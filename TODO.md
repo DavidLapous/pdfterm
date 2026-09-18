@@ -10,7 +10,7 @@
 
 - [ ] Publish release archives for macOS arm64 and Linux x86_64/aarch64. #chore
 - [ ] Transmit each page once and re-place crops on scroll instead of re-transmitting. #improvement
-- [ ] Live-verify nvim `<leader>cl` forward search end-to-end in a real Ghostty session (socket send → page jump → 1s red flash → scroll near top). #task
+- [ ] Verify visible forward-search page/flash/scroll; same-tab Ghostty launch and viewer reuse are verified, but a bare-PTY probe did not emit a post-request page indicator. #task
 
 ## Later
 

@@ -1535,22 +1535,31 @@ impl App {
         });
     }
 
-    /// Drains one forward-search request from the control socket, if a client
-    /// connected. Nonblocking: the listener never stalls the event loop.
-    /// Reads one forward-search payload from an accepted client. A client
-    /// that never closes its write half cannot stall the event loop: the
-    /// read times out after 100ms and whatever bytes arrived are returned.
+    /// Reads a request through EOF, bounded to 100ms for incomplete clients.
+    /// macOS rejects SO_RCVTIMEO after the peer closes, so use nonblocking
+    /// reads and a deadline instead of configuring a socket read timeout.
     fn read_forward_payload(stream: &mut UnixStream) -> io::Result<String> {
         use std::io::Read;
-        // The listener is nonblocking; make the accepted stream blocking
-        // with a timeout so reads wait briefly for data instead of failing.
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        let mut payload = String::new();
-        // A timeout or reset connection still returns whatever bytes
-        // arrived before the error; parse those.
-        let _ = stream.read_to_string(&mut payload);
-        Ok(payload)
+        stream.set_nonblocking(true)?;
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut payload = Vec::new();
+        let mut buffer = [0; 256];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => payload.extend_from_slice(&buffer[..size]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        String::from_utf8(payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn poll_forward_socket(&mut self) -> Result<(), AppError> {
@@ -7396,5 +7405,16 @@ mod tests {
         client.shutdown(Shutdown::Write).unwrap();
         let payload = App::read_forward_payload(&mut server).unwrap();
         assert_eq!(payload, "3:1.0:2.0:3.0:4.0");
+    }
+
+    #[test]
+    fn forward_payload_read_survives_peer_closed_before_accept() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(b"3:1.0:2.0:3.0:4.0").unwrap();
+        drop(client);
+        assert_eq!(
+            App::read_forward_payload(&mut server).unwrap(),
+            "3:1.0:2.0:3.0:4.0"
+        );
     }
 }

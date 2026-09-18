@@ -76,6 +76,24 @@ impl FitMode {
     }
 }
 
+// Share geometry between rendering and inverse search. Do not use PDFium's
+// scale_page_to_display_size(): it rotates landscape pages 90 degrees.
+fn build_fit_config(
+    base_config: PdfRenderConfig,
+    fit: FitMode,
+    target_width: i32,
+    target_height: i32,
+) -> PdfRenderConfig {
+    match fit {
+        FitMode::Page => base_config
+            .set_target_width(target_width)
+            .set_maximum_width(target_width)
+            .set_maximum_height(target_height),
+        FitMode::Width => base_config.set_target_width(target_width),
+        FitMode::Height => base_config.set_target_height(target_height),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DarkModeStyle {
     pub background: [u8; 3],
@@ -675,13 +693,8 @@ fn run_worker(
                             .use_lcd_text_rendering(true)
                             .force_half_tone(false)
                             .use_print_quality(false);
-                        let config = match key.fit {
-                            FitMode::Page => {
-                                base_config.scale_page_to_display_size(target_width, target_height)
-                            }
-                            FitMode::Width => base_config.set_target_width(target_width),
-                            FitMode::Height => base_config.set_target_height(target_height),
-                        };
+                        let config =
+                            build_fit_config(base_config, key.fit, target_width, target_height);
                         let page_height_pt = rendered.height().value;
                         let (pdf_x, pdf_y) =
                             match rendered.pixels_to_points(x as i32, y as i32, &config) {
@@ -934,13 +947,8 @@ fn run_worker(
                 .use_lcd_text_rendering(true)
                 .force_half_tone(false)
                 .use_print_quality(false);
-            let config = match request.key.fit {
-                FitMode::Page => {
-                    base_config.scale_page_to_display_size(target_width, target_height)
-                }
-                FitMode::Width => base_config.set_target_width(target_width),
-                FitMode::Height => base_config.set_target_height(target_height),
-            };
+            let config =
+                build_fit_config(base_config, request.key.fit, target_width, target_height);
             let render_started = Instant::now();
             let bitmap = page.render_with_config(&config).map_err(|error| {
                 format!("could not render page {}: {error}", request.key.page + 1)
@@ -2596,6 +2604,7 @@ mod tests {
         };
 
         let pdfium = load_pdfium(None).unwrap();
+        fit_page_keeps_landscape_pages_landscape(&pdfium);
         let source = pdfium
             .load_pdf_from_byte_vec(synthetic_image_pdf(), None)
             .unwrap();
@@ -2742,6 +2751,29 @@ mod tests {
             false,
         );
         assert_ne!(link_highlighted, link_original);
+    }
+
+    fn fit_page_keeps_landscape_pages_landscape(pdfium: &pdfium_render::prelude::Pdfium) {
+        use super::{FitMode, build_fit_config};
+        use pdfium_render::prelude::{PdfPagePaperSize, PdfPoints, PdfRenderConfig};
+
+        let mut document = pdfium.create_new_pdf().expect("create document");
+        document
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::from_points(
+                PdfPoints::new(400.0),
+                PdfPoints::new(300.0),
+            ))
+            .expect("create landscape page");
+        let page = document.pages().get(0).expect("first page");
+        let config = build_fit_config(PdfRenderConfig::new(), FitMode::Page, 400, 400);
+        let bitmap = page.render_with_config(&config).expect("render page");
+        assert!(
+            bitmap.width() > bitmap.height(),
+            "fit-page rendered a landscape page as {}x{}; expected landscape (width > height)",
+            bitmap.width(),
+            bitmap.height()
+        );
     }
 
     fn synthetic_image_pdf() -> Vec<u8> {

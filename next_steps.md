@@ -1,15 +1,14 @@
 # Next steps
 
-- [ ] Live-verify nvim `<leader>cl` forward search end-to-end in a real Ghostty
-      session (socket send → page jump → 1s red flash → scroll near top).
-      Headless + PTY coverage passed; the live GUI press is the acceptance test
-      and cannot be run from the harness.
-- [ ] Fix pre-existing `picker_labels_recent_files_with_parent_directory`
-      failure: the directory title renders on the popup's border row
-      (`Block::title`), but the test scans only the inner rows, so the
-      expectation can never pass as written. Draw the label inside the rect or
-      correct the expectation. Fails on clean HEAD `08996cb` (pre-dates forward
-      search).
+- [ ] Verify visible forward-search page, flash placement, and scroll position.
+      Same-tab Ghostty launch/reuse passed on the course PDF with the same viewer
+      PID after repeated Neovim requests; orientation was checked from decoded
+      Kitty pixels. Desktop capture is unavailable. A bare-PTY navigation probe
+      stayed alive but produced no post-request page indicator; this does not
+      establish successful page navigation or flash placement.
+- [ ] Fix pre-existing `picker_labels_recent_files_with_parent_directory`:
+      the directory label is absent even when scanning the whole popup rect.
+      Failure also occurs on clean baseline `08996cb`.
 
 ## Accepted caveats
 
