@@ -107,10 +107,6 @@ impl Config {
     pub fn forward_socket(&self) -> Option<&str> {
         self.forward_socket.as_deref()
     }
-
-    pub fn set_forward_socket(&mut self, socket: Option<String>) {
-        self.forward_socket = socket;
-    }
 }
 
 fn config_path() -> Option<PathBuf> {
