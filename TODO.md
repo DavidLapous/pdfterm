@@ -40,3 +40,4 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 - [x] Add incremental text search that does not block foreground rendering. #feature
 - [x] Follow internal links and named destinations, with a numbered link picker and back navigation. #feature
 - [x] Add discrete zoom levels beyond the fit modes. #feature
+- [x] Add a forward-search socket: nvim sends `page:h:v:W:H`, the viewer jumps, flashes the line red for 1s, and scrolls it near the top. #feature
