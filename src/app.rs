@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use crate::config::{Config, LinkPickerLayout};
 use crate::kitty::{self, Placement};
 use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
-    RenderKey, RenderRequest, RenderWorker, SearchPageMatch, WorkerMessage,
+    RenderKey, RenderRequest, RenderWorker, SearchPageMatch, SearchRect, WorkerMessage,
 };
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
@@ -209,6 +210,8 @@ pub fn run(
         app.poll_file_change(&mut output)?;
         app.poll_link_preview(&mut output)?;
         app.poll_search_preview(&mut output)?;
+        app.poll_forward_socket()?;
+        app.poll_flash_expiry()?;
 
         if event::poll(Duration::from_millis(10))? {
             match event::read()? {
@@ -268,6 +271,9 @@ struct App {
     pending_synctex: Option<PendingSynctex>,
     synctex_enabled: bool,
     nvim_socket: Option<String>,
+    forward_socket: Option<String>,
+    forward_listener: Option<UnixListener>,
+    pending_flash: Option<PendingFlash>,
     pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
     persistent_link_picker: bool,
@@ -291,6 +297,7 @@ struct AppDefaults {
     link_picker_geometry: LinkPickerGeometry,
     synctex_enabled: bool,
     nvim_socket: Option<String>,
+    forward_socket: Option<String>,
 }
 
 impl From<&Config> for AppDefaults {
@@ -320,6 +327,7 @@ impl From<&Config> for AppDefaults {
             ),
             synctex_enabled: config.synctex_enabled(),
             nvim_socket: config.nvim_socket().map(str::to_owned),
+            forward_socket: config.forward_socket().map(str::to_owned),
             theme,
             themes,
             theme_index,
@@ -742,6 +750,42 @@ fn render_timing_status(
     format!("render {total_ms}ms")
 }
 
+struct ForwardRequest {
+    page: u32,
+    rect: SearchRect,
+}
+
+/// Parses the control-socket wire format: "page:h:v:W:H" with a one-based
+/// page and synctex point coordinates (h = box left, v = box bottom).
+fn parse_forward_request(payload: &str) -> Option<ForwardRequest> {
+    let payload = payload.trim();
+    let mut parts = payload.split(':');
+    let page = parts.next()?.parse::<u32>().ok()?;
+    let h = parts.next()?.parse::<f32>().ok()?;
+    let v = parts.next()?.parse::<f32>().ok()?;
+    let width = parts.next()?.parse::<f32>().ok()?;
+    let height = parts.next()?.parse::<f32>().ok()?;
+    Some(ForwardRequest {
+        page,
+        rect: SearchRect {
+            left: h,
+            top: v - height,
+            right: h + width,
+            bottom: v,
+        },
+    })
+}
+
+struct PendingFlash {
+    document_id: DocumentId,
+    page: u32,
+    /// y-down top edge of the flash box in points (synctex v - H); taken by
+    /// receive_frame on the flash frame, leaving the flash in place for the
+    /// 1s expiry to clear the highlight.
+    top_pt: Option<f32>,
+    expires_at: Instant,
+}
+
 struct PendingSynctex {
     document_id: DocumentId,
     page: u32,
@@ -826,6 +870,9 @@ impl App {
             pending_synctex: None,
             synctex_enabled: defaults.synctex_enabled,
             nvim_socket: defaults.nvim_socket,
+            forward_socket: defaults.forward_socket,
+            forward_listener: None,
+            pending_flash: None,
             pending_link_picker_open: false,
             link_picker: None,
             persistent_link_picker: defaults.persistent_link_picker,
@@ -1486,6 +1533,94 @@ impl App {
             page,
             ready_at: Instant::now() + LINK_PREVIEW_DELAY,
         });
+    }
+
+    /// Drains one forward-search request from the control socket, if a client
+    /// connected. Nonblocking: the listener never stalls the event loop.
+    fn poll_forward_socket(&mut self) -> Result<(), AppError> {
+        let Some(path) = self.forward_socket.clone() else {
+            return Ok(());
+        };
+        if self.forward_listener.is_none() {
+            // Remove a stale socket file left by a previous viewer before
+            // binding; if another live viewer owns the path, bind fails and
+            // only that instance answers.
+            let _ = fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).map_err(AppError::from)?;
+            listener.set_nonblocking(true).map_err(AppError::from)?;
+            self.forward_listener = Some(listener);
+        }
+        let Some(listener) = self.forward_listener.as_ref() else {
+            return Ok(());
+        };
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                use std::io::Read;
+                let mut payload = String::new();
+                if stream.read_to_string(&mut payload).is_ok() {
+                    if let Some(request) = parse_forward_request(&payload) {
+                        self.apply_forward_request(request, Instant::now())?;
+                    }
+                }
+            }
+            // WouldBlock = no client waiting; not an error in this context.
+            Err(_) => {}
+        }
+        Ok(())
+    }
+
+    fn apply_forward_request(&mut self, request: ForwardRequest, now: Instant) -> Result<(), AppError> {
+        let tab = self.tab_mut();
+        let document_id = tab.document_id;
+        let page = request.page.saturating_sub(1).min(tab.page_count - 1);
+        if page != tab.page {
+            tab.page = page;
+            tab.scroll_x = 0;
+            tab.scroll_y = 0;
+        }
+        self.pending_flash = Some(PendingFlash {
+            document_id,
+            page,
+            // y-down top edge of the flash box in points; turned into a scroll
+            // ratio on frame arrival where the worker-reported page height is
+            // known.
+            top_pt: Some(request.rect.top),
+            expires_at: now + Duration::from_secs(1),
+        });
+        self.worker.flash(document_id, page, request.rect);
+        self.generation += 1;
+        self.worker.begin_generation(self.generation);
+        let viewport = self.viewport()?;
+        let key = self.render_key(viewport);
+        self.worker
+            .render(RenderRequest {
+                key,
+                generation: self.generation,
+            })
+            .map_err(AppError::Renderer)?;
+        Ok(())
+    }
+
+    fn poll_flash_expiry(&mut self) -> Result<(), AppError> {
+        if !self.pending_flash.is_some() {
+            return Ok(());
+        }
+        if Instant::now() < self.pending_flash.as_ref().unwrap().expires_at {
+            return Ok(());
+        }
+        let flash = self.pending_flash.take().unwrap();
+        self.worker.clear_flash(flash.document_id);
+        self.generation += 1;
+        self.worker.begin_generation(self.generation);
+        let viewport = self.viewport()?;
+        let key = self.render_key(viewport);
+        self.worker
+            .render(RenderRequest {
+                key,
+                generation: self.generation,
+            })
+            .map_err(AppError::Renderer)?;
+        Ok(())
     }
 
     fn poll_search_preview(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -2558,6 +2693,25 @@ impl App {
                 && (cached.selected_link_ordinal.is_none()
                     || cached.selected_link_ordinal == key.selected_link_ordinal)
         });
+
+        // Forward-search scroll: the flash frame reports the page height, so
+        // the pending flash's y-down top edge can become a scroll ratio with
+        // the same -0.08 headroom links use.
+        let flash_scroll = match self.pending_flash.as_mut() {
+            Some(flash) if flash.page == key.page && frame.flash_page_height_pt > 0.0 => {
+                flash.top_pt.take()
+            }
+            _ => None,
+        };
+        if let Some(top_pt) = flash_scroll {
+            let page = self.pending_flash.as_ref().unwrap().page;
+            let top_ratio = (top_pt / frame.flash_page_height_pt - 0.08).clamp(0.0, 1.0);
+            let tab = self.tab_mut();
+            tab.pending_destination = Some(LinkDestination {
+                page,
+                top_ratio: Some(top_ratio),
+            });
+        }
 
         if self.desired_key == Some(key) {
             let viewport = self.viewport()?;

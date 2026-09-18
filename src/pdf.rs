@@ -127,6 +127,10 @@ pub struct Frame {
     pub compression_elapsed: Duration,
     pub generation: u64,
     pub links: Vec<PageLink>,
+    /// Page height in points, set when the frame carries a forward-search
+    /// flash; 0.0 otherwise. The app needs it to turn the flash rect into a
+    /// scroll ratio.
+    pub flash_page_height_pt: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -242,6 +246,14 @@ enum WorkerCommand {
         y: u32,
         key: RenderKey,
     },
+    Flash {
+        document_id: DocumentId,
+        page: u32,
+        rect: SearchRect,
+    },
+    ClearFlash {
+        document_id: DocumentId,
+    },
     IndexLinks {
         document_id: DocumentId,
         request_id: u64,
@@ -279,6 +291,14 @@ enum WorkerTask {
         document_id: DocumentId,
         request_id: u64,
     },
+    Flash {
+        document_id: DocumentId,
+        page: u32,
+        rect: SearchRect,
+    },
+    ClearFlash {
+        document_id: DocumentId,
+    },
     IndexLinkPage(LinkIndexJob),
     SearchPage(SearchJob),
     Render(RenderRequest),
@@ -311,11 +331,11 @@ struct SearchHighlights {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct SearchRect {
-    bottom: f32,
-    left: f32,
-    top: f32,
-    right: f32,
+pub struct SearchRect {
+    pub bottom: f32,
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,12 +346,11 @@ struct PixelRect {
     bottom: u32,
 }
 
-struct CachedPageText {
+pub struct CachedPageText {
     raw: String,
     normalized: String,
     source_index_by_byte: Vec<usize>,
 }
-
 struct WorkerChannels {
     priority_rx: Receiver<RenderRequest>,
     prefetch_rx: Receiver<RenderRequest>,
@@ -447,6 +466,22 @@ impl RenderWorker {
         });
     }
 
+    pub fn flash(&self, document_id: DocumentId, page: u32, rect: SearchRect) {
+        let _ = self
+            .command_tx
+            .send(WorkerCommand::Flash {
+                document_id,
+                page,
+                rect,
+            });
+    }
+
+    pub fn clear_flash(&self, document_id: DocumentId) {
+        let _ = self
+            .command_tx
+            .send(WorkerCommand::ClearFlash { document_id });
+    }
+
     pub fn search(&self, document_id: DocumentId, request_id: u64, query: String) {
         let _ = self.command_tx.send(WorkerCommand::Search {
             document_id,
@@ -507,6 +542,7 @@ fn run_worker(
         let mut search_jobs = VecDeque::new();
         let mut link_index_jobs = VecDeque::new();
         let mut search_highlights: HashMap<DocumentId, SearchHighlights> = HashMap::new();
+        let mut flash_highlights: HashMap<DocumentId, (u32, SearchRect, f32)> = HashMap::new();
 
         loop {
             let task = match command_rx.try_recv() {
@@ -571,6 +607,7 @@ fn run_worker(
                                 search_jobs.retain(|job| job.document_id != document_id);
                                 link_index_jobs.retain(|job| job.document_id != document_id);
                                 search_highlights.remove(&document_id);
+                                flash_highlights.remove(&document_id);
                                 message_tx
                                     .send(WorkerMessage::Opened {
                                         document_id,
@@ -600,6 +637,7 @@ fn run_worker(
                     search_jobs.retain(|job| job.document_id != document_id);
                     link_index_jobs.retain(|job| job.document_id != document_id);
                     search_highlights.remove(&document_id);
+                    flash_highlights.remove(&document_id);
                     continue;
                 }
                 WorkerTask::ExtractText { document_id, page } => {
@@ -665,6 +703,38 @@ fn run_worker(
                             })
                             .map_err(|_| "viewer stopped".to_string())?;
                     }
+                    continue;
+                }
+                WorkerTask::Flash {
+                    document_id,
+                    page,
+                    rect,
+                } => {
+                    // Forward-search flash state: the app re-issues the render
+                    // (and the clear) around this store, so nothing else to do.
+                    // The wire rect is y-down from the page top (synctex v);
+                    // flip to pdfium bottom-up so points_to_pixels lands right.
+                    let page_height = {
+                        let Some(document) = documents.get(&document_id) else {
+                            continue;
+                        };
+                        document
+                            .pages()
+                            .get(page as i32)
+                            .map(|target| target.height().value)
+                            .unwrap_or_default()
+                    };
+                    let flipped = SearchRect {
+                        left: rect.left,
+                        right: rect.right,
+                        top: page_height - rect.bottom,
+                        bottom: page_height - rect.top,
+                    };
+                    flash_highlights.insert(document_id, (page, flipped, page_height));
+                    continue;
+                }
+                WorkerTask::ClearFlash { document_id } => {
+                    flash_highlights.remove(&document_id);
                     continue;
                 }
                 WorkerTask::StartSearch {
@@ -918,10 +988,17 @@ fn run_worker(
             } else {
                 Vec::new()
             };
+            let flash = flash_highlights
+                .get(&request.key.document_id)
+                .filter(|(page, _, _)| *page == request.key.page)
+                .map(|(_, rect, page_height)| (rect, *page_height));
+            let flash_rectangle = flash.as_ref().map(|(rect, _)| *rect);
+            let flash_page_height_pt = flash.map(|(_, page_height)| page_height).unwrap_or(0.0);
             let highlight_elapsed = (search_rectangles.is_some()
                 || (request.key.link_mode && !links.is_empty())
                 || !selected_link_rectangles.is_empty()
-                || !dark_mode_link_rectangles.is_empty())
+                || !dark_mode_link_rectangles.is_empty()
+                || flash_rectangle.is_some())
             .then(|| {
                 let started = Instant::now();
                 if !dark_mode_link_rectangles.is_empty() {
@@ -964,6 +1041,17 @@ fn run_worker(
                         request.key.link_highlight,
                     );
                 }
+                if let Some(rect) = flash_rectangle {
+                    apply_search_highlights(
+                        &page,
+                        &config,
+                        width,
+                        height,
+                        &mut raw_rgba,
+                        std::slice::from_ref(rect),
+                        [255, 0, 0],
+                    );
+                }
                 started.elapsed()
             });
             let compression_started = Instant::now();
@@ -988,6 +1076,7 @@ fn run_worker(
                     compression_elapsed,
                     generation: request.generation,
                     links,
+                    flash_page_height_pt,
                 }))
                 .map_err(|_| "viewer stopped".to_string())?;
         }
@@ -1480,6 +1569,16 @@ impl From<WorkerCommand> for WorkerTask {
                 document_id,
                 request_id,
             },
+            WorkerCommand::Flash {
+                document_id,
+                page,
+                rect,
+            } => Self::Flash {
+                document_id,
+                page,
+                rect,
+            },
+            WorkerCommand::ClearFlash { document_id } => Self::ClearFlash { document_id },
         }
     }
 }

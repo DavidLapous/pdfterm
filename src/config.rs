@@ -23,6 +23,7 @@ pub struct Config {
     link_picker_layout: LinkPickerLayout,
     synctex_enabled: Option<bool>,
     nvim_socket: Option<String>,
+    forward_socket: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -101,6 +102,14 @@ impl Config {
 
     pub fn nvim_socket(&self) -> Option<&str> {
         self.nvim_socket.as_deref()
+    }
+
+    pub fn forward_socket(&self) -> Option<&str> {
+        self.forward_socket.as_deref()
+    }
+
+    pub fn set_forward_socket(&mut self, socket: Option<String>) {
+        self.forward_socket = socket;
     }
 }
 
@@ -187,6 +196,7 @@ mod tests {
                 .expect("config");
         assert!(!config.synctex_enabled());
         assert_eq!(config.nvim_socket(), Some("/tmp/pdfterm.sock"));
+        assert_eq!(config.forward_socket(), None);
     }
 
     #[test]
