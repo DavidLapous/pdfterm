@@ -1540,15 +1540,17 @@ impl App {
     /// Reads one forward-search payload from an accepted client. A client
     /// that never closes its write half cannot stall the event loop: the
     /// read times out after 100ms and whatever bytes arrived are returned.
-    fn read_forward_payload(stream: &mut UnixStream) -> String {
+    fn read_forward_payload(stream: &mut UnixStream) -> io::Result<String> {
         use std::io::Read;
         // The listener is nonblocking; make the accepted stream blocking
         // with a timeout so reads wait briefly for data instead of failing.
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         let mut payload = String::new();
+        // A timeout or reset connection still returns whatever bytes
+        // arrived before the error; parse those.
         let _ = stream.read_to_string(&mut payload);
-        payload
+        Ok(payload)
     }
 
     fn poll_forward_socket(&mut self) -> Result<(), AppError> {
@@ -1570,7 +1572,8 @@ impl App {
         };
         // Accept is nonblocking: WouldBlock means no client is waiting.
         if let Ok((mut stream, _)) = listener.accept() {
-            let payload = Self::read_forward_payload(&mut stream);
+            let payload = Self::read_forward_payload(&mut stream)?;
+
             if let Some(request) = parse_forward_request(&payload) {
                 self.apply_forward_request(request, Instant::now())?;
             }
@@ -7372,7 +7375,6 @@ mod tests {
 
     #[test]
     fn forward_payload_read_returns_buffered_data_on_timeout() {
-        use std::net::Shutdown;
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client
             .write_all(b"3:133.768356:136.701797:343.711060:8.855677")
@@ -7381,10 +7383,9 @@ mod tests {
         let started = Instant::now();
         // Client never closes its write half: the read times out at 100ms
         // but the buffered bytes are still returned.
-        let payload = App::read_forward_payload(&mut server);
+        let payload = App::read_forward_payload(&mut server).unwrap();
         assert_eq!(payload, "3:133.768356:136.701797:343.711060:8.855677");
         assert!(started.elapsed() < Duration::from_millis(500));
-        let _ = Shutdown::Write;
     }
 
     #[test]
@@ -7393,7 +7394,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(b"3:1.0:2.0:3.0:4.0").unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let payload = App::read_forward_payload(&mut server);
+        let payload = App::read_forward_payload(&mut server).unwrap();
         assert_eq!(payload, "3:1.0:2.0:3.0:4.0");
     }
 }
