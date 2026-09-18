@@ -4,11 +4,13 @@
 
 - [ ] Add Kitty graphics passthrough for tmux. #feature
 - [ ] Measure render, compression, and transfer latency on direct SSH sessions. #experiment
+- [ ] Fix pre-existing `picker_labels_recent_files_with_parent_directory`: the directory label is not rendered anywhere in the popup rect (scanning the whole rect also fails), so either draw it or correct the expectation. #test
 
 ## Next
 
 - [ ] Publish release archives for macOS arm64 and Linux x86_64/aarch64. #chore
 - [ ] Transmit each page once and re-place crops on scroll instead of re-transmitting. #improvement
+- [ ] Live-verify nvim `<leader>cl` forward search end-to-end in a real Ghostty session (socket send → page jump → 1s red flash → scroll near top). #task
 
 ## Later
 
