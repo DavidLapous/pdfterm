@@ -467,13 +467,11 @@ impl RenderWorker {
     }
 
     pub fn flash(&self, document_id: DocumentId, page: u32, rect: SearchRect) {
-        let _ = self
-            .command_tx
-            .send(WorkerCommand::Flash {
-                document_id,
-                page,
-                rect,
-            });
+        let _ = self.command_tx.send(WorkerCommand::Flash {
+            document_id,
+            page,
+            rect,
+        });
     }
 
     pub fn clear_flash(&self, document_id: DocumentId) {

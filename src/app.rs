@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -1537,14 +1537,29 @@ impl App {
 
     /// Drains one forward-search request from the control socket, if a client
     /// connected. Nonblocking: the listener never stalls the event loop.
+    /// Reads one forward-search payload from an accepted client. A client
+    /// that never closes its write half cannot stall the event loop: the
+    /// read times out after 100ms and whatever bytes arrived are returned.
+    fn read_forward_payload(stream: &mut UnixStream) -> String {
+        use std::io::Read;
+        // The listener is nonblocking; make the accepted stream blocking
+        // with a timeout so reads wait briefly for data instead of failing.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let mut payload = String::new();
+        let _ = stream.read_to_string(&mut payload);
+        payload
+    }
+
     fn poll_forward_socket(&mut self) -> Result<(), AppError> {
         let Some(path) = self.forward_socket.clone() else {
             return Ok(());
         };
         if self.forward_listener.is_none() {
-            // Remove a stale socket file left by a previous viewer before
-            // binding; if another live viewer owns the path, bind fails and
-            // only that instance answers.
+            // Unlink whatever sits at the path before binding: a stale file
+            // from a crashed viewer is reclaimed, and a live viewer's path
+            // is stolen (last instance wins; the old listener is orphaned
+            // and stops receiving requests).
             let _ = fs::remove_file(&path);
             let listener = UnixListener::bind(&path).map_err(AppError::from)?;
             listener.set_nonblocking(true).map_err(AppError::from)?;
@@ -1553,23 +1568,21 @@ impl App {
         let Some(listener) = self.forward_listener.as_ref() else {
             return Ok(());
         };
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                use std::io::Read;
-                let mut payload = String::new();
-                if stream.read_to_string(&mut payload).is_ok() {
-                    if let Some(request) = parse_forward_request(&payload) {
-                        self.apply_forward_request(request, Instant::now())?;
-                    }
-                }
+        // Accept is nonblocking: WouldBlock means no client is waiting.
+        if let Ok((mut stream, _)) = listener.accept() {
+            let payload = Self::read_forward_payload(&mut stream);
+            if let Some(request) = parse_forward_request(&payload) {
+                self.apply_forward_request(request, Instant::now())?;
             }
-            // WouldBlock = no client waiting; not an error in this context.
-            Err(_) => {}
         }
         Ok(())
     }
 
-    fn apply_forward_request(&mut self, request: ForwardRequest, now: Instant) -> Result<(), AppError> {
+    fn apply_forward_request(
+        &mut self,
+        request: ForwardRequest,
+        now: Instant,
+    ) -> Result<(), AppError> {
         let tab = self.tab_mut();
         let document_id = tab.document_id;
         let page = request.page.saturating_sub(1).min(tab.page_count - 1);
@@ -5946,7 +5959,7 @@ struct SynctexTarget {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
+        App, BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
         PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState, ZOOM_DEFAULT,
         ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, clear_image_canvas, clear_picker,
@@ -5972,6 +5985,7 @@ mod tests {
     use ratatui::layout::Rect;
     use std::fs;
     use std::io::{self, Write};
+    use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant, SystemTime};
 
     #[test]
@@ -7354,5 +7368,32 @@ mod tests {
         assert!(parse_synctex_edit("Output: paper.pdf\nLine: 3\n").is_none());
         assert!(parse_synctex_edit("Output: paper.pdf\nInput: paper.tex\n").is_none());
         assert!(parse_synctex_edit("").is_none());
+    }
+
+    #[test]
+    fn forward_payload_read_returns_buffered_data_on_timeout() {
+        use std::net::Shutdown;
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .write_all(b"3:133.768356:136.701797:343.711060:8.855677")
+            .unwrap();
+        client.flush().unwrap();
+        let started = Instant::now();
+        // Client never closes its write half: the read times out at 100ms
+        // but the buffered bytes are still returned.
+        let payload = App::read_forward_payload(&mut server);
+        assert_eq!(payload, "3:133.768356:136.701797:343.711060:8.855677");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let _ = Shutdown::Write;
+    }
+
+    #[test]
+    fn forward_payload_read_returns_payload_on_eof() {
+        use std::net::Shutdown;
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(b"3:1.0:2.0:3.0:4.0").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let payload = App::read_forward_payload(&mut server);
+        assert_eq!(payload, "3:1.0:2.0:3.0:4.0");
     }
 }
