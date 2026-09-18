@@ -53,6 +53,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `+` / `-` | zoom in / out in 25% steps (up to 400%) |
 | `0` | reset zoom to the fitted size |
 | `i` | toggle Polaris-style dark mode |
+| `I` | toggle inverse search mode: click a location to resolve it via synctex and jump to the source in your editor |
 | `p` | toggle detailed render-performance timings |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
 | `T` | choose and preview a theme for the current session |
@@ -142,6 +143,13 @@ link_picker_layout = "auto"
 # load one theme directly and list picker entries explicitly
 theme = "~/.config/themes/tokyo-night-moon.toml"
 theme_catalog = "~/.config/themes/catalog.toml"
+
+# enable inverse search (default: enabled)
+synctex_enabled = true
+
+# unix socket receiving "file:line" when a click is inverse-searched;
+# the Neovim integration below listens on this path
+nvim_socket = "/tmp/pdfterm-nvim.sock"
 ```
 
 `link_picker_layout = "vertical"` keeps the PDF on the left and links on the
@@ -217,6 +225,19 @@ remains visible after the recent-files heading is replaced by search results. Us
 `j`/`k` or arrows to move, `Ctrl-b`/`Ctrl-f` to move by a page, and, before
 entering a filter, `g`/`G` to jump to the first or last result. The file, outline,
 theme, link, and search-result pickers use the same navigation conventions.
+
+## Neovim integration
+
+With `nvim_socket` set, `I` mode resolves the clicked location with `synctex
+edit` and writes `file:line` to the socket, where the nvim config
+(`lua/custom/pdfterm.lua`) routes it through `latex_sync.inverse_search` — the
+jump raises the Neovim window. Without the socket, the resolved target is only
+shown in the status bar and copied to the clipboard (OSC 52).
+
+The nvim forward search (`<leader>cl`) uses a switchable viewer:
+
+- `<leader>csls` — Skim (displayline)
+- `<leader>cslt` — pdfterm in a dedicated Ghostty terminal
 
 ## Checks
 

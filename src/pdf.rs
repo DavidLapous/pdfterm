@@ -172,6 +172,14 @@ pub enum WorkerMessage {
         pages: u32,
         outline: Vec<OutlineItem>,
     },
+    PagePoint {
+        document_id: DocumentId,
+        page: u32,
+        request_id: u64,
+        pdf_x: f32,
+        pdf_y: f32,
+        page_height_pt: f32,
+    },
     OpenError {
         document_id: DocumentId,
         error: String,
@@ -226,6 +234,14 @@ enum WorkerCommand {
         document_id: DocumentId,
         request_id: u64,
     },
+    PagePoint {
+        document_id: DocumentId,
+        page: u32,
+        request_id: u64,
+        x: u32,
+        y: u32,
+        key: RenderKey,
+    },
     IndexLinks {
         document_id: DocumentId,
         request_id: u64,
@@ -241,6 +257,14 @@ enum WorkerTask {
     ExtractText {
         document_id: DocumentId,
         page: u32,
+    },
+    PagePoint {
+        document_id: DocumentId,
+        page: u32,
+        request_id: u64,
+        x: u32,
+        y: u32,
+        key: RenderKey,
     },
     StartSearch {
         document_id: DocumentId,
@@ -367,6 +391,7 @@ impl RenderWorker {
                 | WorkerMessage::SearchProgress { .. }
                 | WorkerMessage::SearchResults { .. }
                 | WorkerMessage::LinkIndexProgress { .. }
+                | WorkerMessage::PagePoint { .. }
                 | WorkerMessage::Frame(_),
             ) => Err("renderer sent a frame before initialization".into()),
             Err(_) => Err("renderer stopped during initialization".into()),
@@ -401,6 +426,25 @@ impl RenderWorker {
         let _ = self
             .command_tx
             .send(WorkerCommand::ExtractText { document_id, page });
+    }
+
+    pub fn page_point(
+        &self,
+        document_id: DocumentId,
+        page: u32,
+        request_id: u64,
+        x: u32,
+        y: u32,
+        key: RenderKey,
+    ) {
+        let _ = self.command_tx.send(WorkerCommand::PagePoint {
+            document_id,
+            page,
+            request_id,
+            x,
+            y,
+            key,
+        });
     }
 
     pub fn search(&self, document_id: DocumentId, request_id: u64, query: String) {
@@ -570,6 +614,54 @@ fn run_worker(
                                 document_id,
                                 page,
                                 content,
+                            })
+                            .map_err(|_| "viewer stopped".to_string())?;
+                    }
+                    continue;
+                }
+                WorkerTask::PagePoint {
+                    document_id,
+                    page,
+                    request_id,
+                    x,
+                    y,
+                    key,
+                } => {
+                    if let Some(document) = documents.get(&document_id)
+                        && let Ok(page_index) = i32::try_from(page)
+                        && let Ok(rendered) = document.pages().get(page_index)
+                    {
+                        let zoom = i32::from(key.zoom.max(1));
+                        let target_width = (i32::from(key.width) * zoom / 100).max(1);
+                        let target_height = (i32::from(key.height) * zoom / 100).max(1);
+                        let base_config = PdfRenderConfig::new()
+                            .set_reverse_byte_order(true)
+                            .use_lcd_text_rendering(true)
+                            .force_half_tone(false)
+                            .use_print_quality(false);
+                        let config = match key.fit {
+                            FitMode::Page => {
+                                base_config.scale_page_to_display_size(target_width, target_height)
+                            }
+                            FitMode::Width => base_config.set_target_width(target_width),
+                            FitMode::Height => base_config.set_target_height(target_height),
+                        };
+                        let page_height_pt = rendered.height().value;
+                        let (pdf_x, pdf_y) =
+                            match rendered.pixels_to_points(x as i32, y as i32, &config) {
+                                Ok((pdf_x, pdf_y)) => (pdf_x.value, pdf_y.value),
+                                // Unresolvable click: report back so the app can
+                                // clear its pending request instead of wedging.
+                                Err(_) => (-1.0, -1.0),
+                            };
+                        message_tx
+                            .send(WorkerMessage::PagePoint {
+                                document_id,
+                                page,
+                                request_id,
+                                pdf_x,
+                                pdf_y,
+                                page_height_pt,
                             })
                             .map_err(|_| "viewer stopped".to_string())?;
                     }
@@ -1365,6 +1457,21 @@ impl From<WorkerCommand> for WorkerTask {
             } => Self::CancelSearch {
                 document_id,
                 request_id,
+            },
+            WorkerCommand::PagePoint {
+                document_id,
+                page,
+                request_id,
+                x,
+                y,
+                key,
+            } => Self::PagePoint {
+                document_id,
+                page,
+                request_id,
+                x,
+                y,
+                key,
             },
             WorkerCommand::IndexLinks {
                 document_id,

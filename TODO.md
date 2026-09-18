@@ -19,6 +19,7 @@
 Pure-Rust PDF rendering: Hayro states that its renderer has not received performance work yet, which conflicts with the latency requirement.
 
 ## Done
+- [x] Add a SyncTeX inverse-search handoff: `I` mode resolves the click via synctex edit and writes file:line to a configured nvim unix socket. #feature
 
 - [x] Add a fuzzy PDF picker for startup and in-viewer file changes. #feature
 - [x] Reload changed PDFs without interrupting navigation or displaying partial writes. #feature

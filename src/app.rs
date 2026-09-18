@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -135,6 +136,26 @@ pub fn run(
                     app.fail_open(document_id, &error, &mut output)?
                 }
                 WorkerMessage::Text { content, .. } => app.copy_text(&content, &mut output)?,
+                WorkerMessage::PagePoint {
+                    document_id,
+                    page,
+                    request_id,
+                    pdf_x,
+                    pdf_y,
+                    page_height_pt,
+                } => {
+                    app.receive_page_point(
+                        SynctexClick {
+                            document_id,
+                            page,
+                            request_id,
+                            pdf_x,
+                            pdf_y,
+                            page_height_pt,
+                        },
+                        &mut output,
+                    )?;
+                }
                 WorkerMessage::SearchProgress {
                     document_id,
                     request_id,
@@ -242,6 +263,11 @@ struct App {
     next_search_request_id: u64,
     next_link_request_id: u64,
     link_mode: bool,
+    next_synctex_request_id: u64,
+    synctex_mode: bool,
+    pending_synctex: Option<PendingSynctex>,
+    synctex_enabled: bool,
+    nvim_socket: Option<String>,
     pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
     persistent_link_picker: bool,
@@ -263,6 +289,8 @@ struct AppDefaults {
     theme_index: usize,
     persistent_link_picker: bool,
     link_picker_geometry: LinkPickerGeometry,
+    synctex_enabled: bool,
+    nvim_socket: Option<String>,
 }
 
 impl From<&Config> for AppDefaults {
@@ -290,6 +318,8 @@ impl From<&Config> for AppDefaults {
                 config.link_picker_split_percent(),
                 config.link_picker_layout(),
             ),
+            synctex_enabled: config.synctex_enabled(),
+            nvim_socket: config.nvim_socket().map(str::to_owned),
             theme,
             themes,
             theme_index,
@@ -712,6 +742,21 @@ fn render_timing_status(
     format!("render {total_ms}ms")
 }
 
+struct PendingSynctex {
+    document_id: DocumentId,
+    page: u32,
+    request_id: u64,
+}
+
+struct SynctexClick {
+    document_id: DocumentId,
+    page: u32,
+    request_id: u64,
+    pdf_x: f32,
+    pdf_y: f32,
+    page_height_pt: f32,
+}
+
 enum PendingOpen {
     Reload {
         document_id: DocumentId,
@@ -776,6 +821,11 @@ impl App {
             next_search_request_id: 1,
             next_link_request_id: 1,
             link_mode: false,
+            next_synctex_request_id: 1,
+            synctex_mode: false,
+            pending_synctex: None,
+            synctex_enabled: defaults.synctex_enabled,
+            nvim_socket: defaults.nvim_socket,
             pending_link_picker_open: false,
             link_picker: None,
             persistent_link_picker: defaults.persistent_link_picker,
@@ -1524,6 +1574,14 @@ impl App {
             && mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && self.handle_link_picker_pointer(mouse, output)?
         {
+            return Ok(());
+        }
+        if self.synctex_enabled
+            && self.synctex_mode
+            && !self.link_mode
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        {
+            self.begin_inverse_search(mouse, output)?;
             return Ok(());
         }
         if !self.link_mode || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -2282,6 +2340,7 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(output)?,
             KeyCode::Char('0') => self.reset_zoom(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
+            KeyCode::Char('I') => self.set_inverse_mode(!self.synctex_mode, output)?,
             KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
             KeyCode::Char('T') => self.open_theme_picker(output)?,
@@ -2665,6 +2724,7 @@ impl App {
         }
         let search_status = tab.search.status_label(tab.page);
         let link_status = self.link_mode.then_some("  click/enter: open  esc: close");
+        let synctex_status = self.synctex_mode.then_some("  inverse: click a location");
         execute!(
             output,
             MoveTo(0, viewport.status_row),
@@ -2687,6 +2747,8 @@ impl App {
             Print(search_status.as_deref().unwrap_or_default()),
             SetForegroundColor(theme.cyan),
             Print(link_status.unwrap_or_default()),
+            SetForegroundColor(theme.yellow),
+            Print(synctex_status.unwrap_or_default()),
             SetForegroundColor(theme.comment),
             Print("  ?: help"),
             SetBackgroundColor(theme.bg),
@@ -2870,6 +2932,144 @@ impl App {
         self.tabs
             .iter()
             .position(|tab| tab.document_id == document_id)
+    }
+
+    fn set_inverse_mode(&mut self, enabled: bool, output: &mut impl Write) -> Result<(), AppError> {
+        if enabled == self.synctex_mode {
+            return Ok(());
+        }
+        self.synctex_mode = enabled;
+        if enabled {
+            execute!(output, crossterm::event::EnableMouseCapture).map_err(AppError::from)?;
+        } else if !self.link_mode {
+            execute!(output, crossterm::event::DisableMouseCapture).map_err(AppError::from)?;
+        }
+        let viewport = self.viewport()?;
+        self.draw_status(
+            output,
+            viewport,
+            if enabled {
+                "inverse search: click a location"
+            } else {
+                ""
+            },
+        )?;
+        Ok(())
+    }
+
+    fn begin_inverse_search(
+        &mut self,
+        mouse: MouseEvent,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if self.pending_open.is_some() || self.pending_synctex.is_some() {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let key = self.render_key(viewport);
+        let Some(frame) = self.tab().cache.get(&key).cloned() else {
+            self.draw_status(output, viewport, "page is still rendering")?;
+            return Ok(());
+        };
+        let tab = self.tab();
+        let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
+        let Some(local_column) = mouse.column.checked_sub(placement.left) else {
+            return Ok(());
+        };
+        let Some(local_row) = mouse.row.checked_sub(viewport.top) else {
+            return Ok(());
+        };
+        if local_column >= placement.columns || local_row >= placement.rows {
+            return Ok(());
+        }
+        let (source_x, source_y, visible_width, visible_height) = placement
+            .crop
+            .map_or((0, 0, frame.width, frame.height), |crop| {
+                (crop.x, crop.y, crop.width, crop.height)
+            });
+        let cell_x0 =
+            source_x + scaled_cell_boundary(local_column, placement.columns, visible_width);
+        let cell_x1 = source_x
+            + scaled_cell_boundary(
+                local_column.saturating_add(1),
+                placement.columns,
+                visible_width,
+            );
+        let cell_y0 = source_y + scaled_cell_boundary(local_row, placement.rows, visible_height);
+        let cell_y1 = source_y
+            + scaled_cell_boundary(local_row.saturating_add(1), placement.rows, visible_height);
+        let pixel_x = (cell_x0 + cell_x1) / 2;
+        let pixel_y = (cell_y0 + cell_y1) / 2;
+        let (document_id, page) = (tab.document_id, tab.page);
+        let request_id = self.next_synctex_request_id;
+        self.next_synctex_request_id = request_id.wrapping_add(1);
+        self.pending_synctex = Some(PendingSynctex {
+            document_id,
+            page,
+            request_id,
+        });
+        self.worker
+            .page_point(document_id, page, request_id, pixel_x, pixel_y, key);
+        self.draw_status(output, viewport, "inverse search: resolving location...")?;
+        Ok(())
+    }
+
+    fn receive_page_point(
+        &mut self,
+        click: SynctexClick,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let Some(pending) = self.pending_synctex.take() else {
+            return Ok(());
+        };
+        if pending.document_id != click.document_id
+            || pending.page != click.page
+            || pending.request_id != click.request_id
+        {
+            // Stale reply for an older request: restore the in-flight request.
+            self.pending_synctex = Some(pending);
+            return Ok(());
+        }
+        if click.pdf_x < 0.0 || click.pdf_y < 0.0 {
+            let viewport = self.viewport()?;
+            self.draw_status(output, viewport, "inverse search: click outside page")?;
+            return Ok(());
+        }
+        let tab = self.tab();
+        let pdf_path = tab.path.display().to_string();
+        let synctex_y = click.page_height_pt - click.pdf_y;
+        let spec = format!(
+            "{}:{:.2}:{:.2}:{}",
+            click.page + 1,
+            click.pdf_x,
+            synctex_y,
+            pdf_path
+        );
+        let resolved = Command::new("synctex").args(["edit", "-o", &spec]).output();
+        let viewport = self.viewport()?;
+        let Some(resolved) = resolved.ok().filter(|resolved| resolved.status.success()) else {
+            self.draw_status(output, viewport, "inverse search: synctex failed")?;
+            return Ok(());
+        };
+        let stdout = String::from_utf8_lossy(&resolved.stdout);
+        let Some(target) = parse_synctex_edit(&stdout) else {
+            self.draw_status(output, viewport, "inverse search: no synctex match")?;
+            return Ok(());
+        };
+        let handoff = format!("{}:{}", target.file, target.line);
+        if let Some(socket_path) = self.nvim_socket.as_deref()
+            && let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path)
+        {
+            let _ = std::io::Write::write_all(&mut stream, handoff.as_bytes());
+        }
+        let _ = write_clipboard_osc52(output, &handoff);
+        let shown = target.file.rsplit('/').next().unwrap_or(&target.file);
+        self.draw_status(
+            output,
+            viewport,
+            &format!("inverse search: {}:{} (copied)", shown, target.line),
+        )?;
+        Ok(())
     }
 }
 
@@ -4898,6 +5098,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("+ / -", "zoom in / out"),
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
+        ("I", "inverse search mode"),
         ("p", "toggle performance timings"),
         ("t", "table of contents"),
         ("T", "choose theme"),
@@ -5565,6 +5766,29 @@ impl FileWatcher {
     }
 }
 
+/// Parses the stdout of `synctex edit -o ...` into a source file and line.
+/// Handles `Input:`, `Line:`, and `Column:` keys; `Column` may be `-1`.
+/// Returns None when no match is found.
+fn parse_synctex_edit(stdout: &str) -> Option<SynctexTarget> {
+    let mut input: Option<String> = None;
+    let mut line: Option<u32> = None;
+    for row in stdout.lines() {
+        if let Some(value) = row.strip_prefix("Input:") {
+            input = Some(value.trim().to_owned());
+        } else if let Some(value) = row.strip_prefix("Line:") {
+            line = value.trim().parse::<u32>().ok().or(line);
+        }
+    }
+    let file = input?;
+    let line = line?;
+    Some(SynctexTarget { file, line })
+}
+
+struct SynctexTarget {
+    file: String,
+    line: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5577,7 +5801,7 @@ mod tests {
         filter_theme_indices, link_at_cell, link_picker_focus_for_key, link_picker_label,
         link_picker_link_at_position, link_picker_list_area, link_picker_navigation_index,
         link_picker_panes, link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
-        outline_start_index, picker_color, picker_rect, render_timing_status,
+        outline_start_index, parse_synctex_edit, picker_color, picker_rect, render_timing_status,
         restore_link_picker_split, search_target_page, shorten_path, show_link_picker_split,
         stale_status_row, stepped_zoom, synchronized_output, update_link_number_selection,
         write_clipboard_osc52,
@@ -6755,6 +6979,7 @@ mod tests {
         assert!(rendered.contains("zoom in / out"));
         assert!(rendered.contains("reset zoom"));
         assert!(rendered.contains("toggle performance timings"));
+        assert!(rendered.contains("inverse search mode"));
         assert!(rendered.contains("choose theme"));
         assert!(rendered.contains("open PDF in new tab"));
         assert!(rendered.contains("leave mode / clear / exit"));
@@ -6952,5 +7177,28 @@ mod tests {
         let floating_output = String::from_utf8(floating_output).expect("terminal output");
         assert!(!floating_output.contains("a=p"));
         assert!(!floating_output.contains("a=T"));
+    }
+
+    #[test]
+    fn parse_synctex_edit_finds_file_and_line() {
+        let stdout = "Output: paper.pdf\nInput: /private/tmp/synctex-test/./paper.tex\nLine: 3\nColumn: -1\n";
+        let target = parse_synctex_edit(stdout).expect("synctex match");
+        assert_eq!(target.file, "/private/tmp/synctex-test/./paper.tex");
+        assert_eq!(target.line, 3);
+    }
+
+    #[test]
+    fn parse_synctex_edit_takes_last_input() {
+        let stdout = "Input: preamble.tex\nLine: 9\nInput: paper.tex\nLine: 3\n";
+        let target = parse_synctex_edit(stdout).expect("synctex match");
+        assert_eq!(target.file, "paper.tex");
+        assert_eq!(target.line, 3);
+    }
+
+    #[test]
+    fn parse_synctex_edit_rejects_missing_input() {
+        assert!(parse_synctex_edit("Output: paper.pdf\nLine: 3\n").is_none());
+        assert!(parse_synctex_edit("Output: paper.pdf\nInput: paper.tex\n").is_none());
+        assert!(parse_synctex_edit("").is_none());
     }
 }

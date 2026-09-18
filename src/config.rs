@@ -21,6 +21,8 @@ pub struct Config {
     persistent_link_picker: bool,
     link_picker_split_percent: Option<u16>,
     link_picker_layout: LinkPickerLayout,
+    synctex_enabled: Option<bool>,
+    nvim_socket: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -91,6 +93,14 @@ impl Config {
 
     pub fn link_picker_layout(&self) -> LinkPickerLayout {
         self.link_picker_layout
+    }
+
+    pub fn synctex_enabled(&self) -> bool {
+        self.synctex_enabled.unwrap_or(true)
+    }
+
+    pub fn nvim_socket(&self) -> Option<&str> {
+        self.nvim_socket.as_deref()
     }
 }
 
@@ -168,6 +178,22 @@ mod tests {
                 toml::from_str(&format!("link_picker_layout = \"{value}\"\n")).expect("config");
             assert_eq!(config.link_picker_layout(), expected);
         }
+    }
+
+    #[test]
+    fn parses_synctex_and_nvim_socket() {
+        let config: Config =
+            toml::from_str("synctex_enabled = false\nnvim_socket = \"/tmp/pdfterm.sock\"\n")
+                .expect("config");
+        assert!(!config.synctex_enabled());
+        assert_eq!(config.nvim_socket(), Some("/tmp/pdfterm.sock"));
+    }
+
+    #[test]
+    fn synctex_defaults_to_enabled() {
+        let config: Config = toml::from_str("").expect("empty config");
+        assert!(config.synctex_enabled());
+        assert_eq!(config.nvim_socket(), None);
     }
 
     #[test]
