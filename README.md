@@ -239,6 +239,14 @@ The nvim forward search (`<leader>cl`) uses a switchable viewer:
 - `<leader>csls` — Skim (displayline)
 - `<leader>cslt` — pdfterm in a dedicated Ghostty terminal
 
+The terminal branch runs `synctex view` for the current cursor line and sends
+`page:h:v:W:H` (1-based page, h = box left, v = box bottom measured from the
+page top) to the forward socket (`forward_socket` config key or
+`--forward-socket`). A live viewer applies the goto, flashes the target box
+red for one second, and scrolls so the line sits near the top; with no viewer
+listening, nvim launches pdfterm first and delivers the payload once its
+socket is up.
+
 ## Checks
 
 ```console
