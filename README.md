@@ -124,37 +124,27 @@ PDF link annotation is not inferred.
 
 ## Configuration
 
-`pdfterm` reads an optional config file from `$XDG_CONFIG_HOME/pdfterm/config.toml`
-(falling back to `~/.config/pdfterm/config.toml`). A missing file uses the defaults;
-a malformed file is reported once and ignored. Supported keys:
+On first launch, `pdfterm` creates **`~/.config/pdfterm/config.toml`** with
+commented defaults. A nonempty `XDG_CONFIG_HOME` replaces `~/.config`. Existing
+files are never overwritten. Invalid TOML, unknown keys, invalid animation
+ranges, and file-access errors stop startup with the configuration path.
 
-```toml
-# fit-page (default), fit-width, or fit-height
-fit_mode = "page"
+[config.default.toml](config.default.toml) documents every setting:
 
-# enable Polaris-style dark mode by default
-dark_mode = true
+- Top level: fit, colors, link-browser layout, SyncTeX, and socket paths.
+- `[viewer]`: continuous/smooth scrolling, animation interval and easing,
+  small/page scroll distances, filename titles, forward-search centering and
+  flash duration, word matching and source-context radius.
+- `[nvim]`: initial viewer, compile-before-search, inverse-search focus, and
+  executable override. Empty `executable` uses this checkout's release binary.
+- `[nvim.keys]`: forward search, build, main file, compile toggle, and viewer
+  selection. An empty binding disables that mapping.
 
-# keep the link split open after following or copying a link
-persistent_link_picker = true
-
-# percentage of the split assigned to the link browser (default 50; range 20-80)
-link_picker_split_percent = 50
-
-# auto, vertical, horizontal, or floating
-link_picker_layout = "auto"
-
-# load one theme directly and list picker entries explicitly
-theme = "~/.config/themes/tokyo-night-moon.toml"
-theme_catalog = "~/.config/themes/catalog.toml"
-
-# enable inverse search (default: enabled)
-synctex_enabled = true
-
-# unix socket receiving "file:line:byte-column" on inverse search;
-# the Neovim integration below listens on this path
-nvim_socket = "/tmp/pdfterm-nvim.sock"
-```
+The bundled Neovim plugin reads this same file through `pdfterm --print-config`;
+there is no second configuration to synchronize. Restart the viewer and Neovim
+after editing it. `?` shows controls and the active configuration path.
+Scrolling eases over terminal rows; `smooth_scroll = false` restores immediate
+steps. `continuous_scroll = false` retains single-page scrolling.
 
 `link_picker_layout = "vertical"` keeps the PDF on the left and links on the
 right; `"horizontal"` keeps the PDF above the links; and `"floating"` places an
@@ -232,11 +222,27 @@ theme, link, and search-result pickers use the same navigation conventions.
 
 ## Neovim integration
 
+Build the release binary, then add the bundled plugin to Neovim:
+
+```lua
+vim.opt.runtimepath:prepend(vim.fn.expand('~/git/pdfterm/nvim'))
+require('pdfterm').setup()
+```
+
+No modules from a separate Neovim configuration are required. The plugin owns
+its keymaps, compilation, forward search, inverse-search socket, and source-window
+focus. It supports **Kitty and Ghostty**; unsupported terminals fail explicitly.
+Kitty needs `kitten` on `PATH` and remote control permitted (for example, a
+`listen_on` Unix socket with `allow_remote_control socket-only`). Use Kitty's
+`splits` layout for a right split. Ghostty needs its AppleScript interface enabled.
+No terminal settings are modified by the plugin.
+
 With `nvim_socket` set, `Alt`/`Option`-click resolves the clicked location with
 `synctex edit`, then matches the clicked PDF word and nearby text against source
-lines within four lines of the result. The handoff is `file:line:byte-column`
-(one-based line, zero-based UTF-8 byte column). The nvim config
-(`lua/custom/pdfterm.lua`) routes it through `latex_sync.inverse_search`.
+lines within `viewer.source_context_lines` of the result (default four).
+The handoff is `file:line:byte-column` (one-based line, zero-based UTF-8 byte
+column). The plugin jumps to that source buffer and focuses the exact terminal
+captured by forward search, unless `nvim.focus_on_inverse = false`.
 Ambiguous words, macros, and non-text clicks remain explicitly marked **line only**;
 the matcher does not expand TeX. Source matching uses the saved file, so save and
 rebuild after edits. Without the socket, the target is shown in the status bar and
@@ -245,17 +251,24 @@ copied to the clipboard (OSC 52). Configured editor-socket failures are reported
 The nvim forward search (`<leader>cl`) uses a switchable viewer:
 
 - `<leader>csls` — Skim (displayline)
-- `<leader>cslt` — pdfterm in a dedicated Ghostty terminal
+- `<leader>cslt` — pdfterm beside the source Kitty or Ghostty terminal (default)
 
 The terminal branch runs `synctex view` for the cursor line and character column,
 uses the first (best-ranked) result, and sends
 `page:h:v:W:H` (1-based page, h = box left, v = box bottom measured from the
-page top) to the forward socket (`forward_socket` config key or
-`--forward-socket`). A live viewer applies the goto, flashes the target box
-red for one second, and centers the highlighted region vertically, showing the
-preceding or following page as needed. Positioning is rounded to terminal rows
-and clamped at document ends. With no viewer listening, nvim launches pdfterm
-first and delivers the payload once its socket is up.
+page top) to the configured `forward_socket`. A live viewer applies the goto,
+flashes the target box red for one second, and centers it vertically, showing
+adjacent pages as needed. Centering and flash duration are configurable.
+Positioning is rounded to terminal rows and clamped at document ends.
+With no viewer listening, the plugin launches pdfterm beside the captured source
+terminal and sends the payload once its socket is up. The split inherits `PATH`
+and `XDG_CONFIG_HOME`. The viewer sets its terminal title to the PDF filename
+unless `viewer.set_window_title = false`.
+
+Default editor controls: `<leader>cl` forward search, `<leader>cb` build,
+`<leader>csl` set main TeX file, `<leader>cscl` toggle compile-before-search.
+Socket paths are global by default: one active document/editor pair per socket
+pair. Use separate configurations/socket paths for independent sessions.
 
 ## Checks
 

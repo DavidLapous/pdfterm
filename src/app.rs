@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, Borders, Clear as RatatuiClear, Paragraph, Wrap};
 use thiserror::Error;
 
 use crate::browser::{BrowserEntry, BrowserEntrySource, BrowserState};
-use crate::config::{Config, LinkPickerLayout};
+use crate::config::{Config, LinkPickerLayout, ViewerSettings};
 use crate::kitty::{self, Placement};
 use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
@@ -214,6 +214,7 @@ pub fn run(
         app.poll_search_preview(&mut output)?;
         app.poll_forward_socket()?;
         app.poll_flash_expiry()?;
+        app.poll_smooth_scroll(&mut output)?;
 
         if event::poll(Duration::from_millis(10))? {
             match event::read()? {
@@ -259,6 +260,10 @@ struct App {
     visible_image_id: Option<u32>,
     visible_pages: Vec<VisiblePage>,
     pending_vertical_scroll: i64,
+    smooth_scroll_remaining: i64,
+    smooth_scroll_tick: Instant,
+    title_document: Option<DocumentId>,
+    viewer: ViewerSettings,
     next_image_id: u32,
     last_status_row: Option<u16>,
     performance_snapshot: Option<PerformanceSnapshot>,
@@ -301,6 +306,7 @@ struct AppDefaults {
     synctex_enabled: bool,
     nvim_socket: Option<String>,
     forward_socket: Option<String>,
+    viewer: ViewerSettings,
 }
 
 impl From<&Config> for AppDefaults {
@@ -331,6 +337,7 @@ impl From<&Config> for AppDefaults {
             synctex_enabled: config.synctex_enabled(),
             nvim_socket: config.nvim_socket().map(str::to_owned),
             forward_socket: config.forward_socket().map(str::to_owned),
+            viewer: config.viewer,
             theme,
             themes,
             theme_index,
@@ -865,6 +872,9 @@ impl App {
             visible_image_id: None,
             visible_pages: Vec::new(),
             pending_vertical_scroll: 0,
+            smooth_scroll_remaining: 0,
+            smooth_scroll_tick: Instant::now(),
+            title_document: None,
             next_image_id: 1,
             last_status_row: None,
             performance_snapshot: None,
@@ -891,6 +901,7 @@ impl App {
             theme: defaults.theme,
             themes: defaults.themes,
             theme_index: defaults.theme_index,
+            viewer: defaults.viewer,
         }
     }
 
@@ -1601,6 +1612,7 @@ impl App {
         now: Instant,
     ) -> Result<(), AppError> {
         self.pending_vertical_scroll = 0;
+        self.smooth_scroll_remaining = 0;
         if let Some(previous) = self.pending_flash.take() {
             self.worker.clear_flash(previous.document_id);
             if let Some(index) = self.tab_index(previous.document_id) {
@@ -1620,8 +1632,12 @@ impl App {
         self.pending_flash = Some(PendingFlash {
             document_id,
             page,
-            center_pt: Some((request.rect.top + request.rect.bottom) * 0.5),
-            expires_at: now + Duration::from_secs(1),
+            center_pt: Some(if self.viewer.center_forward_search {
+                (request.rect.top + request.rect.bottom) * 0.5
+            } else {
+                request.rect.top
+            }),
+            expires_at: now + Duration::from_millis(self.viewer.flash_duration_ms),
         });
         self.worker.flash(document_id, page, request.rect);
         self.generation += 1;
@@ -2492,17 +2508,24 @@ impl App {
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let viewport = self.viewport()?;
-        if axis == Axis::Vertical && self.link_picker.is_none() && self.search_picker.is_none() {
+        if self.viewer.continuous_scroll
+            && axis == Axis::Vertical
+            && self.link_picker.is_none()
+            && self.search_picker.is_none()
+        {
             let cell = (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1);
             let pixels = if large {
-                u32::from(viewport.pixel_height) * 85 / 100
+                u32::from(viewport.pixel_height) * self.viewer.page_scroll_percent as u32 / 100
             } else {
-                u32::from(viewport.pixel_height) / 8
+                u32::from(viewport.pixel_height) * self.viewer.scroll_step_percent as u32 / 100
             };
             let step = i64::from(pixels.max(1).div_ceil(cell) * cell);
-            self.pending_vertical_scroll += if forward { step } else { -step };
-            if self.apply_vertical_scroll(viewport)? {
-                self.request_current(output)?;
+            self.smooth_scroll_remaining += if forward { step } else { -step };
+            if !self.viewer.smooth_scroll {
+                self.pending_vertical_scroll += std::mem::take(&mut self.smooth_scroll_remaining);
+                if self.apply_vertical_scroll(viewport)? {
+                    self.request_current(output)?;
+                }
             }
             return Ok(());
         }
@@ -2545,6 +2568,46 @@ impl App {
             Axis::Horizontal => self.tab_mut().scroll_x = next,
         }
         self.redraw_current(output)
+    }
+
+    fn poll_smooth_scroll(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.link_picker.is_some()
+            || self.search_picker.is_some()
+            || self.search_input.is_some()
+            || self.goto_input.is_some()
+        {
+            self.smooth_scroll_remaining = 0;
+            return Ok(());
+        }
+        let now = Instant::now();
+        if self.smooth_scroll_remaining == 0
+            || self.pending_vertical_scroll != 0
+            || now.duration_since(self.smooth_scroll_tick)
+                < Duration::from_millis(self.viewer.scroll_frame_ms)
+        {
+            return Ok(());
+        }
+        self.smooth_scroll_tick = now;
+        let viewport = self.viewport()?;
+        let cell = u64::from((u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1));
+        // Ease toward the accumulated wheel/key target without queuing animations.
+        let remaining = self.smooth_scroll_remaining;
+        let step = (remaining
+            .unsigned_abs()
+            .div_ceil(self.viewer.scroll_ease_divisor)
+            .max(cell)
+            .div_ceil(cell)
+            * cell)
+            .min(remaining.unsigned_abs()) as i64
+            * remaining.signum();
+        self.smooth_scroll_remaining -= step;
+        self.pending_vertical_scroll = step;
+        if self.apply_vertical_scroll(viewport)? {
+            let rest = self.smooth_scroll_remaining;
+            self.request_current(output)?;
+            self.smooth_scroll_remaining = rest;
+        }
+        Ok(())
     }
 
     fn page_key(&self, page: u32, viewport: Viewport) -> RenderKey {
@@ -2716,6 +2779,20 @@ impl App {
 
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         self.pending_vertical_scroll = 0;
+        self.smooth_scroll_remaining = 0;
+        if self.viewer.set_window_title && self.title_document != Some(self.tab().document_id) {
+            let title: String = self
+                .tab()
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            execute!(output, crossterm::terminal::SetTitle(title))?;
+            self.title_document = Some(self.tab().document_id);
+        }
         let viewport = self.prepare_viewport(output)?;
         self.draw_tab_bar(output)?;
         let key = self.render_key(viewport);
@@ -2789,14 +2866,26 @@ impl App {
                 (center_pt / frame.flash_page_height_pt * frame.height as f32).round() as i64;
             self.tab_mut().pending_destination = None;
             self.tab_mut().scroll_y = 0;
-            self.pending_vertical_scroll = center - i64::from(viewport.pixel_height) / 2;
+            let target = center
+                - if self.viewer.center_forward_search {
+                    i64::from(viewport.pixel_height) / 2
+                } else {
+                    i64::from(viewport.pixel_height) * 8 / 100
+                };
+            if self.viewer.continuous_scroll {
+                self.pending_vertical_scroll = target;
+            } else {
+                self.tab_mut().scroll_y = target.max(0) as u32;
+            }
             self.pending_flash.as_mut().unwrap().expires_at =
-                Instant::now() + Duration::from_secs(1);
+                Instant::now() + Duration::from_millis(self.viewer.flash_duration_ms);
         }
 
         if key.document_id == self.tab().document_id && self.pending_vertical_scroll != 0 {
             if self.apply_vertical_scroll(self.viewport()?)? {
+                let rest = self.smooth_scroll_remaining;
                 self.request_current(output)?;
+                self.smooth_scroll_remaining = rest;
             }
             return Ok(());
         }
@@ -2847,7 +2936,10 @@ impl App {
             self.tab_mut().scroll_x = 0;
             self.tab_mut().scroll_y = target_y;
         }
-        if self.link_picker.is_none() && self.search_picker.is_none() {
+        if self.viewer.continuous_scroll
+            && self.link_picker.is_none()
+            && self.search_picker.is_none()
+        {
             return self.draw_continuous(frame, viewport, output);
         }
         self.retain_primary_image(output)?;
@@ -3078,7 +3170,10 @@ impl App {
         mouse: MouseEvent,
         viewport: Viewport,
     ) -> Option<(Arc<Frame>, ImagePlacement, u16)> {
-        if self.link_picker.is_none() && self.search_picker.is_none() {
+        if self.viewer.continuous_scroll
+            && self.link_picker.is_none()
+            && self.search_picker.is_none()
+        {
             return self
                 .visible_pages
                 .iter()
@@ -3097,6 +3192,9 @@ impl App {
             self.tab().scroll_x,
             self.tab().scroll_y,
         );
+        if self.link_picker.is_none() && self.search_picker.is_none() {
+            return Some((frame, placement, viewport.top));
+        }
         let (preview, _) = link_picker_panes(link_picker_area(viewport), self.link_picker_geometry);
         let positioned = position_link_picker_image(
             LinkPickerImage::new(self.visible_image_id?, &frame, placement, viewport),
@@ -3245,6 +3343,7 @@ impl App {
         self.visible_image_id = None;
         self.visible_pages.clear();
         self.pending_vertical_scroll = 0;
+        self.smooth_scroll_remaining = 0;
         self.last_status_row = None;
         execute!(
             output,
@@ -3329,6 +3428,7 @@ impl App {
         self.desired_key = None;
         self.pending.clear();
         self.pending_vertical_scroll = 0;
+        self.smooth_scroll_remaining = 0;
     }
 
     fn viewport(&self) -> io::Result<Viewport> {
@@ -3459,7 +3559,11 @@ impl App {
         };
         let mut column = 0;
         let mut precise = false;
-        match click.text {
+        match if self.viewer.word_precision {
+            click.text
+        } else {
+            Ok(None)
+        } {
             Err(error) => {
                 self.draw_status(
                     output,
@@ -3480,9 +3584,13 @@ impl App {
                         return Ok(());
                     }
                 };
-                if let Some((line, byte)) =
-                    source_word_location(&source, target.line, &context, offset)
-                {
+                if let Some((line, byte)) = source_word_location(
+                    &source,
+                    target.line,
+                    &context,
+                    offset,
+                    self.viewer.source_context_lines as u32,
+                ) {
                     target.line = line;
                     column = byte;
                     precise = true;
@@ -5528,7 +5636,7 @@ fn link_picker_label(label: &str) -> String {
 
 fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
     const NAVIGATION: &[(&str, &str)] = &[
-        ("j/k · ↑/↓", "move vertically"),
+        ("j/k · ↑/↓", "smooth scroll"),
         ("h/l · ←/→", "move horizontally"),
         ("Space · PgDn", "page viewport forward"),
         ("Backspace · PgUp", "page viewport backward"),
@@ -5536,7 +5644,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         (":", "go to page"),
         ("/", "search document"),
         ("n / N", "next / prev match"),
-        ("Mouse wheel", "scroll PDF / change page"),
+        ("Mouse wheel", "smooth scroll"),
         ("Enter", "browse PDF links"),
         ("Click", "follow PDF link"),
         ("h / l (split)", "focus PDF/pane"),
@@ -5551,14 +5659,14 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("+ / -", "zoom in / out"),
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
-        ("Alt/Option-click", "inverse search"),
-        ("p", "toggle performance timings"),
+        ("Alt/Option-click", "word jump + focus"),
+        ("p", "performance timings"),
         ("t", "table of contents"),
         ("T", "choose theme"),
         ("y", "copy page text"),
         ("L", "link mode + browser"),
-        ("s / a", "cycle / auto side layout"),
-        ("b", "return from followed link"),
+        ("s / a", "cycle / auto layout"),
+        ("b", "back from link"),
         ("f", "open PDF in new tab"),
         ("q", "leave mode / close tab"),
         ("Esc", "leave mode / clear / exit"),
@@ -5567,7 +5675,11 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
 
     let colors = PickerTheme::from(theme);
     let area = frame.area();
-    let popup = picker_rect(area);
+    let popup = if area.width < 110 {
+        area
+    } else {
+        picker_rect(area)
+    };
     frame.render_widget(
         Block::default().style(Style::default().bg(colors.backdrop)),
         area,
@@ -5587,24 +5699,57 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         );
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(if inner.width < 80 { 10 } else { 6 }),
+        Constraint::Length(1),
+    ])
+    .split(inner);
     let columns =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
+        if inner.width < 90 && usize::from(rows[0].height) >= NAVIGATION.len() + VIEWER.len() + 4 {
+            Layout::vertical([
+                Constraint::Length(NAVIGATION.len() as u16 + 2),
+                Constraint::Min(1),
+            ])
+            .split(rows[0])
+        } else {
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .spacing(2)
+                .split(rows[0])
+        };
 
     frame.render_widget(
         Paragraph::new(help_lines("Navigation", NAVIGATION, 18, colors))
-            .style(Style::default().bg(colors.surface)),
+            .style(Style::default().bg(colors.surface))
+            .wrap(Wrap { trim: true }),
         columns[0],
     );
     frame.render_widget(
-        Paragraph::new(help_lines("Viewer", VIEWER, 5, colors))
-            .style(Style::default().bg(colors.surface)),
+        Paragraph::new(help_lines("Viewer", VIEWER, 18, colors))
+            .style(Style::default().bg(colors.surface))
+            .wrap(Wrap { trim: true }),
         columns[1],
+    );
+    let path = crate::config::config_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "HOME is unset".into());
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("Config: {path}")),
+            Line::from("[viewer]: smooth_scroll, scroll_frame_ms, scroll_ease_divisor"),
+            Line::from("[viewer]: continuous_scroll, set_window_title, center_forward_search"),
+            Line::from("[viewer]: flash_duration_ms, word_precision, source_context_lines"),
+            Line::from("[nvim]: focus_on_inverse, viewer, compile; [nvim.keys]: editor keys"),
+            Line::from("Commented defaults on first launch. Edit config, then restart."),
+        ])
+        .style(Style::default().bg(colors.surface).fg(colors.text))
+        .wrap(Wrap { trim: true }),
+        rows[1],
     );
     frame.render_widget(
         Paragraph::new(picker_hint_line(&[("? / esc / q", "close")], None, colors))
             .style(Style::default().bg(colors.chrome)),
-        rows[1],
+        rows[2],
     );
 }
 
@@ -6227,6 +6372,7 @@ fn source_word_location(
     line: u32,
     context: &str,
     offset: usize,
+    radius: u32,
 ) -> Option<(u32, usize)> {
     fn words(text: &str) -> Vec<(usize, &str)> {
         let mut result = Vec::new();
@@ -6257,11 +6403,11 @@ fn source_word_location(
         .position(|(start, word)| *start <= offset && offset < start + word.len())?;
     let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized(word)).collect();
     let mut candidates = Vec::new();
-    let start_line = line.saturating_sub(5) as usize;
+    let start_line = line.saturating_sub(radius + 1) as usize;
     for (index, text) in source
         .lines()
         .enumerate()
-        .take(line as usize + 4)
+        .take(line as usize + radius as usize)
         .skip(start_line)
     {
         let text = text.split('%').next().unwrap_or("");
@@ -7684,25 +7830,31 @@ mod tests {
         let source = "A repeated word far away.\nÉlie uses \\emph{repeated} maps near fibers.\nRepeated noise.\n";
         let context = "Élie uses repeated maps near ﬁbers.";
         assert_eq!(
-            super::source_word_location(source, 2, context, context.find("repeated").unwrap()),
+            super::source_word_location(source, 2, context, context.find("repeated").unwrap(), 4),
             Some((2, source.lines().nth(1).unwrap().find("repeated").unwrap()))
         );
         assert_eq!(
-            super::source_word_location(source, 3, context, context.find("ﬁbers").unwrap()),
+            super::source_word_location(source, 3, context, context.find("ﬁbers").unwrap(), 4),
             Some((2, source.lines().nth(1).unwrap().find("fibers").unwrap()))
         );
-        assert_eq!(super::source_word_location("word word", 1, "word", 1), None);
         assert_eq!(
-            super::source_word_location("\\word % word", 1, "word", 1),
+            super::source_word_location("word word", 1, "word", 1, 4),
             None
         );
-        assert_eq!(super::source_word_location("word", 1, "missing", 1), None);
+        assert_eq!(
+            super::source_word_location("\\word % word", 1, "word", 1, 4),
+            None
+        );
+        assert_eq!(
+            super::source_word_location("word", 1, "missing", 1, 4),
+            None
+        );
         let boundary = "one\ntwo\nthree\nfour\nfive\nsix";
         assert_eq!(
-            super::source_word_location(boundary, 1, "five", 1),
+            super::source_word_location(boundary, 1, "five", 1, 4),
             Some((5, 0))
         );
-        assert_eq!(super::source_word_location(boundary, 1, "six", 1), None);
+        assert_eq!(super::source_word_location(boundary, 1, "six", 1, 4), None);
     }
 
     #[test]

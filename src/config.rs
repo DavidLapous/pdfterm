@@ -1,17 +1,15 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::pdf::FitMode;
 
-/// User settings loaded from `$XDG_CONFIG_HOME/pdfterm/config.toml`
-/// (falling back to `~/.config/pdfterm/config.toml`). Every field is optional;
-/// a missing or unreadable file yields defaults, and a malformed file is
-/// reported once and then ignored.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+/// Settings shared by the viewer and its bundled Neovim plugin.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     fit_mode: FitModeSetting,
     #[serde(alias = "invert")]
@@ -24,9 +22,11 @@ pub struct Config {
     synctex_enabled: Option<bool>,
     nvim_socket: Option<String>,
     forward_socket: Option<String>,
+    pub viewer: ViewerSettings,
+    pub nvim: NvimSettings,
 }
 
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum FitModeSetting {
     #[default]
@@ -35,7 +35,7 @@ enum FitModeSetting {
     Height,
 }
 
-#[derive(Debug, Default, Clone, Copy, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkPickerLayout {
     #[default]
@@ -46,22 +46,40 @@ pub enum LinkPickerLayout {
 }
 
 impl Config {
-    /// Loads the configuration, returning defaults when no usable file exists.
-    pub fn load() -> Self {
-        let Some(path) = config_path() else {
-            return Self::default();
-        };
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(_) => return Self::default(),
-        };
-        match toml::from_str(&text) {
-            Ok(config) => config,
-            Err(error) => {
-                eprintln!("pdfterm: ignoring {}: {error}", path.display());
-                Self::default()
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let path = config_path().ok_or("HOME or XDG_CONFIG_HOME must be set")?;
+        Self::load_path(&path).map_err(|error| format!("{}: {error}", path.display()).into())
+    }
+
+    fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        fs::create_dir_all(path.parent().ok_or("config path has no parent")?)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => file.write_all(include_bytes!("../config.default.toml"))?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        let viewer = &config.viewer;
+        for (name, value, low, high) in [
+            ("scroll_frame_ms", viewer.scroll_frame_ms, 1, 1000),
+            ("scroll_ease_divisor", viewer.scroll_ease_divisor, 1, 100),
+            ("scroll_step_percent", viewer.scroll_step_percent, 1, 100),
+            ("page_scroll_percent", viewer.page_scroll_percent, 1, 100),
+            ("flash_duration_ms", viewer.flash_duration_ms, 1, 60000),
+            ("source_context_lines", viewer.source_context_lines, 0, 100),
+        ] {
+            if !(low..=high).contains(&value) {
+                return Err(format!("viewer.{name} must be in {low}..={high}").into());
             }
         }
+        if !matches!(config.nvim.viewer.as_str(), "terminal" | "skim") {
+            return Err("nvim.viewer must be terminal or skim".into());
+        }
+        Ok(config)
     }
 
     pub fn fit_mode(&self) -> FitMode {
@@ -77,11 +95,13 @@ impl Config {
     }
 
     pub fn theme(&self) -> Option<&str> {
-        self.theme.as_deref()
+        self.theme.as_deref().filter(|value| !value.is_empty())
     }
 
     pub fn theme_catalog(&self) -> Option<&str> {
-        self.theme_catalog.as_deref()
+        self.theme_catalog
+            .as_deref()
+            .filter(|value| !value.is_empty())
     }
 
     pub fn persistent_link_picker(&self) -> bool {
@@ -101,15 +121,19 @@ impl Config {
     }
 
     pub fn nvim_socket(&self) -> Option<&str> {
-        self.nvim_socket.as_deref()
+        self.nvim_socket
+            .as_deref()
+            .filter(|value| !value.is_empty())
     }
 
     pub fn forward_socket(&self) -> Option<&str> {
-        self.forward_socket.as_deref()
+        self.forward_socket
+            .as_deref()
+            .filter(|value| !value.is_empty())
     }
 }
 
-fn config_path() -> Option<PathBuf> {
+pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config.toml"))
 }
 
@@ -125,10 +149,110 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
     Some(config_root()?.join("pdfterm"))
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            fit_mode: FitModeSetting::default(),
+            dark_mode: false,
+            theme: None,
+            theme_catalog: None,
+            persistent_link_picker: false,
+            link_picker_split_percent: None,
+            link_picker_layout: LinkPickerLayout::Auto,
+            synctex_enabled: None,
+            nvim_socket: Some("/tmp/pdfterm-nvim.sock".into()),
+            forward_socket: Some("/tmp/pdfterm-forward.sock".into()),
+            viewer: ViewerSettings::default(),
+            nvim: NvimSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ViewerSettings {
+    pub continuous_scroll: bool,
+    pub smooth_scroll: bool,
+    pub scroll_frame_ms: u64,
+    pub scroll_ease_divisor: u64,
+    pub scroll_step_percent: u64,
+    pub page_scroll_percent: u64,
+    pub set_window_title: bool,
+    pub center_forward_search: bool,
+    pub flash_duration_ms: u64,
+    pub word_precision: bool,
+    pub source_context_lines: u64,
+}
+
+impl Default for ViewerSettings {
+    fn default() -> Self {
+        Self {
+            continuous_scroll: true,
+            smooth_scroll: true,
+            scroll_frame_ms: 16,
+            scroll_ease_divisor: 4,
+            scroll_step_percent: 12,
+            page_scroll_percent: 85,
+            set_window_title: true,
+            center_forward_search: true,
+            flash_duration_ms: 1000,
+            word_precision: true,
+            source_context_lines: 4,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NvimSettings {
+    pub viewer: String,
+    pub compile: bool,
+    pub focus_on_inverse: bool,
+    pub executable: String,
+    pub keys: NvimKeys,
+}
+
+impl Default for NvimSettings {
+    fn default() -> Self {
+        Self {
+            viewer: "terminal".into(),
+            compile: false,
+            focus_on_inverse: true,
+            executable: String::new(),
+            keys: NvimKeys::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NvimKeys {
+    pub forward: String,
+    pub build: String,
+    pub main_file: String,
+    pub compile: String,
+    pub skim: String,
+    pub terminal: String,
+}
+
+impl Default for NvimKeys {
+    fn default() -> Self {
+        Self {
+            forward: "<leader>cl".into(),
+            build: "<leader>cb".into(),
+            main_file: "<leader>csl".into(),
+            compile: "<leader>cscl".into(),
+            skim: "<leader>csls".into(),
+            terminal: "<leader>cslt".into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Config, LinkPickerLayout};
     use crate::pdf::FitMode;
+    use std::fs;
 
     #[test]
     fn empty_config_uses_defaults() {
@@ -192,14 +316,7 @@ mod tests {
                 .expect("config");
         assert!(!config.synctex_enabled());
         assert_eq!(config.nvim_socket(), Some("/tmp/pdfterm.sock"));
-        assert_eq!(config.forward_socket(), None);
-    }
-
-    #[test]
-    fn synctex_defaults_to_enabled() {
-        let config: Config = toml::from_str("").expect("empty config");
-        assert!(config.synctex_enabled());
-        assert_eq!(config.nvim_socket(), None);
+        assert_eq!(config.forward_socket(), Some("/tmp/pdfterm-forward.sock"));
     }
 
     #[test]
@@ -216,9 +333,24 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_ignored() {
-        let config: Config =
-            toml::from_str("future_option = 42\ndark_mode = true\n").expect("config");
-        assert!(config.dark_mode());
+    fn rejects_unknown_keys() {
+        assert!(toml::from_str::<Config>("future_option = 42").is_err());
+    }
+
+    #[test]
+    fn creates_documented_config_without_overwriting_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pdfterm/config.toml");
+        Config::load_path(&path).unwrap();
+        let template = fs::read_to_string(&path).unwrap();
+        assert_eq!(template, include_str!("../config.default.toml"));
+        fs::write(&path, "[viewer]\nsmooth_scroll = false\n").unwrap();
+        assert!(!Config::load_path(&path).unwrap().viewer.smooth_scroll);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[viewer]\nsmooth_scroll = false\n"
+        );
+        fs::write(&path, "[viewer]\nscroll_frame_ms = 0\n").unwrap();
+        assert!(Config::load_path(&path).is_err());
     }
 }
