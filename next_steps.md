@@ -4,16 +4,14 @@
       the directory label is absent even when scanning the whole popup rect.
       Failure also occurs on clean baseline `08996cb`.
 
-- [ ] Isolate the forward-write EPIPE observed while Neovim had a file-change
-      prompt open. Check scheduled write callbacks against the viewer's bounded
-      receive deadline; causality has not been established.
+- [ ] Exercise build, rendering, generic editor commands, private sockets, and
+      Kitty lifecycle on Linux when a Linux machine is available. Ghostty's
+      current editor adapter uses macOS AppleScript.
 
-## Accepted caveats
+## Accepted limits
 
-- Forward-socket path steal: a second pdfterm instance unlinks and rebinds
-  `/tmp/pdfterm-forward.sock` (last instance wins; the old viewer keeps an
-  orphaned listener). Documented in `poll_forward_socket`; explicit error only
-  if bind itself fails.
-  Separate instances can use different socket pairs through separate
-  `XDG_CONFIG_HOME` configurations; document identity is still absent from the
-  forward payload.
+- One viewer and one editor socket adapter per configuration; a viewer may hold
+  multiple PDF tabs. Separate configurations isolate independent sessions.
+- A crash or SIGKILL can leave an endpoint requiring explicit stale-file removal.
+- PDFium runs in-process without a sandbox; do not treat untrusted PDFs as safe.
+- Source-word precision requires saved source and an unambiguous prose match.

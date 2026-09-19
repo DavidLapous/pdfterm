@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -31,8 +30,9 @@ use crate::config::{Config, LinkPickerLayout, ViewerSettings};
 use crate::kitty::{self, Placement};
 use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
-    RenderKey, RenderRequest, RenderWorker, SearchPageMatch, SearchRect, WorkerMessage,
+    RenderKey, RenderRequest, RenderWorker, SearchPageMatch, WorkerMessage,
 };
+use crate::synctex::{ForwardRequest, parse_forward_request};
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
 
@@ -78,12 +78,24 @@ where
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("viewer quit requested")]
+    Quit,
     #[error("pdfterm requires an interactive terminal")]
     NotInteractive,
     #[error("{0}")]
     Renderer(String),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+fn read_event() -> Result<Event, AppError> {
+    let event = event::read()?;
+    if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        return Err(AppError::Quit);
+    }
+    Ok(event)
 }
 
 pub fn run(
@@ -212,12 +224,12 @@ pub fn run(
         app.poll_file_change(&mut output)?;
         app.poll_link_preview(&mut output)?;
         app.poll_search_preview(&mut output)?;
-        app.poll_forward_socket()?;
+        app.poll_forward_socket(&mut output)?;
         app.poll_flash_expiry()?;
         app.poll_smooth_scroll(&mut output)?;
 
         if event::poll(Duration::from_millis(10))? {
-            match event::read()? {
+            match read_event()? {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press && app.handle_key(key, &mut output)? =>
                 {
@@ -278,9 +290,9 @@ struct App {
     next_synctex_request_id: u64,
     pending_synctex: Option<PendingSynctex>,
     synctex_enabled: bool,
-    nvim_socket: Option<String>,
+    editor: crate::editor::Editor,
     forward_socket: Option<String>,
-    forward_listener: Option<UnixListener>,
+    forward_listener: Option<crate::ipc::Listener>,
     pending_flash: Option<PendingFlash>,
     pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
@@ -304,7 +316,7 @@ struct AppDefaults {
     persistent_link_picker: bool,
     link_picker_geometry: LinkPickerGeometry,
     synctex_enabled: bool,
-    nvim_socket: Option<String>,
+    editor: crate::editor::Editor,
     forward_socket: Option<String>,
     viewer: ViewerSettings,
 }
@@ -335,7 +347,7 @@ impl From<&Config> for AppDefaults {
                 config.link_picker_layout(),
             ),
             synctex_enabled: config.synctex_enabled(),
-            nvim_socket: config.nvim_socket().map(str::to_owned),
+            editor: config.editor.clone(),
             forward_socket: config.forward_socket().map(str::to_owned),
             viewer: config.viewer,
             theme,
@@ -767,32 +779,6 @@ fn render_timing_status(
     format!("render {total_ms}ms")
 }
 
-struct ForwardRequest {
-    page: u32,
-    rect: SearchRect,
-}
-
-/// Parses the control-socket wire format: "page:h:v:W:H" with a one-based
-/// page and synctex point coordinates (h = box left, v = box bottom).
-fn parse_forward_request(payload: &str) -> Option<ForwardRequest> {
-    let payload = payload.trim();
-    let mut parts = payload.split(':');
-    let page = parts.next()?.parse::<u32>().ok()?;
-    let h = parts.next()?.parse::<f32>().ok()?;
-    let v = parts.next()?.parse::<f32>().ok()?;
-    let width = parts.next()?.parse::<f32>().ok()?;
-    let height = parts.next()?.parse::<f32>().ok()?;
-    Some(ForwardRequest {
-        page,
-        rect: SearchRect {
-            left: h,
-            top: v - height,
-            right: h + width,
-            bottom: v,
-        },
-    })
-}
-
 struct PendingFlash {
     document_id: DocumentId,
     page: u32,
@@ -889,7 +875,7 @@ impl App {
             next_synctex_request_id: 1,
             pending_synctex: None,
             synctex_enabled: defaults.synctex_enabled,
-            nvim_socket: defaults.nvim_socket,
+            editor: defaults.editor,
             forward_socket: defaults.forward_socket,
             forward_listener: None,
             pending_flash: None,
@@ -1563,7 +1549,15 @@ impl App {
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(size) => payload.extend_from_slice(&buffer[..size]),
+                Ok(size) => {
+                    if payload.len() + size > 4096 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "forward request exceeds 4096 bytes",
+                        ));
+                    }
+                    payload.extend_from_slice(&buffer[..size]);
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -1571,37 +1565,54 @@ impl App {
                 Err(error) => return Err(error),
             }
             if Instant::now() >= deadline {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "forward request did not reach EOF within 100ms",
+                ));
             }
         }
         String::from_utf8(payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
-    fn poll_forward_socket(&mut self) -> Result<(), AppError> {
+    fn poll_forward_socket(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let Some(path) = self.forward_socket.clone() else {
             return Ok(());
         };
         if self.forward_listener.is_none() {
-            // Unlink whatever sits at the path before binding: a stale file
-            // from a crashed viewer is reclaimed, and a live viewer's path
-            // is stolen (last instance wins; the old listener is orphaned
-            // and stops receiving requests).
-            let _ = fs::remove_file(&path);
-            let listener = UnixListener::bind(&path).map_err(AppError::from)?;
-            listener.set_nonblocking(true).map_err(AppError::from)?;
-            self.forward_listener = Some(listener);
+            self.forward_listener = Some(crate::ipc::Listener::bind(Path::new(&path))?);
         }
         let Some(listener) = self.forward_listener.as_ref() else {
             return Ok(());
         };
         // Accept is nonblocking: WouldBlock means no client is waiting.
-        if let Ok((mut stream, _)) = listener.accept() {
-            let payload = Self::read_forward_payload(&mut stream)?;
-
-            if let Some(request) = parse_forward_request(&payload) {
-                self.apply_forward_request(request, Instant::now())?;
-            }
+        let mut stream = match listener.socket.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let result = Self::read_forward_payload(&mut stream)
+            .and_then(|payload| parse_forward_request(&payload))
+            .and_then(|request| {
+                self.apply_forward_request(request, Instant::now(), output)
+                    .map_err(io::Error::other)
+            });
+        let reply = crate::editor::Reply {
+            ok: result.is_ok(),
+            error: result.err().map(|error| error.to_string()),
+        };
+        if let Err(error) = serde_json::to_writer(&mut stream, &reply) {
+            self.draw_status(
+                output,
+                self.viewport()?,
+                &format!("forward reply failed: {error}"),
+            )?;
+        } else if let Some(error) = reply.error {
+            self.draw_status(
+                output,
+                self.viewport()?,
+                &format!("forward search: {error}"),
+            )?;
         }
         Ok(())
     }
@@ -1610,7 +1621,24 @@ impl App {
         &mut self,
         request: ForwardRequest,
         now: Instant,
+        output: &mut impl Write,
     ) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Err(io::Error::other("viewer is still opening a document").into());
+        }
+        let pdf = fs::canonicalize(&request.pdf)?;
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| fs::canonicalize(&tab.path).ok().as_ref() == Some(&pdf))
+            .ok_or_else(|| {
+                io::Error::other(format!("PDF is not open in this viewer: {}", pdf.display()))
+            })?;
+        if request.page > self.tabs[index].page_count {
+            return Err(io::Error::other("forward page is outside the document").into());
+        }
+        let rect = request.rect();
+        self.select_tab(index, output)?;
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
         if let Some(previous) = self.pending_flash.take() {
@@ -1633,13 +1661,13 @@ impl App {
             document_id,
             page,
             center_pt: Some(if self.viewer.center_forward_search {
-                (request.rect.top + request.rect.bottom) * 0.5
+                (rect.top + rect.bottom) * 0.5
             } else {
-                request.rect.top
+                rect.top
             }),
             expires_at: now + Duration::from_millis(self.viewer.flash_duration_ms),
         });
-        self.worker.flash(document_id, page, request.rect);
+        self.worker.flash(document_id, page, rect);
         self.generation += 1;
         self.worker.begin_generation(self.generation);
         let viewport = self.viewport()?;
@@ -1781,7 +1809,7 @@ impl App {
                 && self.search_input.is_none()
                 && self.goto_input.is_none()
             {
-                self.move_view(axis, forward, false, output)?;
+                self.move_view(axis, forward, false, axis == Axis::Vertical, output)?;
             }
             return Ok(());
         }
@@ -2390,19 +2418,19 @@ impl App {
         }
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_view(Axis::Vertical, true, false, output)?
+                self.move_view(Axis::Vertical, true, false, true, output)?
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_view(Axis::Vertical, false, false, output)?
+                self.move_view(Axis::Vertical, false, false, true, output)?
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.move_view(Axis::Vertical, true, true, output)?
+                self.move_view(Axis::Vertical, true, true, true, output)?
             }
             KeyCode::PageUp | KeyCode::Backspace => {
-                self.move_view(Axis::Vertical, false, true, output)?
+                self.move_view(Axis::Vertical, false, true, true, output)?
             }
-            KeyCode::Right => self.move_view(Axis::Horizontal, true, false, output)?,
-            KeyCode::Left => self.move_view(Axis::Horizontal, false, false, output)?,
+            KeyCode::Right => self.move_view(Axis::Horizontal, true, false, true, output)?,
+            KeyCode::Left => self.move_view(Axis::Horizontal, false, false, true, output)?,
             KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
                 self.set_page(self.tab().page_count - 1, output)?
@@ -2453,22 +2481,22 @@ impl App {
             KeyCode::Tab => self.switch_tab(1, output)?,
             KeyCode::BackTab => self.switch_tab(-1, output)?,
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_view(Axis::Vertical, true, false, output)?
+                self.move_view(Axis::Vertical, true, false, true, output)?
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_view(Axis::Vertical, false, false, output)?
+                self.move_view(Axis::Vertical, false, false, true, output)?
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.move_view(Axis::Vertical, true, true, output)?
+                self.move_view(Axis::Vertical, true, true, true, output)?
             }
             KeyCode::PageUp | KeyCode::Backspace => {
-                self.move_view(Axis::Vertical, false, true, output)?
+                self.move_view(Axis::Vertical, false, true, true, output)?
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.move_view(Axis::Horizontal, true, false, output)?
+                self.move_view(Axis::Horizontal, true, false, true, output)?
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.move_view(Axis::Horizontal, false, false, output)?
+                self.move_view(Axis::Horizontal, false, false, true, output)?
             }
             KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
@@ -2490,13 +2518,10 @@ impl App {
 
     fn set_page(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
         let page = page.min(self.tab().page_count - 1);
-        if page != self.tab().page {
-            self.tab_mut().page = page;
-            self.tab_mut().scroll_x = 0;
-            self.tab_mut().scroll_y = 0;
-            self.request_current(output)?;
-        }
-        Ok(())
+        self.tab_mut().page = page;
+        self.tab_mut().scroll_x = 0;
+        self.tab_mut().scroll_y = 0;
+        self.request_current(output)
     }
 
     /// Vertical movement crosses page boundaries without discarding the remainder.
@@ -2505,6 +2530,7 @@ impl App {
         axis: Axis,
         forward: bool,
         large: bool,
+        allow_page_step: bool,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let viewport = self.viewport()?;
@@ -2531,7 +2557,11 @@ impl App {
         }
         let key = self.render_key(viewport);
         let Some(frame) = self.tab().cache.get(&key).cloned() else {
-            return self.page_step(forward, output);
+            return if allow_page_step {
+                self.page_step(forward, output)
+            } else {
+                Ok(())
+            };
         };
         let (max_x, max_y) = viewport.max_scroll(frame.width, frame.height);
         let (axis_max, current) = match axis {
@@ -2539,7 +2569,11 @@ impl App {
             Axis::Horizontal => (max_x, self.tab().scroll_x),
         };
         if axis_max == 0 {
-            return self.page_step(forward, output);
+            return if allow_page_step {
+                self.page_step(forward, output)
+            } else {
+                Ok(())
+            };
         }
 
         let span = match axis {
@@ -2554,12 +2588,20 @@ impl App {
 
         let next = if forward {
             if current >= axis_max {
-                return self.page_step(true, output);
+                return if allow_page_step {
+                    self.page_step(true, output)
+                } else {
+                    Ok(())
+                };
             }
             (current + step).min(axis_max)
         } else {
             if current == 0 {
-                return self.page_step(false, output);
+                return if allow_page_step {
+                    self.page_step(false, output)
+                } else {
+                    Ok(())
+                };
             }
             current.saturating_sub(step)
         };
@@ -3537,79 +3579,46 @@ impl App {
         let Some(index) = self.tab_index(click.document_id) else {
             return Ok(());
         };
-        let pdf_path = self.tabs[index].path.display().to_string();
-        let synctex_y = click.page_height_pt - click.pdf_y;
-        let spec = format!(
-            "{}:{:.2}:{:.2}:{}",
-            click.page + 1,
-            click.pdf_x,
-            synctex_y,
-            pdf_path
-        );
-        let resolved = Command::new("synctex").args(["edit", "-o", &spec]).output();
         let viewport = self.viewport()?;
-        let Some(resolved) = resolved.ok().filter(|resolved| resolved.status.success()) else {
-            self.draw_status(output, viewport, "inverse search: synctex failed")?;
-            return Ok(());
-        };
-        let stdout = String::from_utf8_lossy(&resolved.stdout);
-        let Some(mut target) = parse_synctex_edit(&stdout) else {
-            self.draw_status(output, viewport, "inverse search: no synctex match")?;
-            return Ok(());
-        };
-        let mut column = 0;
-        let mut precise = false;
-        match if self.viewer.word_precision {
-            click.text
-        } else {
-            Ok(None)
-        } {
-            Err(error) => {
-                self.draw_status(
-                    output,
-                    viewport,
-                    &format!("inverse search: PDF text: {error}"),
-                )?;
-                return Ok(());
-            }
-            Ok(Some((context, offset))) => {
-                let source = match fs::read_to_string(&target.file) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        self.draw_status(
-                            output,
-                            viewport,
-                            &format!("inverse search: source: {error}"),
-                        )?;
-                        return Ok(());
-                    }
-                };
-                if let Some((line, byte)) = source_word_location(
-                    &source,
-                    target.line,
-                    &context,
-                    offset,
-                    self.viewer.source_context_lines as u32,
-                ) {
-                    target.line = line;
-                    column = byte;
-                    precise = true;
+        let word = if self.viewer.word_precision {
+            match &click.text {
+                Ok(word) => word
+                    .as_ref()
+                    .map(|(context, offset)| (context.as_str(), *offset)),
+                Err(error) => {
+                    self.draw_status(
+                        output,
+                        viewport,
+                        &format!("inverse search: PDF text: {error}"),
+                    )?;
+                    return Ok(());
                 }
             }
-            Ok(None) => {}
-        }
-        let handoff = format!("{}:{}:{}", target.file, target.line, column);
-        if let Some(socket_path) = self.nvim_socket.as_deref() {
-            let sent = std::os::unix::net::UnixStream::connect(socket_path)
-                .and_then(|mut stream| stream.write_all(handoff.as_bytes()));
-            if let Err(error) = sent {
-                self.draw_status(
-                    output,
-                    viewport,
-                    &format!("inverse search: editor handoff: {error}"),
-                )?;
+        } else {
+            None
+        };
+        let target = match crate::synctex::resolve_inverse(
+            &self.tabs[index].path,
+            click.page + 1,
+            click.pdf_x,
+            click.page_height_pt - click.pdf_y,
+            word,
+            self.viewer.source_context_lines as u32,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                self.draw_status(output, viewport, &format!("inverse search: {error}"))?;
                 return Ok(());
             }
+        };
+        let handoff = format!("{}:{}:{}", target.file, target.line, target.byte_column);
+        if let Err(error) = self.editor.deliver(&target) {
+            self.draw_status(
+                output,
+                viewport,
+                &format!("inverse search: editor handoff: {error}"),
+            )?;
+            return Ok(());
         }
         write_clipboard_osc52(output, &handoff)?;
         let shown = target.file.rsplit('/').next().unwrap_or(&target.file);
@@ -3620,8 +3629,8 @@ impl App {
                 "inverse search: {}:{}:{} ({})",
                 shown,
                 target.line,
-                column + 1,
-                if precise {
+                target.byte_column + 1,
+                if target.precise {
                     "word, copied"
                 } else {
                     "line only, copied"
@@ -3761,7 +3770,7 @@ fn pick_pdf(
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let key = match event::read()? {
+        let key = match read_event()? {
             Event::Key(key) => key,
             Event::Resize(_, _) => {
                 redraw = true;
@@ -3839,7 +3848,7 @@ fn show_help(output: &mut impl Write, theme: Palette) -> Result<(), AppError> {
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        match event::read()? {
+        match read_event()? {
             Event::Resize(_, _) => redraw = true,
             Event::Key(key)
                 if key.kind == KeyEventKind::Press
@@ -3887,7 +3896,7 @@ fn pick_theme(
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let key = match event::read()? {
+        let key = match read_event()? {
             Event::Key(key) => key,
             Event::Resize(_, _) => {
                 redraw = true;
@@ -4400,7 +4409,7 @@ fn pick_outline(
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let key = match event::read()? {
+        let key = match read_event()? {
             Event::Key(key) => key,
             Event::Resize(_, _) => {
                 redraw = true;
@@ -6364,116 +6373,6 @@ impl FileWatcher {
     }
 }
 
-/// Resolve a PDF word near SyncTeX's source line, using neighboring words to
-/// disambiguate repeats. Columns are zero-based UTF-8 byte offsets for Neovim.
-/// ponytail: prose matching, not a TeX expander; macros may remain line-only.
-fn source_word_location(
-    source: &str,
-    line: u32,
-    context: &str,
-    offset: usize,
-    radius: u32,
-) -> Option<(u32, usize)> {
-    fn words(text: &str) -> Vec<(usize, &str)> {
-        let mut result = Vec::new();
-        let mut start = None;
-        for (index, ch) in text
-            .char_indices()
-            .chain(std::iter::once((text.len(), ' ')))
-        {
-            if ch.is_alphanumeric() {
-                start.get_or_insert(index);
-            } else if let Some(start) = start.take() {
-                result.push((start, &text[start..index]));
-            }
-        }
-        result
-    }
-    fn normalized(word: &str) -> String {
-        word.to_lowercase()
-            .replace('ﬁ', "fi")
-            .replace('ﬂ', "fl")
-            .replace('ﬀ', "ff")
-            .replace('ﬃ', "ffi")
-            .replace('ﬄ', "ffl")
-    }
-    let pdf = words(context);
-    let selected = pdf
-        .iter()
-        .position(|(start, word)| *start <= offset && offset < start + word.len())?;
-    let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized(word)).collect();
-    let mut candidates = Vec::new();
-    let start_line = line.saturating_sub(radius + 1) as usize;
-    for (index, text) in source
-        .lines()
-        .enumerate()
-        .take(line as usize + radius as usize)
-        .skip(start_line)
-    {
-        let text = text.split('%').next().unwrap_or("");
-        for (byte, word) in words(text) {
-            if byte == 0 || !text[..byte].ends_with('\\') {
-                candidates.push((index as u32 + 1, byte, normalized(word)));
-            }
-        }
-    }
-    let mut best = None;
-    let mut tied = false;
-    for (index, (row, byte, word)) in candidates.iter().enumerate() {
-        if *word != pdf[selected] {
-            continue;
-        }
-        let mut score = 0;
-        for distance in 1..=3 {
-            for direction in [-1isize, 1] {
-                let delta = distance * direction;
-                if let (Some(a), Some(b)) = (
-                    selected.checked_add_signed(delta).and_then(|i| pdf.get(i)),
-                    index
-                        .checked_add_signed(delta)
-                        .and_then(|i| candidates.get(i)),
-                ) && *a == b.2
-                {
-                    score += 4 - distance;
-                }
-            }
-        }
-        let rank = (score, std::cmp::Reverse(row.abs_diff(line)));
-        match best {
-            Some((old, _, _)) if rank < old => {}
-            Some((old, _, _)) if rank == old => tied = true,
-            _ => {
-                best = Some((rank, *row, *byte));
-                tied = false;
-            }
-        }
-    }
-    best.filter(|_| !tied).map(|(_, row, byte)| (row, byte))
-}
-
-/// Parses the stdout of `synctex edit -o ...` into a source file and line.
-/// SyncTeX may return Column: -1; PDF text refines the source position separately.
-/// Returns None when no match is found.
-fn parse_synctex_edit(stdout: &str) -> Option<SynctexTarget> {
-    let mut input: Option<String> = None;
-    let mut line: Option<u32> = None;
-    for row in stdout.lines() {
-        if let Some(value) = row.strip_prefix("Input:") {
-            input = Some(value.trim().to_owned());
-        } else if let Some(value) = row.strip_prefix("Line:") {
-            line = value.trim().parse::<u32>().ok().or(line);
-        }
-    }
-    let file = input?;
-    let line = line?;
-    Some(SynctexTarget { file, line })
-}
-
-struct SynctexTarget {
-    file: String,
-    line: u32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -6486,7 +6385,7 @@ mod tests {
         link_at_cell, link_picker_focus_for_key, link_picker_label, link_picker_link_at_position,
         link_picker_list_area, link_picker_navigation_index, link_picker_panes,
         link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
-        outline_start_index, parse_synctex_edit, picker_color, picker_rect, render_timing_status,
+        outline_start_index, picker_color, picker_rect, render_timing_status,
         restore_link_picker_split, search_target_page, shorten_path, show_link_picker_split,
         stale_status_row, stepped_zoom, synchronized_output, update_link_number_selection,
         write_clipboard_osc52,
@@ -6505,12 +6404,6 @@ mod tests {
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant, SystemTime};
-
-    #[test]
-    fn page_navigation_bounds_are_saturating() {
-        assert_eq!(0_u32.saturating_sub(1), 0);
-        assert_eq!(u32::MAX.saturating_add(1), u32::MAX);
-    }
 
     #[test]
     fn synchronized_output_closes_successful_and_failed_updates() {
@@ -7826,73 +7719,29 @@ mod tests {
     }
 
     #[test]
-    fn inverse_word_matching_resolves_context_and_utf8_byte_columns() {
-        let source = "A repeated word far away.\nÉlie uses \\emph{repeated} maps near fibers.\nRepeated noise.\n";
-        let context = "Élie uses repeated maps near ﬁbers.";
-        assert_eq!(
-            super::source_word_location(source, 2, context, context.find("repeated").unwrap(), 4),
-            Some((2, source.lines().nth(1).unwrap().find("repeated").unwrap()))
-        );
-        assert_eq!(
-            super::source_word_location(source, 3, context, context.find("ﬁbers").unwrap(), 4),
-            Some((2, source.lines().nth(1).unwrap().find("fibers").unwrap()))
-        );
-        assert_eq!(
-            super::source_word_location("word word", 1, "word", 1, 4),
-            None
-        );
-        assert_eq!(
-            super::source_word_location("\\word % word", 1, "word", 1, 4),
-            None
-        );
-        assert_eq!(
-            super::source_word_location("word", 1, "missing", 1, 4),
-            None
-        );
-        let boundary = "one\ntwo\nthree\nfour\nfive\nsix";
-        assert_eq!(
-            super::source_word_location(boundary, 1, "five", 1, 4),
-            Some((5, 0))
-        );
-        assert_eq!(super::source_word_location(boundary, 1, "six", 1, 4), None);
-    }
-
-    #[test]
-    fn parse_synctex_edit_finds_file_and_line() {
-        let stdout = "Output: paper.pdf\nInput: /private/tmp/synctex-test/./paper.tex\nLine: 3\nColumn: -1\n";
-        let target = parse_synctex_edit(stdout).expect("synctex match");
-        assert_eq!(target.file, "/private/tmp/synctex-test/./paper.tex");
-        assert_eq!(target.line, 3);
-    }
-
-    #[test]
-    fn parse_synctex_edit_takes_last_input() {
-        let stdout = "Input: preamble.tex\nLine: 9\nInput: paper.tex\nLine: 3\n";
-        let target = parse_synctex_edit(stdout).expect("synctex match");
-        assert_eq!(target.file, "paper.tex");
-        assert_eq!(target.line, 3);
-    }
-
-    #[test]
-    fn parse_synctex_edit_rejects_missing_input() {
-        assert!(parse_synctex_edit("Output: paper.pdf\nLine: 3\n").is_none());
-        assert!(parse_synctex_edit("Output: paper.pdf\nInput: paper.tex\n").is_none());
-        assert!(parse_synctex_edit("").is_none());
-    }
-
-    #[test]
-    fn forward_payload_read_returns_buffered_data_on_timeout() {
+    fn forward_payload_rejects_incomplete_requests() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client
             .write_all(b"3:133.768356:136.701797:343.711060:8.855677")
             .unwrap();
         client.flush().unwrap();
         let started = Instant::now();
-        // Client never closes its write half: the read times out at 100ms
-        // but the buffered bytes are still returned.
-        let payload = App::read_forward_payload(&mut server).unwrap();
-        assert_eq!(payload, "3:133.768356:136.701797:343.711060:8.855677");
+        // An incomplete client cannot apply a valid-looking partial request.
+        assert_eq!(
+            App::read_forward_payload(&mut server).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn forward_payload_rejects_oversized_requests() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&[b'1'; 4097]).unwrap();
+        assert_eq!(
+            App::read_forward_payload(&mut server).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

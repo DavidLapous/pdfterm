@@ -20,7 +20,7 @@ pub struct Config {
     link_picker_split_percent: Option<u16>,
     link_picker_layout: LinkPickerLayout,
     synctex_enabled: Option<bool>,
-    nvim_socket: Option<String>,
+    pub editor: crate::editor::Editor,
     forward_socket: Option<String>,
     pub viewer: ViewerSettings,
     pub nvim: NvimSettings,
@@ -62,7 +62,7 @@ impl Config {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
         let viewer = &config.viewer;
         for (name, value, low, high) in [
             ("scroll_frame_ms", viewer.scroll_frame_ms, 1, 1000),
@@ -78,6 +78,46 @@ impl Config {
         }
         if !matches!(config.nvim.viewer.as_str(), "terminal" | "skim") {
             return Err("nvim.viewer must be terminal or skim".into());
+        }
+        let runtime = fs::canonicalize(path.parent().unwrap())?.join("run");
+        config.editor.validate()?;
+        for value in [config.editor.socket_mut(), config.forward_socket.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if value.is_empty() {
+                continue;
+            }
+            let configured = Path::new(value);
+            let resolved = if configured.is_absolute() {
+                configured.to_owned()
+            } else {
+                if configured.components().count() != 1
+                    || !matches!(
+                        configured.components().next(),
+                        Some(std::path::Component::Normal(_))
+                    )
+                {
+                    return Err("relative socket paths must be simple filenames".into());
+                }
+                runtime.join(configured)
+            };
+            // macOS sockaddr_un.sun_path has 104 bytes, including the NUL.
+            if resolved.as_os_str().as_encoded_bytes().len() > 103 {
+                return Err(
+                    format!("socket path exceeds 103 bytes: {}", resolved.display()).into(),
+                );
+            }
+            crate::ipc::private_dir(resolved.parent().ok_or("socket path has no parent")?)?;
+            *value = resolved
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "socket path must be UTF-8")?;
+        }
+        if let crate::editor::Editor::Socket { path } = &config.editor
+            && config.forward_socket.as_ref() == Some(path)
+        {
+            return Err("editor and forward sockets must have different paths".into());
         }
         Ok(config)
     }
@@ -120,12 +160,6 @@ impl Config {
         self.synctex_enabled.unwrap_or(true)
     }
 
-    pub fn nvim_socket(&self) -> Option<&str> {
-        self.nvim_socket
-            .as_deref()
-            .filter(|value| !value.is_empty())
-    }
-
     pub fn forward_socket(&self) -> Option<&str> {
         self.forward_socket
             .as_deref()
@@ -160,8 +194,8 @@ impl Default for Config {
             link_picker_split_percent: None,
             link_picker_layout: LinkPickerLayout::Auto,
             synctex_enabled: None,
-            nvim_socket: Some("/tmp/pdfterm-nvim.sock".into()),
-            forward_socket: Some("/tmp/pdfterm-forward.sock".into()),
+            editor: crate::editor::Editor::default(),
+            forward_socket: Some("forward.sock".into()),
             viewer: ViewerSettings::default(),
             nvim: NvimSettings::default(),
         }
@@ -217,7 +251,7 @@ impl Default for NvimSettings {
         Self {
             viewer: "terminal".into(),
             compile: false,
-            focus_on_inverse: true,
+            focus_on_inverse: false,
             executable: String::new(),
             keys: NvimKeys::default(),
         }
@@ -307,16 +341,6 @@ mod tests {
                 toml::from_str(&format!("link_picker_layout = \"{value}\"\n")).expect("config");
             assert_eq!(config.link_picker_layout(), expected);
         }
-    }
-
-    #[test]
-    fn parses_synctex_and_nvim_socket() {
-        let config: Config =
-            toml::from_str("synctex_enabled = false\nnvim_socket = \"/tmp/pdfterm.sock\"\n")
-                .expect("config");
-        assert!(!config.synctex_enabled());
-        assert_eq!(config.nvim_socket(), Some("/tmp/pdfterm.sock"));
-        assert_eq!(config.forward_socket(), Some("/tmp/pdfterm-forward.sock"));
     }
 
     #[test]

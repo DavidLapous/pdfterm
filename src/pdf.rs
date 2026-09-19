@@ -2552,27 +2552,15 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
         Pdfium::bind_to_library(path)
             .map_err(|error| format!("could not load Pdfium from {}: {error}", path.display()))?
     } else {
-        let executable_library = std::env::current_exe().ok().and_then(|path| {
-            path.parent()
-                .map(Pdfium::pdfium_platform_library_name_at_path)
-        });
-        match executable_library
-            .as_ref()
-            .and_then(|path| Pdfium::bind_to_library(path).ok())
-        {
-            Some(bindings) => bindings,
-            None => {
-                let embedded = crate::embedded_pdfium::materialize().map_err(|error| {
-                    format!("could not extract embedded PDFium to the user cache: {error}")
-                })?;
-                Pdfium::bind_to_library(&embedded).map_err(|embedded_error| {
-                    format!(
-                        "could not load embedded PDFium from {}: {embedded_error}",
-                        embedded.display()
-                    )
-                })?
-            }
-        }
+        let embedded = crate::embedded_pdfium::materialize().map_err(|error| {
+            format!("could not extract embedded PDFium to the user cache: {error}")
+        })?;
+        Pdfium::bind_to_library(&embedded).map_err(|error| {
+            format!(
+                "could not load embedded PDFium from {}: {error}",
+                embedded.display()
+            )
+        })?
     };
 
     Ok(Pdfium::new(bindings))

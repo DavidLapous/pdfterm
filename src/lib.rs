@@ -1,9 +1,12 @@
 pub mod app;
 mod browser;
 pub mod config;
+pub mod editor;
 mod embedded_pdfium;
+mod ipc;
 pub mod kitty;
 pub mod pdf;
 pub mod recent;
+pub mod synctex;
 pub mod terminal;
 pub mod theme;

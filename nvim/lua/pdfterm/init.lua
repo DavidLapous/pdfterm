@@ -1,15 +1,57 @@
--- pdfterm: Kitty/Ghostty split launcher + unix-socket listener.
--- forward_search() opens the PDF beside the captured source terminal.
--- when the mapping runs. The listener receives "<file>:<line>:<byte-column>" from each
--- resolved inverse search and jumps to its byte column in the source buffer.
+-- Neovim adapter for pdfterm's editor-neutral JSON socket protocol.
+-- Rust owns SyncTeX resolution; this module owns splits, cursor placement, and focus.
 local M = {}
 
 local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h:h')
 local options = {
   executable = root .. '/target/release/pdfterm',
-  nvim_socket = '/tmp/pdfterm-nvim.sock',
-  forward_socket = '/tmp/pdfterm-forward.sock',
 }
+
+local owned_splits, split_launch, exiting = {}, nil, false
+local function close_owned_splits()
+  exiting = true
+  -- The launch callback records ownership before scheduling any editor work.
+  if split_launch then
+    local result = split_launch:wait()
+    if result.code ~= 0 then
+      vim.notify('pdfterm: split launch failed during exit: ' .. (result.stderr or ''), vim.log.levels.ERROR)
+    end
+  end
+  for _, split in ipairs(owned_splits) do
+    if split.kind == 'kitty' then
+      local found = vim.system({ 'kitten', '@', 'ls', '--match', 'id:' .. split.id }, { text = true, timeout = 3000 }):wait()
+      if found.code ~= 0 then
+        vim.notify('pdfterm: could not locate owned PDF split: ' .. (found.stderr or ''), vim.log.levels.ERROR)
+      elseif #vim.json.decode(found.stdout) > 0 then
+        local result = vim.system({ 'kitten', '@', 'send-text', '--match', 'id:' .. split.id, '\003' }, { text = true, timeout = 3000 }):wait()
+        if result.code ~= 0 then
+          vim.notify('pdfterm: could not quit owned PDF split: ' .. (result.stderr or ''), vim.log.levels.ERROR)
+        end
+      end
+    else
+      local command = {
+        'osascript',
+        '-e',
+        [[on run argv
+tell application "Ghostty"
+  repeat 20 times
+    if not (exists terminal id (item 1 of argv)) then return
+    -- Ctrl-C quits the reader; another key dismisses Ghostty's retained exit screen.
+    send key "c" modifiers "control" to terminal id (item 1 of argv)
+    delay 0.1
+  end repeat
+  if exists terminal id (item 1 of argv) then error "owned PDF split did not exit"
+end tell
+end run]],
+        split.id,
+      }
+      local result = vim.system(command, { text = true, timeout = 3000 }):wait()
+      if result.code ~= 0 then
+        vim.notify('pdfterm: could not close owned PDF split: ' .. (result.stderr or ''), vim.log.levels.ERROR)
+      end
+    end
+  end
+end
 
 local function source_terminal()
   if vim.env.KITTY_WINDOW_ID then
@@ -62,12 +104,25 @@ end
 local setup_keys
 
 local function handle_line(chunk)
-  local file, line, column = chunk:match '^(.*):(%d+):(%d+)$'
-  if not file or not line or not column then
-    return
-  end
+  local ok, location = pcall(vim.json.decode, chunk)
   vim.schedule(function()
-    inverse_search(file, tonumber(line), tonumber(column))
+    if
+      not ok
+      or type(location) ~= 'table'
+      or type(location.file) ~= 'string'
+      or location.file:sub(1, 1) ~= '/'
+      or location.file:find '%z'
+      or type(location.line) ~= 'number'
+      or location.line < 1
+      or location.line % 1 ~= 0
+      or type(location.byte_column) ~= 'number'
+      or location.byte_column < 0
+      or location.byte_column % 1 ~= 0
+    then
+      vim.notify('pdfterm: invalid inverse-search JSON location', vim.log.levels.ERROR)
+      return
+    end
+    inverse_search(location.file, location.line, location.byte_column)
   end)
 end
 
@@ -75,17 +130,40 @@ end
 -- closes it. uv pipes are byte-stream pipes here (payload arrives as one or
 -- more chunks), so accumulate until EOF.
 local function serve_client(client)
-  local payload = {}
-  client:read_start(function(err, chunk)
-    if err or not chunk then
-      local data = table.concat(payload)
-      if data ~= '' then
-        handle_line(data)
-      end
-      client:close()
+  local payload, size = {}, 0
+  local timer = assert(vim.uv.new_timer())
+  local function finish(message, deliver)
+    if client:is_closing() then
       return
     end
-    payload[#payload + 1] = chunk
+    timer:stop()
+    timer:close()
+    client:read_stop()
+    client:close()
+    if message then
+      vim.schedule(function()
+        vim.notify('pdfterm inverse search: ' .. message, vim.log.levels.ERROR)
+      end)
+    elseif deliver then
+      handle_line(table.concat(payload))
+    end
+  end
+  timer:start(1000, 0, function()
+    finish 'request timed out'
+  end)
+  client:read_start(function(err, chunk)
+    if err then
+      finish(err)
+    elseif not chunk then
+      finish(nil, true)
+    else
+      size = size + #chunk
+      if size > 16384 then
+        finish 'request exceeds 16384 bytes'
+      else
+        payload[#payload + 1] = chunk
+      end
+    end
   end)
 end
 
@@ -106,7 +184,7 @@ local function arm_listen(server)
   end)
 end
 
-function M.setup(opts)
+function M.setup()
   if M._listening then
     return
   end
@@ -117,35 +195,53 @@ function M.setup(opts)
   local config = vim.json.decode(result.stdout)
   local executable = options.executable
   options = vim.tbl_extend('force', config.nvim, {
-    nvim_socket = config.nvim_socket,
+    editor = config.editor,
     forward_socket = config.forward_socket,
     executable = config.nvim.executable ~= '' and config.nvim.executable or executable,
-  }, opts or {})
+  })
   setup_keys(options)
-  if options.nvim_socket == '' then
+  vim.api.nvim_create_autocmd('VimLeavePre', {
+    group = vim.api.nvim_create_augroup('pdfterm_lifetime', { clear = true }),
+    once = true,
+    callback = close_owned_splits,
+  })
+  if options.editor.transport ~= 'socket' then
     return
   end
 
-  vim.uv.fs_unlink(options.nvim_socket, function()
-    local pipe = vim.uv.new_pipe(false)
-    if not pipe then
-      vim.schedule(function()
-        vim.notify('pdfterm: could not create unix socket pipe', vim.log.levels.ERROR)
-      end)
-      return
-    end
-    local ok, bind_err = pipe:bind(options.nvim_socket)
-    if not ok then
-      vim.schedule(function()
-        vim.notify('pdfterm socket bind failed: ' .. tostring(bind_err), vim.log.levels.ERROR)
-      end)
+  local path = options.editor.path
+  local parent = assert(vim.uv.fs_lstat(vim.fs.dirname(path)))
+  if parent.type ~= 'directory' or parent.uid ~= vim.uv.getuid() or bit.band(parent.mode, 63) ~= 0 then
+    error 'pdfterm: socket parent must be a current-user-owned mode-0700 directory'
+  end
+  local pipe = assert(vim.uv.new_pipe(false))
+  local ok, bind_err = pipe:bind(path)
+  if not ok then
+    pipe:close()
+    error('pdfterm: cannot bind ' .. path .. ': ' .. tostring(bind_err) .. '; stop the existing editor or explicitly remove its stale socket')
+  end
+  local identity = assert(vim.uv.fs_lstat(path))
+  local function close_listener()
+    if not pipe:is_closing() then
       pipe:close()
-      return
     end
-    arm_listen(pipe)
-    M._pipe = pipe
-    M._listening = true
-  end)
+    local current = vim.uv.fs_lstat(path)
+    if current and current.dev == identity.dev and current.ino == identity.ino then
+      local removed, unlink_err = vim.uv.fs_unlink(path)
+      if not removed then
+        vim.notify('pdfterm: socket cleanup failed: ' .. tostring(unlink_err), vim.log.levels.ERROR)
+      end
+    end
+  end
+  local secured, chmod_err = vim.uv.fs_chmod(path, 384) -- 0600
+  if not secured then
+    close_listener()
+    error('pdfterm: cannot secure socket: ' .. tostring(chmod_err))
+  end
+  arm_listen(pipe)
+  M._pipe = pipe
+  M._listening = true
+  vim.api.nvim_create_autocmd('VimLeavePre', { once = true, callback = close_listener })
 end
 
 local pending_forward
@@ -155,6 +251,7 @@ on run argv
     set sourceTerminal to terminal id (item 2 of argv)
     set cfg to new surface configuration
     set command of cfg to item 1 of argv
+    set wait after command of cfg to false
     set environment variables of cfg to {"PATH=" & (item 3 of argv), "XDG_CONFIG_HOME=" & (item 4 of argv)}
     set viewer to split sourceTerminal direction right with configuration cfg
     focus sourceTerminal
@@ -211,33 +308,38 @@ function M.forward_search(pdf_path, payload, source_terminal)
       local shell_command = vim.fn.shellescape(options.executable) .. ' ' .. vim.fn.shellescape(pdf_path)
       command = { 'osascript', '-e', split_script, shell_command, source_terminal.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' }
     end
-    local ok, err = pcall(
-      vim.system,
-      command,
-      { text = true },
-      vim.schedule_wrap(function(result)
-        if result.code ~= 0 then
-          fail('pdfterm: terminal split failed: ' .. vim.trim(result.stderr))
+    local ok, process = pcall(vim.system, command, { text = true, timeout = 3000 }, function(result)
+      local id = vim.trim(result.stdout or '')
+      if result.code == 0 and id ~= '' then
+        owned_splits[#owned_splits + 1] = { kind = source_terminal.kind, id = id }
+      end
+      split_launch = nil
+      vim.schedule(function()
+        if exiting then
+          return
+        end
+        if result.code ~= 0 or id == '' then
+          fail('pdfterm: terminal split failed: ' .. (result.stderr or 'missing terminal ID'))
           return
         end
         attempt()
       end)
-    )
-    if not ok then
-      fail('pdfterm: could not start terminal split command: ' .. tostring(err))
+    end)
+    if ok then
+      split_launch = process
+    else
+      fail('pdfterm: could not start terminal split command: ' .. tostring(process))
     end
   end
   attempt = function()
-    local pipe = vim.uv.new_pipe(false)
-    if not pipe then
-      fail 'pdfterm: could not create forward-search pipe.'
+    if exiting then
       return
     end
-    pipe:connect(
-      options.forward_socket,
-      vim.schedule_wrap(function(err)
-        if err then
-          pipe:close()
+    local pipe = assert(vim.uv.new_pipe(false))
+    pipe:connect(options.forward_socket, function(err)
+      if err then
+        pipe:close()
+        vim.schedule(function()
           if not err:match 'ENOENT' and not err:match 'ECONNREFUSED' then
             fail('pdfterm: forward-search connection failed: ' .. err)
           elseif not launched then
@@ -250,31 +352,68 @@ function M.forward_search(pdf_path, payload, source_terminal)
               vim.defer_fn(attempt, 200)
             end
           end
+        end)
+        return
+      end
+      -- Send and half-close directly in libuv callbacks: editor prompts must not
+      -- delay the payload/EOF beyond the viewer's bounded receive deadline.
+      local sent_payload = request.payload
+      local timer = assert(vim.uv.new_timer())
+      local chunks, size = {}, 0
+      local function finish(message)
+        if pipe:is_closing() then
           return
         end
-        local sent_payload = request.payload
-        pipe:write(
-          sent_payload,
-          vim.schedule_wrap(function(write_err)
-            if write_err then
-              pipe:close()
-              fail('pdfterm: forward-search write failed: ' .. write_err)
-              return
-            end
-            pipe:shutdown(vim.schedule_wrap(function(shutdown_err)
-              pipe:close()
-              if shutdown_err then
-                fail('pdfterm: forward-search shutdown failed: ' .. shutdown_err)
-              elseif request.payload ~= sent_payload then
-                attempt()
-              else
-                pending_forward = nil
-              end
-            end))
-          end)
-        )
+        timer:stop()
+        timer:close()
+        pipe:close()
+        vim.schedule(function()
+          if message then
+            fail('pdfterm: ' .. message)
+            return
+          end
+          local ok, reply = pcall(vim.json.decode, table.concat(chunks))
+          if not ok or type(reply) ~= 'table' or reply.ok ~= true then
+            fail('pdfterm: ' .. (ok and type(reply) == 'table' and reply.error or 'invalid forward reply'))
+          elseif request.payload ~= sent_payload then
+            attempt()
+          else
+            pending_forward = nil
+          end
+        end)
+      end
+      timer:start(2000, 0, function()
+        finish 'forward reply timed out'
       end)
-    )
+      pipe:read_start(function(read_err, chunk)
+        if read_err then
+          finish(read_err)
+        elseif not chunk then
+          finish()
+        else
+          size = size + #chunk
+          if size > 4096 then
+            finish 'forward reply exceeds 4096 bytes'
+          else
+            chunks[#chunks + 1] = chunk
+          end
+        end
+      end)
+      pipe:write(sent_payload, function(write_err)
+        if pipe:is_closing() then
+          return
+        end
+        if write_err then
+          finish(write_err)
+          return
+        end
+        pipe:shutdown(function(shutdown_err)
+          if shutdown_err then
+            finish(shutdown_err)
+          end
+        end)
+      end)
+    end)
   end
   attempt()
 end
@@ -357,34 +496,24 @@ setup_keys = function(opts)
     end
     local function forward_search()
       if viewer == 'terminal' then
-        -- Resolve against the completed build, never against stale SyncTeX data.
-        local out = vim.fn.systemlist {
-          'synctex',
-          'view',
-          '-i',
-          ('%d:%d:%s'):format(line_number, column_number, file_path),
-          '-o',
-          pdf_path,
-        }
-        if vim.v.shell_error ~= 0 then
-          vim.notify('synctex view failed for ' .. pdf_path, vim.log.levels.ERROR)
+        -- Resolve against the completed build through the shared Rust parser.
+        local result = vim
+          .system({
+            options.executable,
+            pdf_path,
+            '--synctex-view',
+            file_path,
+            '--line',
+            tostring(line_number),
+            '--column',
+            tostring(column_number),
+          }, { text = true })
+          :wait()
+        if result.code ~= 0 then
+          vim.notify('pdfterm: ' .. (result.stderr or 'SyncTeX resolution failed'), vim.log.levels.ERROR)
           return
         end
-        local parsed = {}
-        for _, raw in ipairs(out) do
-          local key, value = raw:match '^([a-zA-Z]+):([%-%.%d]+)'
-          if key == 'Page' or key == 'h' or key == 'v' or key == 'W' or key == 'H' then
-            parsed[key] = value
-          end
-          if parsed.Page and parsed.h and parsed.v and parsed.W and parsed.H then
-            break -- SyncTeX ranks its best result first.
-          end
-        end
-        if not (parsed.Page and parsed.h and parsed.v and parsed.W and parsed.H) then
-          vim.notify('synctex output missing goto fields for ' .. pdf_path, vim.log.levels.ERROR)
-          return
-        end
-        local payload = ('%s:%s:%s:%s:%s'):format(parsed.Page, parsed.h, parsed.v, parsed.W, parsed.H)
+        local payload = result.stdout
         M.forward_search(pdf_path, payload, source)
         return
       end

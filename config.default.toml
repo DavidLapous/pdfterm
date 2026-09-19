@@ -10,8 +10,18 @@ persistent_link_picker = false     # Keep link browser open after following a li
 link_picker_split_percent = 50     # Link pane size, 20–80 percent
 link_picker_layout = "auto"         # auto, vertical, horizontal, or floating
 synctex_enabled = true              # Enable Option/Alt-click PDF-to-source jumps
-nvim_socket = "/tmp/pdfterm-nvim.sock"       # Empty disables editor delivery (clipboard remains)
-forward_socket = "/tmp/pdfterm-forward.sock" # Empty disables source-to-PDF requests
+# Relative names resolve inside the private config-directory/run directory (mode 0700).
+# Absolute paths require a current-user-owned mode-0700 parent. Never use shared /tmp directly.
+forward_socket = "forward.sock"    # Empty disables source-to-PDF requests
+
+[editor]
+transport = "none"                 # none (clipboard only), command, or socket
+# For command transport, uncomment argv; no shell expansion is performed.
+# argv = ["code", "--reuse-window", "--goto", "{file}:{line}:{column}"]
+# For socket transport (including the Neovim adapter), uncomment path.
+# path = "editor.sock"             # Relative to private run/ directory
+# {line}: 1-based; {column}: 1-based UTF-16; {column_char}: 1-based Unicode scalar
+# {byte_column}: 0-based UTF-8; {column_byte}: 1-based UTF-8; {file}: absolute path
 
 [viewer]
 continuous_scroll = true           # Display adjacent pages together; false restores page-at-a-time
@@ -29,7 +39,7 @@ source_context_lines = 4           # Maximum source lines before/after SyncTeX r
 [nvim]
 viewer = "terminal"                # terminal (Kitty/Ghostty split) or skim (macOS displayline)
 compile = false                    # Run latexmk before forward search
-focus_on_inverse = true            # Focus the captured source terminal after inverse search
+focus_on_inverse = false           # Opt in to focusing the source terminal after inverse search
 executable = ""                    # Empty: target/release/pdfterm beside bundled plugin; or absolute path
 
 [nvim.keys]

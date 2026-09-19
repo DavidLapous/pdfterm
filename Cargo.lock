@@ -1021,6 +1021,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "flate2",
+ "libc",
  "nucleo-matcher",
  "pdfium-render",
  "ratatui",
