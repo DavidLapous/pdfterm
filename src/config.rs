@@ -76,9 +76,6 @@ impl Config {
                 return Err(format!("viewer.{name} must be in {low}..={high}").into());
             }
         }
-        if !matches!(config.nvim.viewer.as_str(), "terminal" | "skim") {
-            return Err("nvim.viewer must be terminal or skim".into());
-        }
         let runtime = fs::canonicalize(path.parent().unwrap())?.join("run");
         config.editor.validate()?;
         for value in [config.editor.socket_mut(), config.forward_socket.as_mut()]
@@ -236,26 +233,13 @@ impl Default for ViewerSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NvimSettings {
-    pub viewer: String,
     pub compile: bool,
     pub focus_on_inverse: bool,
     pub executable: String,
     pub keys: NvimKeys,
-}
-
-impl Default for NvimSettings {
-    fn default() -> Self {
-        Self {
-            viewer: "terminal".into(),
-            compile: false,
-            focus_on_inverse: false,
-            executable: String::new(),
-            keys: NvimKeys::default(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -265,8 +249,6 @@ pub struct NvimKeys {
     pub build: String,
     pub main_file: String,
     pub compile: String,
-    pub skim: String,
-    pub terminal: String,
 }
 
 impl Default for NvimKeys {
@@ -276,8 +258,6 @@ impl Default for NvimKeys {
             build: "<leader>cb".into(),
             main_file: "<leader>csl".into(),
             compile: "<leader>cscl".into(),
-            skim: "<leader>csls".into(),
-            terminal: "<leader>cslt".into(),
         }
     }
 }

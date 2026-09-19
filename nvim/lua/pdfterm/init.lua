@@ -347,13 +347,6 @@ end
 setup_keys = function(opts)
 	local main_tex_file = nil
 	local latex_compile = opts.compile
-	local latex_viewer = opts.viewer
-
-	local function set_latex_viewer(viewer)
-		latex_viewer = viewer
-		vim.notify("PDF viewer is now: " .. latex_viewer, vim.log.levels.INFO)
-	end
-
 	local function toggle_latex_compile()
 		latex_compile = not latex_compile
 		vim.notify("Compile flag is now: " .. tostring(latex_compile))
@@ -402,7 +395,7 @@ setup_keys = function(opts)
 		compile_tex(main_tex_file .. ".tex")
 	end
 
-	local function build_user_tex_with_skim_forward_search()
+	local function forward_main_tex_file()
 		if main_tex_file == nil then
 			change_main_tex_file_name()
 		end
@@ -422,34 +415,24 @@ setup_keys = function(opts)
 		local column_number = vim.fn.strchars(vim.api.nvim_get_current_line():sub(1, cursor[2])) + 1
 		local file_path = vim.fn.expand("%:p")
 
-		local viewer = latex_viewer
-		local source
-		if viewer == "terminal" then
-			source = terminal.capture_source()
-		end
+		local source = terminal.capture_source()
 		local function forward_search()
-			if viewer == "terminal" then
-				-- Resolve against the completed build through the shared Rust parser.
-				local result = vim.system({
-					options.executable,
-					pdf_path,
-					"--synctex-view",
-					file_path,
-					"--line",
-					tostring(line_number),
-					"--column",
-					tostring(column_number),
-				}, { text = true }):wait()
-				if result.code ~= 0 then
-					vim.notify("pdfterm: " .. (result.stderr or "SyncTeX resolution failed"), vim.log.levels.ERROR)
-					return
-				end
-				local payload = result.stdout
-				M.forward_search(pdf_path, payload, source)
+			-- Resolve against the completed build through the shared Rust parser.
+			local result = vim.system({
+				options.executable,
+				pdf_path,
+				"--synctex-view",
+				file_path,
+				"--line",
+				tostring(line_number),
+				"--column",
+				tostring(column_number),
+			}, { text = true }):wait()
+			if result.code ~= 0 then
+				vim.notify("pdfterm: " .. (result.stderr or "SyncTeX resolution failed"), vim.log.levels.ERROR)
 				return
 			end
-
-			platform.skim_forward(line_number, pdf_path, file_path)
+			M.forward_search(pdf_path, result.stdout, source)
 		end
 
 		if latex_compile then
@@ -464,15 +447,9 @@ setup_keys = function(opts)
 			vim.keymap.set("n", key, callback, settings)
 		end
 	end
-	map(opts.keys.forward, build_user_tex_with_skim_forward_search, { desc = "pdfterm forward search" })
+	map(opts.keys.forward, forward_main_tex_file, { desc = "pdfterm forward search" })
 	map(opts.keys.main_file, change_main_tex_file_name, { desc = "pdfterm set main TeX file" })
 	map(opts.keys.compile, toggle_latex_compile, { desc = "pdfterm toggle compilation" })
-	map(opts.keys.skim, function()
-		set_latex_viewer("skim")
-	end, { desc = "[C]ode [S]et [L]atex [S]kim viewer" })
-	map(opts.keys.terminal, function()
-		set_latex_viewer("terminal")
-	end, { desc = "[C]ode [S]et [L]atex [T]erminal viewer" })
 	vim.api.nvim_create_autocmd("FileType", {
 		group = vim.api.nvim_create_augroup("latex-build-keymap", { clear = true }),
 		pattern = { "latex", "tex" },

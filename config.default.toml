@@ -37,7 +37,6 @@ word_precision = true              # Refine inverse search with nearby PDF/sourc
 source_context_lines = 4           # Source radius outside Beamer frames, 0–100; frames use full block
 
 [nvim]
-viewer = "terminal"                # terminal (Kitty/Ghostty split) or skim (macOS displayline)
 compile = false                    # Run latexmk before forward search
 focus_on_inverse = false           # Opt in to focusing the source terminal after inverse search
 executable = ""                    # Empty: target/release/pdfterm beside bundled plugin; or absolute path
@@ -47,5 +46,3 @@ forward = "<leader>cl"              # Save and forward-search (optionally compil
 build = "<leader>cb"                # Build main TeX file (TeX buffers only)
 main_file = "<leader>csl"           # Use current TeX file as main document
 compile = "<leader>cscl"            # Toggle compilation before forward search
-skim = "<leader>csls"               # Select Skim viewer
-terminal = "<leader>cslt"           # Select pdfterm viewer
