@@ -3,7 +3,7 @@
 `pdfterm` is a low-latency PDF viewer for Kitty terminals. It renders on the machine where the command runs, compresses each page once, and sends the bitmap through Kitty's graphics protocol. Direct SSH sessions need no local helper.
 
 This is an experimental fork of [jrf/pdfterm](https://github.com/jrf/pdfterm),
-adding continuous animated scrolling and a bundled Neovim/SyncTeX integration.
+adding continuous animated scrolling and editor-neutral SyncTeX integration.
 It is not a sandboxed viewer for hostile PDFs.
 
 ![pdfterm rendering an arXiv paper in dark mode inside Kitty](assets/pdfterm-dark-mode-arxiv.png)
@@ -19,8 +19,7 @@ You can fit pages to the terminal width or height and scroll through the overflo
 - macOS arm64, Linux x86_64, or Linux aarch64
 
 Native rendering and editor integration are verified on macOS. Linux runtime
-integration is not yet tested; the Ghostty editor adapter currently requires
-macOS AppleScript. Kitty and generic editor command transports are Unix-oriented.
+integration is not yet tested.
 
 tmux support is not included yet. Run `pdfterm` directly under SSH until Kitty graphics passthrough is added.
 
@@ -32,8 +31,7 @@ cargo install --locked --git https://github.com/DavidLapous/pdfterm.git
 
 The build downloads PDFium revision 7881 for the target platform, verifies its SHA-256 checksum, and embeds it in the executable. On first use, `pdfterm` extracts the library to `$XDG_CACHE_HOME/pdfterm-private` or `~/.cache/pdfterm-private`. Older native-library caches are not reused.
 
-For the Neovim plugin, clone the repository and build its release binary
-(`cargo install` alone does not install the plugin):
+To build from source:
 
 ```console
 git clone https://github.com/DavidLapous/pdfterm.git
@@ -146,23 +144,16 @@ ranges, and file-access errors stop startup with the configuration path.
 - `[viewer]`: continuous/smooth scrolling, animation interval and easing,
   small/page scroll distances, filename titles, forward-search centering and
   flash duration, word matching and source-context radius.
-- `[nvim]`: initial viewer, compile-before-search, inverse-search focus, and
-  executable override. Empty `executable` uses this checkout's release binary.
-- `[nvim.keys]`: forward search, build, main file, compile toggle, and viewer
-  selection. An empty binding disables that mapping.
 
-The bundled Neovim plugin reads this same file through `pdfterm --print-config`;
-there is no second configuration to synchronize. Restart the viewer and Neovim
-after editing it. `?` shows controls and the active configuration path.
+Restart the viewer after editing its configuration. `?` shows controls and the
+active configuration path.
 Scrolling eases over terminal rows; `smooth_scroll = false` restores immediate
 steps. `continuous_scroll = false` retains single-page scrolling.
 
 Relative socket names resolve under the configuration directory's `run/`
 directory, which is created with mode `0700`. Socket files use mode `0600`.
 Absolute socket paths require a real, current-user-owned mode-0700 parent;
-the old `/tmp/pdfterm-*.sock` settings are rejected. Replace the old
-`nvim_socket` key with `[editor] transport = "socket"` and `path = "editor.sock"`;
-keep `forward_socket = "forward.sock"` at the top level.
+the old `/tmp/pdfterm-*.sock` settings are rejected.
 Existing endpoints are never unlinked on startup. If a process crashes, stop
 any process using that socket and explicitly remove the stale socket before
 restarting. Normal exits remove only the endpoint the process created.
@@ -244,7 +235,7 @@ theme, link, and search-result pickers use the same navigation conventions.
 ## Editor-neutral SyncTeX
 
 `src/synctex.rs` owns source/PDF resolution; `src/editor.rs` delivers a typed
-source location. Neither depends on Neovim. Inverse search is opt-in:
+source location through a command or socket. Inverse search is opt-in:
 
 ```toml
 [editor]
@@ -259,7 +250,7 @@ exit status is an error. Placeholders: `{file}` is an absolute source path,
 one-based Unicode scalar, `{byte_column}` is zero-based UTF-8, and
 `{column_byte}` is one-based UTF-8. Unknown placeholders are rejected.
 
-For a custom editor adapter (or the bundled Neovim adapter):
+For a custom editor adapter:
 
 ```toml
 [editor]
@@ -304,7 +295,7 @@ and `v` the bottom edge measured down from the page top.
 The viewer reloads a different revision **before** validating page count, positions
 the target, and replies `{"ok":true,"error":null}` only after submitting the
 matching rendered frame to the terminal and flushing output. This does not wait
-for Kitty/Ghostty compositor completion. The highlight lifetime starts at that
+for terminal compositor completion. The highlight lifetime starts at that
 submission, not while loading or rendering.
 
 Each connection receives one terminal reply and closes; no status polling or
@@ -312,50 +303,23 @@ request IDs are needed. Changed-again PDFs, unreadable documents, out-of-range p
 invalid requests, supersession, user-input cancellation, and renderer/viewer
 failure return `{"ok":false,"error":"..."}`. Repeat SyncTeX resolution after a
 revision rejection; do not resend stale coordinates against a newer revision.
-The viewer's submission deadline is 30 seconds; CLI/Neovim allow 31 seconds for
+The viewer's submission deadline is 30 seconds; the CLI allows 31 seconds for
 the final reply. These are failure ceilings, not readiness delays. A disconnected
 client is discarded without retaining its pending request.
 
 Incomplete, malformed, non-finite, unknown-field, and oversized requests are
 rejected. Send the complete request and half-close within 100 ms after connecting.
 
-## Neovim integration
+### Inverse-search precision
 
-Build the release binary, then add the bundled plugin to Neovim:
-
-```lua
-vim.opt.runtimepath:prepend('/path/to/pdfterm/nvim')
-require('pdfterm').setup()
-```
-
-Enable `[editor] transport = "socket"` and `path = "editor.sock"` as above.
-No modules from a separate Neovim configuration are required. The plugin owns
-its keymaps, compilation, forward search, inverse-search socket, and source-window
-focus. It supports **Kitty and Ghostty**; unsupported terminals fail explicitly.
-Kitty needs `kitten` on `PATH` and remote control permitted (for example, a
-`listen_on` Unix socket with `allow_remote_control socket-only`). Use Kitty's
-`splits` layout for a right split. Ghostty needs its AppleScript interface enabled.
-No terminal settings are modified by the plugin.
-
-The bundled adapter separates editor orchestration (`init.lua`), terminal control
-(`terminal.lua`: `capture_source`, `launch_split`, `focus`, `close`), and OS
-operations (`platform.lua`: AppleScript and Skim). Terminal handles identify exact
-surfaces; only the editor tracks ownership. macOS and Linux are accepted;
-AppleScript/Ghostty control and Skim explicitly require macOS.
-Rust rendering stays on the shared Kitty graphics protocol, and Unix sockets
-remain direct Unix APIs rather than an extra portability layer.
-
-`Alt`/`Option`-click resolves the clicked location with
-`synctex edit`, then matches the clicked PDF word and nearby text against source
-lines within `viewer.source_context_lines` of the result (default four).
+`Alt`/`Option`-click resolves the clicked location with `synctex edit`, then
+matches the clicked PDF word and nearby text against source lines within
+`viewer.source_context_lines` of the result (default four).
 Inside a literal `\begin{frame}` … `\end{frame}` block, it searches that frame
 instead: Beamer often maps every `\pause`/`\only` overlay to `\end{frame}`.
 Nearby PDF words disambiguate repeated source words; equally good matches within
 a frame remain line only rather than favoring the occurrence nearest its end.
-The JSON handoff carries one-based lines and explicitly encoded columns.
-The plugin uses the UTF-8 byte column and jumps to the source buffer without changing
-terminal focus. Set `[nvim] focus_on_inverse = true` to opt in to focusing the terminal
-captured by forward search.
+
 Ambiguous words, macros, and non-text clicks remain explicitly marked **line only**;
 the matcher does not expand TeX. Non-alphanumeric math symbols such as `\longmapsto`
 and font-private glyphs are not word candidates. Source matching uses the saved
@@ -363,45 +327,17 @@ file, so save and rebuild after edits. With `transport = "none"`, the target is
 shown in the status bar and copied to the clipboard (OSC 52). Configured transport
 failures are reported.
 
-The nvim forward search (`<leader>cl`) uses a switchable viewer:
-
-- `<leader>csls` — Skim (displayline)
-- `<leader>cslt` — pdfterm beside the source Kitty or Ghostty terminal (default)
-
-The terminal branch calls `pdfterm --synctex-view` for the cursor line and
-character column, uses SyncTeX's first complete result, and sends the
-document-aware JSON request to `forward_socket`. A live viewer applies the goto,
-flashes the target box red for one second, and centers it vertically, showing
-adjacent pages as needed. Centering and flash duration are configurable.
-Positioning is rounded to terminal rows and clamped at document ends.
-With no viewer listening, the plugin launches pdfterm beside the captured source
-terminal and sends the payload once its socket is up. The split inherits `PATH`
-and `XDG_CONFIG_HOME`. The viewer sets its terminal title to the PDF filename
-unless `viewer.set_window_title = false`.
-
-Quitting Neovim gracefully quits the PDF viewers it launched and closes their
-splits. Reused or independently launched viewers are left alone. `Ctrl-c` quits
-the viewer from any mode, including help and pickers, and releases its socket.
-
-Default editor controls: `<leader>cl` forward search, `<leader>cb` build,
-`<leader>csl` set main TeX file, `<leader>cscl` toggle compile-before-search.
-To change projects, open the new project's **main** `.tex` file, press
-`<leader>csl`, then `<leader>cl`. Its PDF opens in a new viewer tab if necessary;
-previous projects remain available. While a forward request is pending, the
-latest requested PDF and position replace the queued target together.
-The default socket pair supports one viewer process and one editor adapter per
-configuration; the viewer may contain several document tabs. Use separate
-`XDG_CONFIG_HOME` directories for independent
-sessions. A second listener fails explicitly rather than stealing an endpoint.
+Each configuration supports one viewer socket and one editor adapter socket.
+The viewer may contain several document tabs. Use separate `XDG_CONFIG_HOME`
+directories for independent sessions. A second listener fails explicitly rather
+than stealing an endpoint.
 
 ## Security and licensing
 
 Only open trusted PDFs and TeX projects. PDFium parses documents inside the
 viewer process; it is not sandboxed. Editor integration can open files and
-trigger normal Neovim file-reading autocommands. Private socket directories
+trigger the configured editor's file-opening hooks. Private socket directories
 exclude other OS users, not malicious processes running as your own account.
-Kitty remote control should likewise use a private socket, not an unrestricted
-network listener.
 
 The embedded native library is checked against its full embedded contents before
 reuse. Unsafe cache directories, symlinks, or modified libraries are rejected,
