@@ -318,6 +318,14 @@ Kitty needs `kitten` on `PATH` and remote control permitted (for example, a
 `splits` layout for a right split. Ghostty needs its AppleScript interface enabled.
 No terminal settings are modified by the plugin.
 
+The bundled adapter separates editor orchestration (`init.lua`), terminal control
+(`terminal.lua`: `capture_source`, `launch_split`, `focus`, `close`), and OS
+operations (`platform.lua`: AppleScript and Skim). Terminal handles identify exact
+surfaces; only the editor tracks ownership. macOS and Linux are accepted;
+AppleScript/Ghostty control and Skim explicitly require macOS.
+Rust rendering stays on the shared Kitty graphics protocol, and Unix sockets
+remain direct Unix APIs rather than an extra portability layer.
+
 `Alt`/`Option`-click resolves the clicked location with
 `synctex edit`, then matches the clicked PDF word and nearby text against source
 lines within `viewer.source_context_lines` of the result (default four).

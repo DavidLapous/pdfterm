@@ -5,8 +5,8 @@
       Failure also occurs on clean baseline `08996cb`.
 
 - [ ] Exercise build, rendering, generic editor commands, private sockets, and
-      Kitty lifecycle on Linux when a Linux machine is available. Ghostty's
-      current editor adapter uses macOS AppleScript.
+      Kitty lifecycle on Linux when a Linux machine is available. The platform
+      adapter explicitly rejects Ghostty AppleScript control and Skim on Linux.
 
 ## Accepted limits
 

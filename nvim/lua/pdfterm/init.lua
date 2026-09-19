@@ -1,6 +1,8 @@
 -- Neovim adapter for pdfterm's editor-neutral JSON socket protocol.
 -- Rust owns SyncTeX resolution; this module owns splits, cursor placement, and focus.
 local M = {}
+local terminal = require 'pdfterm.terminal'
+local platform = require 'pdfterm.platform'
 
 local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h:h')
 local options = {
@@ -18,59 +20,11 @@ local function close_owned_splits()
     end
   end
   for _, split in ipairs(owned_splits) do
-    if split.kind == 'kitty' then
-      local found = vim.system({ 'kitten', '@', 'ls', '--match', 'id:' .. split.id }, { text = true, timeout = 3000 }):wait()
-      if found.code ~= 0 then
-        vim.notify('pdfterm: could not locate owned PDF split: ' .. (found.stderr or ''), vim.log.levels.ERROR)
-      elseif #vim.json.decode(found.stdout) > 0 then
-        local result = vim.system({ 'kitten', '@', 'send-text', '--match', 'id:' .. split.id, '\003' }, { text = true, timeout = 3000 }):wait()
-        if result.code ~= 0 then
-          vim.notify('pdfterm: could not quit owned PDF split: ' .. (result.stderr or ''), vim.log.levels.ERROR)
-        end
-      end
-    else
-      local command = {
-        'osascript',
-        '-e',
-        [[on run argv
-tell application "Ghostty"
-  repeat 20 times
-    if not (exists terminal id (item 1 of argv)) then return
-    -- Ctrl-C quits the reader; another key dismisses Ghostty's retained exit screen.
-    send key "c" modifiers "control" to terminal id (item 1 of argv)
-    delay 0.1
-  end repeat
-  if exists terminal id (item 1 of argv) then error "owned PDF split did not exit"
-end tell
-end run]],
-        split.id,
-      }
-      local result = vim.system(command, { text = true, timeout = 3000 }):wait()
-      if result.code ~= 0 then
-        vim.notify('pdfterm: could not close owned PDF split: ' .. (result.stderr or ''), vim.log.levels.ERROR)
-      end
+    local ok, message = pcall(terminal.close, split)
+    if not ok then
+      vim.notify(message, vim.log.levels.ERROR)
     end
   end
-end
-
-local function source_terminal()
-  if vim.env.KITTY_WINDOW_ID then
-    return { kind = 'kitty', id = vim.env.KITTY_WINDOW_ID }
-  end
-  if vim.env.TERM_PROGRAM ~= 'ghostty' then
-    error 'pdfterm: terminal integration requires Kitty or Ghostty'
-  end
-  local result = vim
-    .system({
-      'osascript',
-      '-e',
-      'tell application "Ghostty" to get id of focused terminal of selected tab of front window',
-    }, { text = true })
-    :wait()
-  if result.code ~= 0 or vim.trim(result.stdout or '') == '' then
-    error('pdfterm: could not identify source Ghostty terminal: ' .. (result.stderr or ''))
-  end
-  return { kind = 'ghostty', id = vim.trim(result.stdout) }
 end
 
 local function inverse_search(file, line, column)
@@ -86,12 +40,8 @@ local function inverse_search(file, line, column)
   vim.api.nvim_win_set_cursor(0, { line, math.min(column, #text) })
   vim.cmd 'normal! zvzz'
   if options.focus_on_inverse and M._source_terminal then
-    local source = M._source_terminal
-    local command = source.kind == 'kitty' and { 'kitten', '@', 'focus-window', '--match', 'id:' .. source.id }
-      or { 'osascript', '-e', 'tell application "Ghostty"\nactivate\nfocus terminal id "' .. source.id .. '"\nend tell' }
-    vim.system(
-      command,
-      {},
+    terminal.focus(
+      M._source_terminal,
       vim.schedule_wrap(function(result)
         if result.code ~= 0 then
           vim.notify('pdfterm: could not focus source terminal: ' .. (result.stderr or ''), vim.log.levels.ERROR)
@@ -185,6 +135,7 @@ local function arm_listen(server)
 end
 
 function M.setup()
+  platform.check_supported()
   if M._listening then
     return
   end
@@ -245,20 +196,6 @@ function M.setup()
 end
 
 local pending_forward
-local split_script = [[
-on run argv
-  tell application "Ghostty"
-    set sourceTerminal to terminal id (item 2 of argv)
-    set cfg to new surface configuration
-    set command of cfg to item 1 of argv
-    set wait after command of cfg to false
-    set environment variables of cfg to {"PATH=" & (item 3 of argv), "XDG_CONFIG_HOME=" & (item 4 of argv)}
-    set viewer to split sourceTerminal direction right with configuration cfg
-    focus sourceTerminal
-    return id of viewer
-  end tell
-end run
-]]
 
 function M.forward_search(pdf_path, payload, source_terminal)
   if options.forward_socket == '' then
@@ -284,41 +221,16 @@ function M.forward_search(pdf_path, payload, source_terminal)
   end
   local function launch()
     launched = true
-    local command
-    if source_terminal.kind == 'kitty' then
-      command = {
-        'kitten',
-        '@',
-        'launch',
-        '--type=window',
-        '--location=vsplit',
-        '--keep-focus',
-        '--match',
-        'window_id:' .. source_terminal.id,
-        '--next-to',
-        'id:' .. source_terminal.id,
-        '--env',
-        'PATH=' .. vim.env.PATH,
-        '--env',
-        'XDG_CONFIG_HOME=' .. (vim.env.XDG_CONFIG_HOME or ''),
-        options.executable,
-        pdf_path,
-      }
-    else
-      local shell_command = vim.fn.shellescape(options.executable) .. ' ' .. vim.fn.shellescape(pdf_path)
-      command = { 'osascript', '-e', split_script, shell_command, source_terminal.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' }
-    end
-    local ok, process = pcall(vim.system, command, { text = true, timeout = 3000 }, function(result)
-      local id = vim.trim(result.stdout or '')
-      if result.code == 0 and id ~= '' then
-        owned_splits[#owned_splits + 1] = { kind = source_terminal.kind, id = id }
+    local ok, process = pcall(terminal.launch_split, source_terminal, options.executable, pdf_path, function(result, split)
+      if split then
+        owned_splits[#owned_splits + 1] = split
       end
       split_launch = nil
       vim.schedule(function()
         if exiting then
           return
         end
-        if result.code ~= 0 or id == '' then
+        if not split then
           fail('pdfterm: terminal split failed: ' .. (result.stderr or 'missing terminal ID'))
           return
         end
@@ -492,7 +404,7 @@ setup_keys = function(opts)
     local viewer = latex_viewer
     local source
     if viewer == 'terminal' then
-      source = source_terminal()
+      source = terminal.capture_source()
     end
     local function forward_search()
       if viewer == 'terminal' then
@@ -518,17 +430,7 @@ setup_keys = function(opts)
         return
       end
 
-      local skim_job = vim.fn.jobstart({
-        '/Applications/Skim.app/Contents/SharedSupport/displayline',
-        '-g',
-        '-r',
-        tostring(line_number),
-        pdf_path,
-        file_path,
-      }, { detach = true })
-      if skim_job == 0 or skim_job == -1 then
-        vim.notify('Failed to open Skim with displayline.', vim.log.levels.ERROR)
-      end
+      platform.skim_forward(line_number, pdf_path, file_path)
     end
 
     if latex_compile then

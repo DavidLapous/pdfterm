@@ -4,6 +4,24 @@ Scope: editor-neutral SyncTeX, publication hardening, diagonal-scroll regression
 opt-in inverse focus, and owned terminal lifecycle. Review was local only;
 delegation and review servers were disabled at the user's request.
 
+## Terminal/platform extraction
+
+- Editor orchestration no longer constructs Kitty commands or AppleScript.
+  `terminal.lua` dispatches capture/launch/focus/close through two adapters;
+  `platform.lua` owns macOS process operations and explicit OS checks.
+- Native isolated Neovim sessions launched and focused PDF splits in Kitty and
+  Ghostty. Quitting each editor removed its viewer and both socket endpoints;
+  the independent Kitty surface remained. Skim opened the exact fixture PDF.
+- A bounded throwaway smoke passed 272 platform/invalid-handle checks, including
+  simulated non-macOS rejection before invoking AppleScript or Skim. This is
+  branch coverage, not Linux runtime verification.
+- A two-second sample of the native Neovim session recorded all 1,772 main-thread
+  samples in `kevent`; no performance improvement is claimed.
+- No Rust source, graphics encoding, socket protocol, or build target changed.
+  The existing macOS/Linux target restriction remains in `build.rs`.
+
+## Retained publication verification
+
 - Release build, 105 tests, and Clippy with warnings denied pass. One independently
   established baseline picker-label failure remains excluded.
 - Native Kitty reproduced diagonal scrolling from page 8 back to page 1 before
