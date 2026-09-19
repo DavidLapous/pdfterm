@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::style::{ResetColor, SetBackgroundColor, SetForegroundColor, force_color_output};
 use crossterm::terminal::{
@@ -136,6 +136,7 @@ impl TerminalGuard {
         if let Err(error) = execute!(
             output,
             EnterAlternateScreen,
+            EnableMouseCapture,
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg),
             DisableLineWrap,

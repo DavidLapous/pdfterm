@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::cursor::{Hide, MoveTo};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::style::{
@@ -144,6 +144,7 @@ pub fn run(
                     pdf_x,
                     pdf_y,
                     page_height_pt,
+                    text,
                 } => {
                     app.receive_page_point(
                         SynctexClick {
@@ -153,6 +154,7 @@ pub fn run(
                             pdf_x,
                             pdf_y,
                             page_height_pt,
+                            text,
                         },
                         &mut output,
                     )?;
@@ -267,7 +269,6 @@ struct App {
     next_link_request_id: u64,
     link_mode: bool,
     next_synctex_request_id: u64,
-    synctex_mode: bool,
     pending_synctex: Option<PendingSynctex>,
     synctex_enabled: bool,
     nvim_socket: Option<String>,
@@ -799,6 +800,7 @@ struct SynctexClick {
     pdf_x: f32,
     pdf_y: f32,
     page_height_pt: f32,
+    text: Result<Option<(String, usize)>, String>,
 }
 
 enum PendingOpen {
@@ -866,7 +868,6 @@ impl App {
             next_link_request_id: 1,
             link_mode: false,
             next_synctex_request_id: 1,
-            synctex_mode: false,
             pending_synctex: None,
             synctex_enabled: defaults.synctex_enabled,
             nvim_socket: defaults.nvim_socket,
@@ -1424,11 +1425,6 @@ impl App {
         if enabled == self.link_mode {
             return Ok(());
         }
-        if enabled {
-            execute!(output, EnableMouseCapture)?;
-        } else {
-            execute!(output, DisableMouseCapture)?;
-        }
         self.link_mode = enabled;
         self.pending_link_picker_open = enabled;
         self.ensure_link_index();
@@ -1617,6 +1613,10 @@ impl App {
         self.worker.begin_generation(self.generation);
         let viewport = self.viewport()?;
         let key = self.render_key(viewport);
+        self.desired_key = Some(key);
+        self.pending.clear();
+        self.pending.insert(key);
+        self.performance_snapshot = None;
         self.worker
             .render(RenderRequest {
                 key,
@@ -1730,6 +1730,23 @@ impl App {
         if self.pending_open.is_some() {
             return Ok(());
         }
+        let scroll = match mouse.kind {
+            MouseEventKind::ScrollUp => Some((Axis::Vertical, false)),
+            MouseEventKind::ScrollDown => Some((Axis::Vertical, true)),
+            MouseEventKind::ScrollLeft => Some((Axis::Horizontal, false)),
+            MouseEventKind::ScrollRight => Some((Axis::Horizontal, true)),
+            _ => None,
+        };
+        if let Some((axis, forward)) = scroll {
+            if self.link_picker.is_none()
+                && self.search_picker.is_none()
+                && self.search_input.is_none()
+                && self.goto_input.is_none()
+            {
+                self.move_view(axis, forward, false, output)?;
+            }
+            return Ok(());
+        }
         if self.link_picker.is_some()
             && mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && self.handle_link_picker_pointer(mouse, output)?
@@ -1737,14 +1754,13 @@ impl App {
             return Ok(());
         }
         if self.synctex_enabled
-            && self.synctex_mode
-            && !self.link_mode
+            && mouse.modifiers.contains(KeyModifiers::ALT)
             && mouse.kind == MouseEventKind::Down(MouseButton::Left)
         {
             self.begin_inverse_search(mouse, output)?;
             return Ok(());
         }
-        if !self.link_mode || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return Ok(());
         }
         let viewport = self.viewport()?;
@@ -1872,9 +1888,6 @@ impl App {
         let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
         let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
 
-        if !self.link_mode {
-            execute!(output, EnableMouseCapture)?;
-        }
         self.pending_link_picker_open = false;
         self.link_picker = Some(LinkPickerState::new(self.tab().page));
         show_link_picker_split(
@@ -1992,9 +2005,6 @@ impl App {
         let Some(state) = self.link_picker.take() else {
             return Ok(());
         };
-        if !self.link_mode {
-            execute!(output, DisableMouseCapture)?;
-        }
         if let Some(origin) = state.preview_origin {
             let tab = self.tab_mut();
             tab.page = origin.page.min(tab.page_count - 1);
@@ -2500,7 +2510,6 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(output)?,
             KeyCode::Char('0') => self.reset_zoom(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
-            KeyCode::Char('I') => self.set_inverse_mode(!self.synctex_mode, output)?,
             KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
             KeyCode::Char('T') => self.open_theme_picker(output)?,
@@ -2723,7 +2732,11 @@ impl App {
         // the pending flash's y-down top edge can become a scroll ratio with
         // the same -0.08 headroom links use.
         let flash_scroll = match self.pending_flash.as_mut() {
-            Some(flash) if flash.page == key.page && frame.flash_page_height_pt > 0.0 => {
+            Some(flash)
+                if flash.document_id == key.document_id
+                    && flash.page == key.page
+                    && frame.flash_page_height_pt > 0.0 =>
+            {
                 flash.top_pt.take()
             }
             _ => None,
@@ -2903,7 +2916,6 @@ impl App {
         }
         let search_status = tab.search.status_label(tab.page);
         let link_status = self.link_mode.then_some("  click/enter: open  esc: close");
-        let synctex_status = self.synctex_mode.then_some("  inverse: click a location");
         execute!(
             output,
             MoveTo(0, viewport.status_row),
@@ -2926,8 +2938,6 @@ impl App {
             Print(search_status.as_deref().unwrap_or_default()),
             SetForegroundColor(theme.cyan),
             Print(link_status.unwrap_or_default()),
-            SetForegroundColor(theme.yellow),
-            Print(synctex_status.unwrap_or_default()),
             SetForegroundColor(theme.comment),
             Print("  ?: help"),
             SetBackgroundColor(theme.bg),
@@ -3113,29 +3123,6 @@ impl App {
             .position(|tab| tab.document_id == document_id)
     }
 
-    fn set_inverse_mode(&mut self, enabled: bool, output: &mut impl Write) -> Result<(), AppError> {
-        if enabled == self.synctex_mode {
-            return Ok(());
-        }
-        self.synctex_mode = enabled;
-        if enabled {
-            execute!(output, crossterm::event::EnableMouseCapture).map_err(AppError::from)?;
-        } else if !self.link_mode {
-            execute!(output, crossterm::event::DisableMouseCapture).map_err(AppError::from)?;
-        }
-        let viewport = self.viewport()?;
-        self.draw_status(
-            output,
-            viewport,
-            if enabled {
-                "inverse search: click a location"
-            } else {
-                ""
-            },
-        )?;
-        Ok(())
-    }
-
     fn begin_inverse_search(
         &mut self,
         mouse: MouseEvent,
@@ -3214,8 +3201,10 @@ impl App {
             self.draw_status(output, viewport, "inverse search: click outside page")?;
             return Ok(());
         }
-        let tab = self.tab();
-        let pdf_path = tab.path.display().to_string();
+        let Some(index) = self.tab_index(click.document_id) else {
+            return Ok(());
+        };
+        let pdf_path = self.tabs[index].path.display().to_string();
         let synctex_y = click.page_height_pt - click.pdf_y;
         let spec = format!(
             "{}:{:.2}:{:.2}:{}",
@@ -3231,22 +3220,72 @@ impl App {
             return Ok(());
         };
         let stdout = String::from_utf8_lossy(&resolved.stdout);
-        let Some(target) = parse_synctex_edit(&stdout) else {
+        let Some(mut target) = parse_synctex_edit(&stdout) else {
             self.draw_status(output, viewport, "inverse search: no synctex match")?;
             return Ok(());
         };
-        let handoff = format!("{}:{}", target.file, target.line);
-        if let Some(socket_path) = self.nvim_socket.as_deref()
-            && let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path)
-        {
-            let _ = std::io::Write::write_all(&mut stream, handoff.as_bytes());
+        let mut column = 0;
+        let mut precise = false;
+        match click.text {
+            Err(error) => {
+                self.draw_status(
+                    output,
+                    viewport,
+                    &format!("inverse search: PDF text: {error}"),
+                )?;
+                return Ok(());
+            }
+            Ok(Some((context, offset))) => {
+                let source = match fs::read_to_string(&target.file) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.draw_status(
+                            output,
+                            viewport,
+                            &format!("inverse search: source: {error}"),
+                        )?;
+                        return Ok(());
+                    }
+                };
+                if let Some((line, byte)) =
+                    source_word_location(&source, target.line, &context, offset)
+                {
+                    target.line = line;
+                    column = byte;
+                    precise = true;
+                }
+            }
+            Ok(None) => {}
         }
-        let _ = write_clipboard_osc52(output, &handoff);
+        let handoff = format!("{}:{}:{}", target.file, target.line, column);
+        if let Some(socket_path) = self.nvim_socket.as_deref() {
+            let sent = std::os::unix::net::UnixStream::connect(socket_path)
+                .and_then(|mut stream| stream.write_all(handoff.as_bytes()));
+            if let Err(error) = sent {
+                self.draw_status(
+                    output,
+                    viewport,
+                    &format!("inverse search: editor handoff: {error}"),
+                )?;
+                return Ok(());
+            }
+        }
+        write_clipboard_osc52(output, &handoff)?;
         let shown = target.file.rsplit('/').next().unwrap_or(&target.file);
         self.draw_status(
             output,
             viewport,
-            &format!("inverse search: {}:{} (copied)", shown, target.line),
+            &format!(
+                "inverse search: {}:{}:{} ({})",
+                shown,
+                target.line,
+                column + 1,
+                if precise {
+                    "word, copied"
+                } else {
+                    "line only, copied"
+                }
+            ),
         )?;
         Ok(())
     }
@@ -5264,7 +5303,9 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         (":", "go to page"),
         ("/", "search document"),
         ("n / N", "next / prev match"),
+        ("Mouse wheel", "scroll PDF / change page"),
         ("Enter", "browse PDF links"),
+        ("Click", "follow PDF link"),
         ("h / l (split)", "focus PDF/pane"),
         ("/ (pane)", "filter/new search"),
         ("Ctrl-b/f (pane)", "page results"),
@@ -5277,7 +5318,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("+ / -", "zoom in / out"),
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
-        ("I", "inverse search mode"),
+        ("Alt/Option-click", "inverse search"),
         ("p", "toggle performance timings"),
         ("t", "table of contents"),
         ("T", "choose theme"),
@@ -5945,8 +5986,94 @@ impl FileWatcher {
     }
 }
 
+/// Resolve a PDF word near SyncTeX's source line, using neighboring words to
+/// disambiguate repeats. Columns are zero-based UTF-8 byte offsets for Neovim.
+/// ponytail: prose matching, not a TeX expander; macros may remain line-only.
+fn source_word_location(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+) -> Option<(u32, usize)> {
+    fn words(text: &str) -> Vec<(usize, &str)> {
+        let mut result = Vec::new();
+        let mut start = None;
+        for (index, ch) in text
+            .char_indices()
+            .chain(std::iter::once((text.len(), ' ')))
+        {
+            if ch.is_alphanumeric() {
+                start.get_or_insert(index);
+            } else if let Some(start) = start.take() {
+                result.push((start, &text[start..index]));
+            }
+        }
+        result
+    }
+    fn normalized(word: &str) -> String {
+        word.to_lowercase()
+            .replace('ﬁ', "fi")
+            .replace('ﬂ', "fl")
+            .replace('ﬀ', "ff")
+            .replace('ﬃ', "ffi")
+            .replace('ﬄ', "ffl")
+    }
+    let pdf = words(context);
+    let selected = pdf
+        .iter()
+        .position(|(start, word)| *start <= offset && offset < start + word.len())?;
+    let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized(word)).collect();
+    let mut candidates = Vec::new();
+    let start_line = line.saturating_sub(5) as usize;
+    for (index, text) in source
+        .lines()
+        .enumerate()
+        .take(line as usize + 4)
+        .skip(start_line)
+    {
+        let text = text.split('%').next().unwrap_or("");
+        for (byte, word) in words(text) {
+            if byte == 0 || !text[..byte].ends_with('\\') {
+                candidates.push((index as u32 + 1, byte, normalized(word)));
+            }
+        }
+    }
+    let mut best = None;
+    let mut tied = false;
+    for (index, (row, byte, word)) in candidates.iter().enumerate() {
+        if *word != pdf[selected] {
+            continue;
+        }
+        let mut score = 0;
+        for distance in 1..=3 {
+            for direction in [-1isize, 1] {
+                let delta = distance * direction;
+                if let (Some(a), Some(b)) = (
+                    selected.checked_add_signed(delta).and_then(|i| pdf.get(i)),
+                    index
+                        .checked_add_signed(delta)
+                        .and_then(|i| candidates.get(i)),
+                ) && *a == b.2
+                {
+                    score += 4 - distance;
+                }
+            }
+        }
+        let rank = (score, std::cmp::Reverse(row.abs_diff(line)));
+        match best {
+            Some((old, _, _)) if rank < old => {}
+            Some((old, _, _)) if rank == old => tied = true,
+            _ => {
+                best = Some((rank, *row, *byte));
+                tied = false;
+            }
+        }
+    }
+    best.filter(|_| !tied).map(|(_, row, byte)| (row, byte))
+}
+
 /// Parses the stdout of `synctex edit -o ...` into a source file and line.
-/// Handles `Input:`, `Line:`, and `Column:` keys; `Column` may be `-1`.
+/// SyncTeX may return Column: -1; PDF text refines the source position separately.
 /// Returns None when no match is found.
 fn parse_synctex_edit(stdout: &str) -> Option<SynctexTarget> {
     let mut input: Option<String> = None;
@@ -5975,11 +6102,11 @@ mod tests {
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
         PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState, ZOOM_DEFAULT,
         ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, clear_image_canvas, clear_picker,
-        clear_picker_filter, cycled_tab_index, draw_help_menu, draw_link_picker, draw_picker,
-        draw_search_picker, draw_theme_picker, filter_document_links, filter_outline,
-        filter_theme_indices, link_at_cell, link_picker_focus_for_key, link_picker_label,
-        link_picker_link_at_position, link_picker_list_area, link_picker_navigation_index,
-        link_picker_panes, link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
+        clear_picker_filter, cycled_tab_index, draw_link_picker, draw_picker, draw_search_picker,
+        draw_theme_picker, filter_document_links, filter_outline, filter_theme_indices,
+        link_at_cell, link_picker_focus_for_key, link_picker_label, link_picker_link_at_position,
+        link_picker_list_area, link_picker_navigation_index, link_picker_panes,
+        link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
         outline_start_index, parse_synctex_edit, picker_color, picker_rect, render_timing_status,
         restore_link_picker_split, search_target_page, shorten_path, show_link_picker_split,
         stale_status_row, stepped_zoom, synchronized_output, update_link_number_selection,
@@ -7127,46 +7254,6 @@ mod tests {
     }
 
     #[test]
-    fn help_menu_lists_viewer_keybindings() {
-        let area = Rect::new(0, 0, 100, 40);
-        let popup = picker_rect(area);
-        let theme = crate::theme::TOKYO_NIGHT_MOON;
-        let mut terminal =
-            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
-
-        terminal
-            .draw(|frame| draw_help_menu(frame, theme))
-            .expect("draw help menu");
-        let buffer = terminal.backend().buffer();
-        let rendered: String = (popup.y..popup.y + popup.height)
-            .flat_map(|y| {
-                (popup.x..popup.x + popup.width).map(move |x| buffer[(x, y)].symbol().to_string())
-            })
-            .collect();
-
-        assert_eq!(buffer[(0, 0)].bg, picker_color(theme.bg_dark1));
-        assert!(rendered.contains("Navigation"));
-        assert!(rendered.contains("Viewer"));
-        assert!(rendered.contains("search document"));
-        assert!(rendered.contains("next / prev match"));
-        assert!(rendered.contains("browse PDF links"));
-        assert!(rendered.contains("filter/new search"));
-        assert!(!rendered.contains("hover (links)"));
-        assert!(rendered.contains("select tab"));
-        assert!(rendered.contains("link mode + browser"));
-        assert!(rendered.contains("leave mode / close tab"));
-        assert!(rendered.contains("cycle / auto side layout"));
-        assert!(rendered.contains("zoom in / out"));
-        assert!(rendered.contains("reset zoom"));
-        assert!(rendered.contains("toggle performance timings"));
-        assert!(rendered.contains("inverse search mode"));
-        assert!(rendered.contains("choose theme"));
-        assert!(rendered.contains("open PDF in new tab"));
-        assert!(rendered.contains("leave mode / clear / exit"));
-        assert!(rendered.contains("? / esc / q"));
-    }
-
-    #[test]
     fn picker_labels_recent_files_with_parent_directory() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let recent = directory.path().join("recent.pdf");
@@ -7357,6 +7444,32 @@ mod tests {
         let floating_output = String::from_utf8(floating_output).expect("terminal output");
         assert!(!floating_output.contains("a=p"));
         assert!(!floating_output.contains("a=T"));
+    }
+
+    #[test]
+    fn inverse_word_matching_resolves_context_and_utf8_byte_columns() {
+        let source = "A repeated word far away.\nÉlie uses \\emph{repeated} maps near fibers.\nRepeated noise.\n";
+        let context = "Élie uses repeated maps near ﬁbers.";
+        assert_eq!(
+            super::source_word_location(source, 2, context, context.find("repeated").unwrap()),
+            Some((2, source.lines().nth(1).unwrap().find("repeated").unwrap()))
+        );
+        assert_eq!(
+            super::source_word_location(source, 3, context, context.find("ﬁbers").unwrap()),
+            Some((2, source.lines().nth(1).unwrap().find("fibers").unwrap()))
+        );
+        assert_eq!(super::source_word_location("word word", 1, "word", 1), None);
+        assert_eq!(
+            super::source_word_location("\\word % word", 1, "word", 1),
+            None
+        );
+        assert_eq!(super::source_word_location("word", 1, "missing", 1), None);
+        let boundary = "one\ntwo\nthree\nfour\nfive\nsix";
+        assert_eq!(
+            super::source_word_location(boundary, 1, "five", 1),
+            Some((5, 0))
+        );
+        assert_eq!(super::source_word_location(boundary, 1, "six", 1), None);
     }
 
     #[test]

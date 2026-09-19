@@ -201,6 +201,7 @@ pub enum WorkerMessage {
         pdf_x: f32,
         pdf_y: f32,
         page_height_pt: f32,
+        text: Result<Option<(String, usize)>, String>,
     },
     OpenError {
         document_id: DocumentId,
@@ -711,6 +712,7 @@ fn run_worker(
                                 pdf_x,
                                 pdf_y,
                                 page_height_pt,
+                                text: clicked_text(&rendered, pdf_x, pdf_y),
                             })
                             .map_err(|_| "viewer stopped".to_string())?;
                     }
@@ -978,11 +980,7 @@ fn run_worker(
                         .and_then(|highlights| highlights.pages.get(&request.key.page))
                 })
                 .flatten();
-            let links = if request.key.link_mode || request.key.selected_link_ordinal.is_some() {
-                extract_page_links(document, &page, &config, width, height)
-            } else {
-                Vec::new()
-            };
+            let links = extract_page_links(document, &page, &config, width, height);
             let selected_link_rectangles =
                 selected_page_link_rectangles(&links, request.key.selected_link_ordinal);
             let dark_mode_link_rectangles = if request.key.invert {
@@ -1587,6 +1585,36 @@ impl From<WorkerCommand> for WorkerTask {
             WorkerCommand::ClearFlash { document_id } => Self::ClearFlash { document_id },
         }
     }
+}
+
+/// Keep a small text neighborhood around the clicked glyph, not the entire page.
+fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)>, String> {
+    let text = page.text().map_err(|error| error.to_string())?;
+    let chars = text.chars();
+    let Some(character) = chars.get_char_near_point(
+        PdfPoints::new(x),
+        PdfPoints::new(6.0),
+        PdfPoints::new(y),
+        PdfPoints::new(6.0),
+    ) else {
+        return Ok(None);
+    };
+    let clicked = character.index();
+    let mut context = String::new();
+    let mut offset = 0;
+    for index in clicked.saturating_sub(96)..chars.len().min(clicked + 97) {
+        if index == clicked {
+            offset = context.len();
+        }
+        if let Some(value) = chars
+            .get(index)
+            .map_err(|error| error.to_string())?
+            .unicode_char()
+        {
+            context.push(value);
+        }
+    }
+    Ok(Some((context, offset)))
 }
 
 fn empty_text_cache(pages: u32) -> Vec<Option<CachedPageText>> {
