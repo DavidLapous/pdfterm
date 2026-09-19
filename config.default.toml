@@ -34,7 +34,7 @@ set_window_title = true            # Set terminal/window title to active PDF fil
 center_forward_search = true       # Center SyncTeX box; false aligns its top near viewport top
 flash_duration_ms = 1000            # Highlight lifetime after frame submission, 1–60000 ms
 word_precision = true              # Refine inverse search with nearby PDF/source words
-source_context_lines = 4           # Maximum source lines before/after SyncTeX result, 0–100
+source_context_lines = 4           # Source radius outside Beamer frames, 0–100; frames use full block
 
 [nvim]
 viewer = "terminal"                # terminal (Kitty/Ghostty split) or skim (macOS displayline)

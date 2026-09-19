@@ -10,7 +10,6 @@
 
 - [ ] Publish release archives for macOS arm64 and Linux x86_64/aarch64. #chore
 - [ ] Transmit each page once and re-place crops on scroll instead of re-transmitting. #improvement
-- [ ] Verify visible forward-search page/flash/scroll; same-tab Ghostty launch and viewer reuse are verified, but a bare-PTY probe did not emit a post-request page indicator. #task
 
 ## Later
 
@@ -21,7 +20,7 @@
 Pure-Rust PDF rendering: Hayro states that its renderer has not received performance work yet, which conflicts with the latency requirement.
 
 ## Done
-- [x] Add a SyncTeX inverse-search handoff: `I` mode resolves the click via synctex edit and writes file:line to a configured nvim unix socket. #feature
+- [x] Add an editor-neutral SyncTeX inverse-search handoff: Alt/Option-click resolves the source location and sends explicitly encoded columns through a configured socket or command. #feature
 
 - [x] Add a fuzzy PDF picker for startup and in-viewer file changes. #feature
 - [x] Reload changed PDFs without interrupting navigation or displaying partial writes. #feature
@@ -42,4 +41,4 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 - [x] Add incremental text search that does not block foreground rendering. #feature
 - [x] Follow internal links and named destinations, with a numbered link picker and back navigation. #feature
 - [x] Add discrete zoom levels beyond the fit modes. #feature
-- [x] Add a forward-search socket: nvim sends `page:h:v:W:H`, the viewer jumps, flashes the line red for 1s, and scrolls it near the top. #feature
+- [x] Add revision-bound forward-search JSON: select or open the PDF tab, position and highlight its target, then acknowledge after the rendered frame is submitted to the terminal. #feature

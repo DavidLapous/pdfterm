@@ -36,8 +36,8 @@ For the Neovim plugin, clone the repository and build its release binary
 (`cargo install` alone does not install the plugin):
 
 ```console
-git clone https://github.com/DavidLapous/pdfterm.git ~/git/pdfterm
-cargo build --release --locked --manifest-path ~/git/pdfterm/Cargo.toml
+git clone https://github.com/DavidLapous/pdfterm.git
+cargo build --release --locked --manifest-path pdfterm/Cargo.toml
 ```
 
 ## Run
@@ -293,7 +293,8 @@ bytes, followed by a write-half-close:
 {"pdf":"/project/main.pdf","revision":{"device":1,"inode":42,"length":12345,"modified_seconds":1700000000,"modified_nanoseconds":0,"changed_seconds":1700000000,"changed_nanoseconds":0},"page":2,"h":72.0,"v":120.0,"width":250.0,"height":12.0}
 ```
 
-`pdf` must be absolute and identify an already-open tab; that tab is selected.
+`pdf` must be absolute. The viewer selects its existing tab or opens a new tab
+before applying the request; switching projects does not require restarting it.
 Use `--synctex-view` to obtain `revision` together with the geometry. It records
 the PDF's Unix device/inode, size, and nanosecond modification/change timestamps,
 checked before and after SyncTeX resolution. This is local filesystem identity,
@@ -307,7 +308,7 @@ for Kitty/Ghostty compositor completion. The highlight lifetime starts at that
 submission, not while loading or rendering.
 
 Each connection receives one terminal reply and closes; no status polling or
-request IDs are needed. Changed-again PDFs, unknown documents, out-of-range pages,
+request IDs are needed. Changed-again PDFs, unreadable documents, out-of-range pages,
 invalid requests, supersession, user-input cancellation, and renderer/viewer
 failure return `{"ok":false,"error":"..."}`. Repeat SyncTeX resolution after a
 revision rejection; do not resend stale coordinates against a newer revision.
@@ -323,7 +324,7 @@ rejected. Send the complete request and half-close within 100 ms after connectin
 Build the release binary, then add the bundled plugin to Neovim:
 
 ```lua
-vim.opt.runtimepath:prepend(vim.fn.expand('~/git/pdfterm/nvim'))
+vim.opt.runtimepath:prepend('/path/to/pdfterm/nvim')
 require('pdfterm').setup()
 ```
 
@@ -347,14 +348,20 @@ remain direct Unix APIs rather than an extra portability layer.
 `Alt`/`Option`-click resolves the clicked location with
 `synctex edit`, then matches the clicked PDF word and nearby text against source
 lines within `viewer.source_context_lines` of the result (default four).
+Inside a literal `\begin{frame}` … `\end{frame}` block, it searches that frame
+instead: Beamer often maps every `\pause`/`\only` overlay to `\end{frame}`.
+Nearby PDF words disambiguate repeated source words; equally good matches within
+a frame remain line only rather than favoring the occurrence nearest its end.
 The JSON handoff carries one-based lines and explicitly encoded columns.
 The plugin uses the UTF-8 byte column and jumps to the source buffer without changing
 terminal focus. Set `[nvim] focus_on_inverse = true` to opt in to focusing the terminal
 captured by forward search.
 Ambiguous words, macros, and non-text clicks remain explicitly marked **line only**;
-the matcher does not expand TeX. Source matching uses the saved file, so save and
-rebuild after edits. With `transport = "none"`, the target is shown in the status
-bar and copied to the clipboard (OSC 52). Configured transport failures are reported.
+the matcher does not expand TeX. Non-alphanumeric math symbols such as `\longmapsto`
+and font-private glyphs are not word candidates. Source matching uses the saved
+file, so save and rebuild after edits. With `transport = "none"`, the target is
+shown in the status bar and copied to the clipboard (OSC 52). Configured transport
+failures are reported.
 
 The nvim forward search (`<leader>cl`) uses a switchable viewer:
 
@@ -378,6 +385,10 @@ the viewer from any mode, including help and pickers, and releases its socket.
 
 Default editor controls: `<leader>cl` forward search, `<leader>cb` build,
 `<leader>csl` set main TeX file, `<leader>cscl` toggle compile-before-search.
+To change projects, open the new project's **main** `.tex` file, press
+`<leader>csl`, then `<leader>cl`. Its PDF opens in a new viewer tab if necessary;
+previous projects remain available. While a forward request is pending, the
+latest requested PDF and position replace the queued target together.
 The default socket pair supports one viewer process and one editor adapter per
 configuration; the viewer may contain several document tabs. Use separate
 `XDG_CONFIG_HOME` directories for independent

@@ -4,4 +4,6 @@
 *.dylib
 *.so
 *.dll
+/review.md
+/next_steps.md
 

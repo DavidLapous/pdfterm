@@ -250,6 +250,63 @@ pub(crate) fn parse_synctex_edit(stdout: &str) -> Option<SourceLocation> {
     }
     result
 }
+/// TeX comments start at an unescaped percent sign.
+fn source_line_text(text: &str) -> &str {
+    let mut escaped = false;
+    for (index, byte) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'%' {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// Find a literal frame environment enclosing the one-based SyncTeX line.
+/// Beamer often attributes every overlay's text to the closing frame line.
+fn source_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>> {
+    let anchor = line.checked_sub(1)? as usize;
+    let mut start = None;
+    for (index, text) in source.lines().enumerate() {
+        let mut text = source_line_text(text);
+        while let Some((_, rest)) = text.split_once('\\') {
+            text = rest;
+            if let Some(rest) = text.strip_prefix('\\') {
+                text = rest;
+                continue;
+            }
+            if let Some(rest) = text
+                .strip_prefix("begin")
+                .and_then(|rest| rest.trim_start().strip_prefix("{frame}"))
+            {
+                text = rest;
+                // Nested frames are not a reliable source boundary.
+                if start.replace(index).is_some() {
+                    return None;
+                }
+            } else if let Some(rest) = text
+                .strip_prefix("end")
+                .and_then(|rest| rest.trim_start().strip_prefix("{frame}"))
+            {
+                text = rest;
+                if let Some(start) = start.take()
+                    && start <= anchor
+                    && anchor <= index
+                {
+                    return Some(start..index + 1);
+                }
+            }
+        }
+        if index >= anchor && start.is_none() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Resolve a PDF word near SyncTeX's source line, using neighboring words to
 /// disambiguate repeats. Columns are zero-based UTF-8 byte offsets.
 /// ponytail: prose matching, not a TeX expander; macros may remain line-only.
@@ -289,14 +346,13 @@ fn source_word_location(
         .position(|(start, word)| *start <= offset && offset < start + word.len())?;
     let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized(word)).collect();
     let mut candidates = Vec::new();
-    let start_line = line.saturating_sub(radius + 1) as usize;
-    for (index, text) in source
-        .lines()
-        .enumerate()
-        .take(line as usize + radius as usize)
-        .skip(start_line)
-    {
-        let text = text.split('%').next().unwrap_or("");
+    let frame = source_frame_range(source, line);
+    let within_frame = frame.is_some();
+    let lines = frame.unwrap_or_else(|| {
+        line.saturating_sub(radius + 1) as usize..line as usize + radius as usize
+    });
+    for (index, text) in source.lines().enumerate().take(lines.end).skip(lines.start) {
+        let text = source_line_text(text);
         for (byte, word) in words(text) {
             if byte == 0 || !text[..byte].ends_with('\\') {
                 candidates.push((index as u32 + 1, byte, normalized(word)));
@@ -324,7 +380,9 @@ fn source_word_location(
                 }
             }
         }
-        let rank = (score, std::cmp::Reverse(row.abs_diff(line)));
+        // A Beamer boundary is not evidence that the last occurrence is best.
+        let proximity = if within_frame { 0 } else { row.abs_diff(line) };
+        let rank = (score, std::cmp::Reverse(proximity));
         match best {
             Some((old, _, _)) if rank < old => {}
             Some((old, _, _)) if rank == old => tied = true,
@@ -386,6 +444,48 @@ mod tests {
             Some((5, 0))
         );
         assert_eq!(super::source_word_location(boundary, 1, "six", 1, 4), None);
+    }
+
+    #[test]
+    fn inverse_frame_matching_reaches_prose_without_crossing_frames() {
+        let source = "\\begin{frame}\nSome datasets convey geometry.\n\\pause\n\
+                      \\includegraphics{datasets/image.pdf}\n\n\n\n\n\
+                      \\only<2>{Other visible text.}\n\\end{frame}\n\
+                      \\begin{frame}\nSome datasets convey geometry.\n\\end{frame}";
+        assert_eq!(
+            source_word_location(source, 10, "Some datasets convey geometry.", 5, 4),
+            Some((2, 5))
+        );
+        assert_eq!(
+            source_word_location(source, 13, "Some datasets convey geometry.", 5, 4),
+            Some((12, 5))
+        );
+        assert_eq!(source_word_location(source, 10, "datasets", 1, 4), None);
+        assert_eq!(source_word_location(source, 13, "Other", 1, 4), None);
+    }
+
+    #[test]
+    fn inverse_frame_matching_keeps_duplicate_overlays_line_only() {
+        let source = "\\begin{frame}\n\\only<1>{Identical visible phrase.}\n\
+                      \\only<2>{Identical visible phrase.}\n\\end{frame}";
+        assert_eq!(
+            source_word_location(source, 4, "Identical visible phrase.", 10, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn inverse_frame_matching_ignores_commented_and_escaped_boundaries() {
+        let source = "% \\begin{frame}\n\\begin {frame}\n\
+                      % \\end{frame}\n\\\\end{frame}\n\
+                      Before \\% percent target. % hidden\n\n\n\n\n\\end {frame}";
+        assert_eq!(
+            source_word_location(source, 10, "percent target", 9, 0),
+            Some((5, 18))
+        );
+        assert_eq!(source_word_location(source, 10, "hidden", 1, 4), None);
+        let unterminated = "\\begin{frame}\ntarget\n\n\n\n\n";
+        assert_eq!(source_word_location(unterminated, 6, "target", 1, 0), None);
     }
 
     #[test]

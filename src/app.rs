@@ -1049,6 +1049,18 @@ impl App {
         Ok(())
     }
 
+    fn begin_open(&mut self, path: PathBuf, output: &mut impl Write) -> Result<(), AppError> {
+        let document_id = self.next_document_id;
+        self.next_document_id = self.next_document_id.wrapping_add(1).max(1);
+        self.worker
+            .open(document_id, path.clone())
+            .map_err(AppError::Renderer)?;
+        self.pending_open = Some(PendingOpen::Selection { document_id, path });
+        let viewport = self.prepare_viewport(output)?;
+        self.draw_status(output, viewport, "opening")?;
+        Ok(())
+    }
+
     fn open_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         if self.pending_open.is_some() {
             return Ok(());
@@ -1068,14 +1080,7 @@ impl App {
                     self.reset_render_state();
                     self.request_current(output)?;
                 } else {
-                    let document_id = self.next_document_id;
-                    self.next_document_id = self.next_document_id.wrapping_add(1).max(1);
-                    self.worker
-                        .open(document_id, path.clone())
-                        .map_err(AppError::Renderer)?;
-                    self.pending_open = Some(PendingOpen::Selection { document_id, path });
-                    let viewport = self.prepare_viewport(output)?;
-                    self.draw_status(output, viewport, "opening")?;
+                    self.begin_open(path, output)?;
                 }
             }
             None => self.request_current(output)?,
@@ -1680,13 +1685,10 @@ impl App {
                 return Ok(());
             }
             let pdf = fs::canonicalize(&pending.request.pdf)?;
-            let index = self
-                .tabs
-                .iter()
-                .position(|tab| tab.path == pdf)
-                .ok_or_else(|| {
-                    io::Error::other(format!("PDF is not open in this viewer: {}", pdf.display()))
-                })?;
+            let Some(index) = self.tabs.iter().position(|tab| tab.path == pdf) else {
+                self.begin_open(pdf, output)?;
+                return Ok(());
+            };
             if self.tabs[index].revision != pending.request.revision {
                 let document_id = self.tabs[index].document_id;
                 let fingerprint = FileFingerprint::read(&pdf)?;
