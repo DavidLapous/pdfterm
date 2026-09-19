@@ -43,8 +43,10 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 
 | Key | Action |
 | --- | --- |
-| `j` `l` arrows space `PageDown` | forward — page, or scroll when the page overflows the viewport |
-| `k` `h` arrows `Backspace` `PageUp` | backward — page, or scroll when the page overflows |
+| `j` / down / space / `PageDown` | scroll down continuously across pages |
+| `k` / up / `Backspace` / `PageUp` | scroll up continuously across pages |
+| `h` / `l` / left / right | scroll horizontally, or change page at the edge |
+| Mouse wheel / trackpad | scroll continuously (outside pickers and prompts) |
 | `g` / `G` | first / last page |
 | `:` | go-to-page prompt (type a number, `Enter` to jump, `Esc` to cancel) |
 | `/` | search selectable document text |
@@ -53,13 +55,13 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `+` / `-` | zoom in / out in 25% steps (up to 400%) |
 | `0` | reset zoom to the fitted size |
 | `i` | toggle Polaris-style dark mode |
-| `I` | toggle inverse search mode: click a location to resolve it via synctex and jump to the source in your editor |
+| `Alt`/`Option` + click | resolve the clicked location via SyncTeX and jump to its source; no toggle |
 | `p` | toggle detailed render-performance timings |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
 | `T` | choose and preview a theme for the current session |
 | `y` | copy the current page's text to the clipboard |
 | `Enter` | open the document-wide link browser |
-| `L` | enable mouse link mode, highlight annotations, and open the link browser |
+| `L` | toggle annotation highlights and open the link browser |
 | `b` | return to the view before the last followed internal link |
 | `f` | open a PDF in a new tab |
 | `Tab` / `Shift-Tab` | switch tabs |
@@ -68,9 +70,10 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `q` | leave link mode when active; otherwise close the current tab |
 | `Esc` | leave link mode; otherwise close a pane, clear search, or exit |
 
-In fit-width and fit-height modes, the movement keys scroll within a page that is
-larger than the viewport and cross into the adjacent page at the edges. The `h`/`l`
-keys and left/right arrows scroll horizontally in fit-height mode.
+Vertical scrolling shows adjacent pages together, separated by one terminal row,
+in every fit mode. Links and inverse search target the page under the pointer,
+not just the first visible page. The `h`/`l` keys and left/right arrows scroll
+horizontally when the rendered page is wider than the viewport.
 
 Search scans and caches selectable text incrementally without blocking foreground
 page rendering. Results open beside the PDF, grouped by outline section and page,
@@ -82,10 +85,11 @@ The search is case-insensitive, treats runs of whitespace as a single space, and
 highlights matches using the active theme. Image-only PDFs require OCR and are
 reported as having no matches.
 
-Mouse link mode temporarily enables mouse capture so normal terminal text selection is
-unchanged outside the mode. Press `L` to enable it, highlight annotations, and
-open the document-wide link browser automatically. Press `Enter` at any time to
-open the same browser without enabling annotation highlighting. It uses a
+Click a PDF hyperlink to follow it; no mode toggle is required. Mouse capture stays
+enabled while the viewer runs, including outside `L` mode. Use `y` to copy
+the page's text, or your terminal's mouse-capture override for terminal selection.
+Press `L` to toggle annotation highlights and open the document-wide link browser.
+Press `Enter` to open the same browser without enabling highlights. It uses a
 Grimoire-style split view. Wide terminals place
 the PDF on the left and a compact link sidebar on the right; narrow terminals
 place the PDF above the links. Links are indexed incrementally behind foreground
@@ -147,7 +151,7 @@ theme_catalog = "~/.config/themes/catalog.toml"
 # enable inverse search (default: enabled)
 synctex_enabled = true
 
-# unix socket receiving "file:line" when a click is inverse-searched;
+# unix socket receiving "file:line:byte-column" on inverse search;
 # the Neovim integration below listens on this path
 nvim_socket = "/tmp/pdfterm-nvim.sock"
 ```
@@ -228,24 +232,30 @@ theme, link, and search-result pickers use the same navigation conventions.
 
 ## Neovim integration
 
-With `nvim_socket` set, `I` mode resolves the clicked location with `synctex
-edit` and writes `file:line` to the socket, where the nvim config
-(`lua/custom/pdfterm.lua`) routes it through `latex_sync.inverse_search` — the
-jump raises the Neovim window. Without the socket, the resolved target is only
-shown in the status bar and copied to the clipboard (OSC 52).
+With `nvim_socket` set, `Alt`/`Option`-click resolves the clicked location with
+`synctex edit`, then matches the clicked PDF word and nearby text against source
+lines within four lines of the result. The handoff is `file:line:byte-column`
+(one-based line, zero-based UTF-8 byte column). The nvim config
+(`lua/custom/pdfterm.lua`) routes it through `latex_sync.inverse_search`.
+Ambiguous words, macros, and non-text clicks remain explicitly marked **line only**;
+the matcher does not expand TeX. Source matching uses the saved file, so save and
+rebuild after edits. Without the socket, the target is shown in the status bar and
+copied to the clipboard (OSC 52). Configured editor-socket failures are reported.
 
 The nvim forward search (`<leader>cl`) uses a switchable viewer:
 
 - `<leader>csls` — Skim (displayline)
 - `<leader>cslt` — pdfterm in a dedicated Ghostty terminal
 
-The terminal branch runs `synctex view` for the current cursor line and sends
+The terminal branch runs `synctex view` for the cursor line and character column,
+uses the first (best-ranked) result, and sends
 `page:h:v:W:H` (1-based page, h = box left, v = box bottom measured from the
 page top) to the forward socket (`forward_socket` config key or
 `--forward-socket`). A live viewer applies the goto, flashes the target box
-red for one second, and scrolls so the line sits near the top; with no viewer
-listening, nvim launches pdfterm first and delivers the payload once its
-socket is up.
+red for one second, and centers the highlighted region vertically, showing the
+preceding or following page as needed. Positioning is rounded to terminal rows
+and clamped at document ends. With no viewer listening, nvim launches pdfterm
+first and delivers the payload once its socket is up.
 
 ## Checks
 

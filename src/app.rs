@@ -257,6 +257,8 @@ struct App {
     desired_key: Option<RenderKey>,
     pending: HashSet<RenderKey>,
     visible_image_id: Option<u32>,
+    visible_pages: Vec<VisiblePage>,
+    pending_vertical_scroll: i64,
     next_image_id: u32,
     last_status_row: Option<u16>,
     performance_snapshot: Option<PerformanceSnapshot>,
@@ -685,6 +687,13 @@ fn search_target_page(
     .map(|result| result.page)
 }
 
+struct VisiblePage {
+    frame: Arc<Frame>,
+    placement: ImagePlacement,
+    top: u16,
+    image_id: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Axis {
     Vertical,
@@ -780,10 +789,8 @@ fn parse_forward_request(payload: &str) -> Option<ForwardRequest> {
 struct PendingFlash {
     document_id: DocumentId,
     page: u32,
-    /// y-down top edge of the flash box in points (synctex v - H); taken by
-    /// receive_frame on the flash frame, leaving the flash in place for the
-    /// 1s expiry to clear the highlight.
-    top_pt: Option<f32>,
+    /// Y-down center of the flash box in points; consumed when its frame arrives.
+    center_pt: Option<f32>,
     expires_at: Instant,
 }
 
@@ -856,6 +863,8 @@ impl App {
             desired_key: None,
             pending: HashSet::new(),
             visible_image_id: None,
+            visible_pages: Vec::new(),
+            pending_vertical_scroll: 0,
             next_image_id: 1,
             last_status_row: None,
             performance_snapshot: None,
@@ -1591,6 +1600,15 @@ impl App {
         request: ForwardRequest,
         now: Instant,
     ) -> Result<(), AppError> {
+        self.pending_vertical_scroll = 0;
+        if let Some(previous) = self.pending_flash.take() {
+            self.worker.clear_flash(previous.document_id);
+            if let Some(index) = self.tab_index(previous.document_id) {
+                self.tabs[index]
+                    .cache
+                    .retain(|key, _| key.page != previous.page);
+            }
+        }
         let tab = self.tab_mut();
         let document_id = tab.document_id;
         let page = request.page.saturating_sub(1).min(tab.page_count - 1);
@@ -1602,10 +1620,7 @@ impl App {
         self.pending_flash = Some(PendingFlash {
             document_id,
             page,
-            // y-down top edge of the flash box in points; turned into a scroll
-            // ratio on frame arrival where the worker-reported page height is
-            // known.
-            top_pt: Some(request.rect.top),
+            center_pt: Some((request.rect.top + request.rect.bottom) * 0.5),
             expires_at: now + Duration::from_secs(1),
         });
         self.worker.flash(document_id, page, request.rect);
@@ -1638,7 +1653,14 @@ impl App {
         self.generation += 1;
         self.worker.begin_generation(self.generation);
         let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
+        let mut key = self.render_key(viewport);
+        key.document_id = flash.document_id;
+        key.page = flash.page;
+        if let Some(index) = self.tab_index(flash.document_id) {
+            self.tabs[index]
+                .cache
+                .retain(|key, _| key.page != flash.page);
+        }
         self.worker
             .render(RenderRequest {
                 key,
@@ -1764,41 +1786,8 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
-        let Some(frame) = self.tab().cache.get(&key).cloned() else {
-            self.draw_status(output, viewport, "links are still rendering")?;
+        let Some((frame, placement, image_top)) = self.page_at_mouse(mouse, viewport) else {
             return Ok(());
-        };
-        let placement = viewport.place(
-            frame.width,
-            frame.height,
-            self.tab().scroll_x,
-            self.tab().scroll_y,
-        );
-        let (placement, image_top) = if self.link_picker.is_some() || self.search_picker.is_some() {
-            let Some(image_id) = self.visible_image_id else {
-                return Ok(());
-            };
-            let (preview, _) =
-                link_picker_panes(link_picker_area(viewport), self.link_picker_geometry);
-            let positioned = position_link_picker_image(
-                LinkPickerImage::new(image_id, &frame, placement, viewport),
-                preview,
-                self.link_picker_geometry.layout,
-            );
-            (
-                ImagePlacement {
-                    left: positioned.left,
-                    columns: positioned.placement.columns,
-                    rows: positioned.placement.rows,
-                    crop: positioned.placement.crop,
-                    scroll_x: placement.scroll_x,
-                    scroll_y: placement.scroll_y,
-                },
-                positioned.top,
-            )
-        } else {
-            (placement, viewport.top)
         };
         let Some(target) = link_at_cell(
             &frame.links,
@@ -1884,6 +1873,7 @@ impl App {
             self.draw_status(output, viewport, "page is still rendering")?;
             return Ok(());
         };
+        self.retain_primary_image(output)?;
         let tab = self.tab();
         let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
         let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
@@ -2016,26 +2006,7 @@ impl App {
             self.request_current(output)?;
             return Ok(());
         }
-        let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
-        let frame = self.tab().cache.get(&key).cloned();
-        let image_id = self.visible_image_id;
-        if let (Some(frame), Some(image_id)) = (frame, image_id) {
-            let tab = self.tab();
-            let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
-            let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
-            restore_link_picker_split(
-                output,
-                link_picker_area(viewport),
-                image,
-                self.link_picker_geometry,
-                self.theme,
-            )?;
-        } else {
-            self.reset_render_state();
-            self.request_current(output)?;
-        }
-        Ok(())
+        self.request_current(output)
     }
 
     fn close_link_picker_and_exit_link_mode(
@@ -2053,6 +2024,7 @@ impl App {
         if self.pending_open.is_some() {
             return Ok(());
         }
+        self.retain_primary_image(output)?;
         let viewport = self.viewport()?;
         let key = self.render_key(viewport);
         let frame = self.tab().cache.get(&key).cloned();
@@ -2113,26 +2085,7 @@ impl App {
             self.request_current(output)?;
             return Ok(());
         }
-        let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
-        let frame = self.tab().cache.get(&key).cloned();
-        let image_id = self.visible_image_id;
-        if let (Some(frame), Some(image_id)) = (frame, image_id) {
-            let tab = self.tab();
-            let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
-            let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
-            restore_link_picker_split(
-                output,
-                link_picker_area(viewport),
-                image,
-                self.link_picker_geometry,
-                self.theme,
-            )?;
-        } else {
-            self.reset_render_state();
-            self.request_current(output)?;
-        }
-        Ok(())
+        self.request_current(output)
     }
 
     fn handle_search_picker_key(
@@ -2530,9 +2483,7 @@ impl App {
         Ok(())
     }
 
-    /// Moves along one axis: scrolls the rendered page when it overflows the
-    /// viewport on that axis, and changes page at the far edge (or immediately
-    /// when the page already fits).
+    /// Vertical movement crosses page boundaries without discarding the remainder.
     fn move_view(
         &mut self,
         axis: Axis,
@@ -2541,6 +2492,20 @@ impl App {
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let viewport = self.viewport()?;
+        if axis == Axis::Vertical && self.link_picker.is_none() && self.search_picker.is_none() {
+            let cell = (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1);
+            let pixels = if large {
+                u32::from(viewport.pixel_height) * 85 / 100
+            } else {
+                u32::from(viewport.pixel_height) / 8
+            };
+            let step = i64::from(pixels.max(1).div_ceil(cell) * cell);
+            self.pending_vertical_scroll += if forward { step } else { -step };
+            if self.apply_vertical_scroll(viewport)? {
+                self.request_current(output)?;
+            }
+            return Ok(());
+        }
         let key = self.render_key(viewport);
         let Some(frame) = self.tab().cache.get(&key).cloned() else {
             return self.page_step(forward, output);
@@ -2580,6 +2545,75 @@ impl App {
             Axis::Horizontal => self.tab_mut().scroll_x = next,
         }
         self.redraw_current(output)
+    }
+
+    fn page_key(&self, page: u32, viewport: Viewport) -> RenderKey {
+        RenderKey {
+            page,
+            search_request_id: self.tab().search.highlight_request_id(page),
+            selected_link_ordinal: None,
+            ..self.render_key(viewport)
+        }
+    }
+
+    fn request_visible_page(&mut self, key: RenderKey) -> Result<(), AppError> {
+        if self.pending.insert(key) {
+            self.worker
+                .render(RenderRequest {
+                    key,
+                    generation: self.generation,
+                })
+                .map_err(AppError::Renderer)?;
+        }
+        Ok(())
+    }
+
+    fn apply_vertical_scroll(&mut self, viewport: Viewport) -> Result<bool, AppError> {
+        let cell = (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1);
+        while self.pending_vertical_scroll != 0 {
+            let page = self.tab().page;
+            let key = self.page_key(page, viewport);
+            let Some(frame) = self.tab().cache.get(&key) else {
+                self.request_visible_page(key)?;
+                return Ok(false);
+            };
+            let offset = i64::from(self.tab().scroll_y);
+            let delta = self.pending_vertical_scroll;
+            if delta > 0 {
+                if page + 1 == self.tab().page_count {
+                    self.tab_mut().scroll_y = (offset + delta).min(i64::from(
+                        frame
+                            .height
+                            .saturating_sub(u32::from(viewport.pixel_height)),
+                    )) as u32;
+                    self.pending_vertical_scroll = 0;
+                } else {
+                    let span = i64::from((frame.height.div_ceil(cell) + 1) * cell);
+                    if offset + delta < span {
+                        self.tab_mut().scroll_y = (offset + delta) as u32;
+                        self.pending_vertical_scroll = 0;
+                    } else {
+                        self.pending_vertical_scroll = offset + delta - span;
+                        self.tab_mut().page += 1;
+                        self.tab_mut().scroll_y = 0;
+                    }
+                }
+            } else if offset + delta >= 0 || page == 0 {
+                self.tab_mut().scroll_y = (offset + delta).max(0) as u32;
+                self.pending_vertical_scroll = 0;
+            } else {
+                let previous = self.page_key(page - 1, viewport);
+                let Some(previous) = self.tab().cache.get(&previous) else {
+                    self.request_visible_page(previous)?;
+                    return Ok(false);
+                };
+                let span = (previous.height.div_ceil(cell) + 1) * cell;
+                self.pending_vertical_scroll += offset;
+                self.tab_mut().page -= 1;
+                self.tab_mut().scroll_y = span;
+            }
+        }
+        Ok(true)
     }
 
     fn page_step(&mut self, forward: bool, output: &mut impl Write) -> Result<(), AppError> {
@@ -2681,6 +2715,7 @@ impl App {
     }
 
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.pending_vertical_scroll = 0;
         let viewport = self.prepare_viewport(output)?;
         self.draw_tab_bar(output)?;
         let key = self.render_key(viewport);
@@ -2715,6 +2750,13 @@ impl App {
             return Ok(());
         };
         let current_page = self.tabs[index].page;
+        let visible_end = self
+            .visible_pages
+            .last()
+            .filter(|page| page.frame.key.document_id == key.document_id)
+            .map_or(current_page, |page| page.frame.key.page)
+            .max(current_page)
+            .saturating_add(1);
         self.tabs[index].cache.insert(key, Arc::clone(&frame));
         self.tabs[index].cache.retain(|cached, _| {
             cached.width == key.width
@@ -2723,32 +2765,47 @@ impl App {
                 && cached.fit == key.fit
                 && cached.invert == key.invert
                 && cached.dark_mode_style == key.dark_mode_style
-                && cached.page.abs_diff(current_page) <= 1
+                && cached.page >= current_page.saturating_sub(1)
+                && cached.page <= visible_end
                 && (cached.selected_link_ordinal.is_none()
                     || cached.selected_link_ordinal == key.selected_link_ordinal)
         });
 
-        // Forward-search scroll: the flash frame reports the page height, so
-        // the pending flash's y-down top edge can become a scroll ratio with
-        // the same -0.08 headroom links use.
+        // Center the highlighted region using continuous scrolling, including
+        // the preceding page when the target is near the top of this one.
         let flash_scroll = match self.pending_flash.as_mut() {
             Some(flash)
                 if flash.document_id == key.document_id
                     && flash.page == key.page
                     && frame.flash_page_height_pt > 0.0 =>
             {
-                flash.top_pt.take()
+                flash.center_pt.take()
             }
             _ => None,
         };
-        if let Some(top_pt) = flash_scroll {
-            let page = self.pending_flash.as_ref().unwrap().page;
-            let top_ratio = (top_pt / frame.flash_page_height_pt - 0.08).clamp(0.0, 1.0);
-            let tab = self.tab_mut();
-            tab.pending_destination = Some(LinkDestination {
-                page,
-                top_ratio: Some(top_ratio),
-            });
+        if let Some(center_pt) = flash_scroll {
+            let viewport = self.viewport()?;
+            let center =
+                (center_pt / frame.flash_page_height_pt * frame.height as f32).round() as i64;
+            self.tab_mut().pending_destination = None;
+            self.tab_mut().scroll_y = 0;
+            self.pending_vertical_scroll = center - i64::from(viewport.pixel_height) / 2;
+            self.pending_flash.as_mut().unwrap().expires_at =
+                Instant::now() + Duration::from_secs(1);
+        }
+
+        if key.document_id == self.tab().document_id && self.pending_vertical_scroll != 0 {
+            if self.apply_vertical_scroll(self.viewport()?)? {
+                self.request_current(output)?;
+            }
+            return Ok(());
+        }
+        if self.link_picker.is_none()
+            && self.search_picker.is_none()
+            && key.document_id == self.tab().document_id
+            && key.page > self.tab().page
+        {
+            self.redraw_current(output)?;
         }
 
         if self.desired_key == Some(key) {
@@ -2790,6 +2847,10 @@ impl App {
             self.tab_mut().scroll_x = 0;
             self.tab_mut().scroll_y = target_y;
         }
+        if self.link_picker.is_none() && self.search_picker.is_none() {
+            return self.draw_continuous(frame, viewport, output);
+        }
+        self.retain_primary_image(output)?;
         let tab = self.tab();
         let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
         self.tab_mut().scroll_x = placement.scroll_x;
@@ -2881,6 +2942,178 @@ impl App {
         }
         self.draw_status(output, viewport, &state)?;
         Ok(())
+    }
+
+    fn retain_primary_image(&mut self, output: &mut impl Write) -> io::Result<()> {
+        for page in self.visible_pages.drain(..) {
+            if Some(page.image_id) != self.visible_image_id {
+                kitty::delete_image(output, page.image_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_continuous(
+        &mut self,
+        frame: &Frame,
+        viewport: Viewport,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let cell = (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1);
+        let max_y = if self.tab().page + 1 == self.tab().page_count {
+            frame
+                .height
+                .saturating_sub(u32::from(viewport.pixel_height))
+        } else {
+            frame.height.div_ceil(cell) * cell
+        };
+        self.tab_mut().scroll_y = self.tab().scroll_y.min(max_y) / cell * cell;
+        let old_pages = std::mem::take(&mut self.visible_pages);
+        if old_pages.is_empty()
+            && let Some(id) = self.visible_image_id.take()
+        {
+            kitty::delete_image(output, id)?;
+        }
+        self.prepare_image_canvas(output, viewport)?;
+        let started = Instant::now();
+        let mut page = self.tab().page;
+        let mut row = 0;
+        while row < viewport.rows && page < self.tab().page_count {
+            let key = self.page_key(page, viewport);
+            let Some(rendered) = self.tab().cache.get(&key).cloned() else {
+                self.request_visible_page(key)?;
+                break;
+            };
+            let offset = if page == self.tab().page {
+                self.tab().scroll_y
+            } else {
+                0
+            };
+            let page_rows = rendered.height.div_ceil(cell);
+            let rows = page_rows
+                .saturating_sub(offset / cell)
+                .min(u32::from(viewport.rows - row)) as u16;
+            if rows > 0 {
+                let mut placement =
+                    viewport.place(rendered.width, rendered.height, self.tab().scroll_x, 0);
+                placement.rows = rows;
+                placement.scroll_y = offset;
+                placement.crop = Some(kitty::Crop {
+                    x: placement.scroll_x,
+                    y: offset,
+                    width: rendered.width.min(u32::from(viewport.pixel_width)),
+                    height: rendered
+                        .height
+                        .saturating_sub(offset)
+                        .min(u32::from(rows) * cell),
+                });
+                let retained = old_pages
+                    .iter()
+                    .find(|old| Arc::ptr_eq(&old.frame, &rendered));
+                let image_id = if let Some(old) = retained {
+                    old.image_id
+                } else {
+                    let id = self.next_image_id;
+                    self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+                    id
+                };
+                let kitty_placement = Placement {
+                    image_id,
+                    columns: placement.columns,
+                    rows,
+                    z_index: PAGE_IMAGE_Z_INDEX,
+                    crop: placement.crop,
+                };
+                execute!(output, MoveTo(placement.left, viewport.top + row))?;
+                if retained.is_some() {
+                    kitty::place_image(output, kitty_placement)?;
+                } else {
+                    kitty::transmit_compressed_rgba(
+                        output,
+                        &rendered.compressed_rgba,
+                        rendered.width,
+                        rendered.height,
+                        kitty_placement,
+                    )?;
+                }
+                self.visible_pages.push(VisiblePage {
+                    frame: rendered,
+                    placement,
+                    top: viewport.top + row,
+                    image_id,
+                });
+            }
+            row += rows + 1; // A single terminal row separates neighboring pages.
+            page += 1;
+        }
+        for old in old_pages {
+            if !self
+                .visible_pages
+                .iter()
+                .any(|page| page.image_id == old.image_id)
+            {
+                kitty::delete_image(output, old.image_id)?;
+            }
+        }
+        self.visible_image_id = self.visible_pages.first().map(|page| page.image_id);
+        let snapshot = PerformanceSnapshot {
+            render_ms: frame.render_elapsed.as_millis(),
+            dark_mode_ms: frame.dark_mode_elapsed.map(|elapsed| elapsed.as_millis()),
+            highlight_ms: frame.highlight_elapsed.map(|elapsed| elapsed.as_millis()),
+            compression_ms: frame.compression_elapsed.as_millis(),
+            transfer_ms: started.elapsed().as_millis(),
+            link_count: frame.links.len(),
+        };
+        self.performance_snapshot = Some(snapshot);
+        self.draw_status(
+            output,
+            viewport,
+            &snapshot.status(self.show_performance, self.link_mode),
+        )?;
+        Ok(())
+    }
+
+    fn page_at_mouse(
+        &self,
+        mouse: MouseEvent,
+        viewport: Viewport,
+    ) -> Option<(Arc<Frame>, ImagePlacement, u16)> {
+        if self.link_picker.is_none() && self.search_picker.is_none() {
+            return self
+                .visible_pages
+                .iter()
+                .find(|page| {
+                    mouse.row >= page.top
+                        && mouse.row < page.top + page.placement.rows
+                        && mouse.column >= page.placement.left
+                        && mouse.column < page.placement.left + page.placement.columns
+                })
+                .map(|page| (Arc::clone(&page.frame), page.placement, page.top));
+        }
+        let frame = self.tab().cache.get(&self.render_key(viewport))?.clone();
+        let placement = viewport.place(
+            frame.width,
+            frame.height,
+            self.tab().scroll_x,
+            self.tab().scroll_y,
+        );
+        let (preview, _) = link_picker_panes(link_picker_area(viewport), self.link_picker_geometry);
+        let positioned = position_link_picker_image(
+            LinkPickerImage::new(self.visible_image_id?, &frame, placement, viewport),
+            preview,
+            self.link_picker_geometry.layout,
+        );
+        Some((
+            frame,
+            ImagePlacement {
+                left: positioned.left,
+                columns: positioned.placement.columns,
+                rows: positioned.placement.rows,
+                crop: positioned.placement.crop,
+                ..placement
+            },
+            positioned.top,
+        ))
     }
 
     fn prepare_image_canvas(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
@@ -3010,6 +3243,8 @@ impl App {
         let theme = self.theme;
         kitty::delete_all(output)?;
         self.visible_image_id = None;
+        self.visible_pages.clear();
+        self.pending_vertical_scroll = 0;
         self.last_status_row = None;
         execute!(
             output,
@@ -3093,6 +3328,7 @@ impl App {
     fn reset_render_state(&mut self) {
         self.desired_key = None;
         self.pending.clear();
+        self.pending_vertical_scroll = 0;
     }
 
     fn viewport(&self) -> io::Result<Viewport> {
@@ -3132,17 +3368,14 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
-        let Some(frame) = self.tab().cache.get(&key).cloned() else {
-            self.draw_status(output, viewport, "page is still rendering")?;
+        let Some((frame, placement, image_top)) = self.page_at_mouse(mouse, viewport) else {
             return Ok(());
         };
-        let tab = self.tab();
-        let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
+        let key = frame.key;
         let Some(local_column) = mouse.column.checked_sub(placement.left) else {
             return Ok(());
         };
-        let Some(local_row) = mouse.row.checked_sub(viewport.top) else {
+        let Some(local_row) = mouse.row.checked_sub(image_top) else {
             return Ok(());
         };
         if local_column >= placement.columns || local_row >= placement.rows {
@@ -3166,7 +3399,7 @@ impl App {
             + scaled_cell_boundary(local_row.saturating_add(1), placement.rows, visible_height);
         let pixel_x = (cell_x0 + cell_x1) / 2;
         let pixel_y = (cell_y0 + cell_y1) / 2;
-        let (document_id, page) = (tab.document_id, tab.page);
+        let (document_id, page) = (key.document_id, key.page);
         let request_id = self.next_synctex_request_id;
         self.next_synctex_request_id = request_id.wrapping_add(1);
         self.pending_synctex = Some(PendingSynctex {
