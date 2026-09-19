@@ -280,6 +280,10 @@ function M.forward_search(pdf_path, payload, source_terminal)
         timer:close()
         pipe:close()
         vim.schedule(function()
+          if request.payload ~= sent_payload then
+            attempt()
+            return
+          end
           if message then
             fail('pdfterm: ' .. message)
             return
@@ -287,14 +291,12 @@ function M.forward_search(pdf_path, payload, source_terminal)
           local ok, reply = pcall(vim.json.decode, table.concat(chunks))
           if not ok or type(reply) ~= 'table' or reply.ok ~= true then
             fail('pdfterm: ' .. (ok and type(reply) == 'table' and reply.error or 'invalid forward reply'))
-          elseif request.payload ~= sent_payload then
-            attempt()
           else
             pending_forward = nil
           end
         end)
       end
-      timer:start(2000, 0, function()
+      timer:start(31000, 0, function()
         finish 'forward reply timed out'
       end)
       pipe:read_start(function(read_err, chunk)

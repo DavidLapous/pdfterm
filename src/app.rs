@@ -32,7 +32,7 @@ use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
     RenderKey, RenderRequest, RenderWorker, SearchPageMatch, WorkerMessage,
 };
-use crate::synctex::{ForwardRequest, parse_forward_request};
+use crate::synctex::{ForwardRequest, PdfRevision, parse_forward_request};
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
 
@@ -120,7 +120,7 @@ pub fn run(
         },
     };
     let worker = RenderWorker::spawn(INITIAL_DOCUMENT_ID, path.clone(), pdfium_library);
-    let (page_count, outline) = worker.wait_until_ready().map_err(AppError::Renderer)?;
+    let (page_count, outline, revision) = worker.wait_until_ready().map_err(AppError::Renderer)?;
     crate::recent::record(&path);
     let watcher = FileWatcher::new(&path)?;
     let mut app = App::new(
@@ -129,7 +129,7 @@ pub fn run(
         start_page.min(page_count - 1),
         path,
         watcher,
-        outline,
+        (outline, revision),
         defaults,
     );
     app.request_current(&mut output)?;
@@ -138,13 +138,17 @@ pub fn run(
         while let Ok(message) = app.worker.try_recv() {
             match message {
                 WorkerMessage::Frame(frame) => app.receive_frame(frame, &mut output)?,
-                WorkerMessage::Error(error) => return Err(AppError::Renderer(error)),
+                WorkerMessage::Error(error) => {
+                    app.finish_forward(Some(format!("render failed: {error}")));
+                    return Err(AppError::Renderer(error));
+                }
                 WorkerMessage::Ready { .. } => {}
                 WorkerMessage::Opened {
                     document_id,
                     pages,
                     outline,
-                } => app.finish_open(document_id, pages, outline, &mut output)?,
+                    revision,
+                } => app.finish_open(document_id, pages, outline, revision, &mut output)?,
                 WorkerMessage::OpenError { document_id, error } => {
                     app.fail_open(document_id, &error, &mut output)?
                 }
@@ -225,18 +229,25 @@ pub fn run(
         app.poll_link_preview(&mut output)?;
         app.poll_search_preview(&mut output)?;
         app.poll_forward_socket(&mut output)?;
+        app.poll_pending_forward(&mut output)?;
         app.poll_flash_expiry()?;
         app.poll_smooth_scroll(&mut output)?;
 
         if event::poll(Duration::from_millis(10))? {
             match read_event()? {
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press && app.handle_key(key, &mut output)? =>
-                {
-                    break;
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.cancel_forward("forward search cancelled by keyboard input")?;
+                    if app.handle_key(key, &mut output)? {
+                        break;
+                    }
                 }
                 Event::Resize(_, _) => app.request_current(&mut output)?,
-                Event::Mouse(mouse) => app.handle_mouse(mouse, &mut output)?,
+                Event::Mouse(mouse) => {
+                    if !matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
+                        app.cancel_forward("forward search cancelled by mouse input")?;
+                    }
+                    app.handle_mouse(mouse, &mut output)?;
+                }
                 _ => {}
             }
         }
@@ -294,6 +305,7 @@ struct App {
     forward_socket: Option<String>,
     forward_listener: Option<crate::ipc::Listener>,
     pending_flash: Option<PendingFlash>,
+    pending_forward: Option<PendingForward>,
     pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
     persistent_link_picker: bool,
@@ -360,6 +372,7 @@ impl From<&Config> for AppDefaults {
 struct Tab {
     document_id: DocumentId,
     path: PathBuf,
+    revision: PdfRevision,
     watcher: FileWatcher,
     page_count: u32,
     page: u32,
@@ -784,7 +797,14 @@ struct PendingFlash {
     page: u32,
     /// Y-down center of the flash box in points; consumed when its frame arrives.
     center_pt: Option<f32>,
-    expires_at: Instant,
+    expires_at: Option<Instant>,
+}
+
+struct PendingForward {
+    request: ForwardRequest,
+    reply: crate::editor::ForwardReply,
+    deadline: Instant,
+    started: bool,
 }
 
 struct PendingSynctex {
@@ -821,9 +841,10 @@ impl App {
         page: u32,
         path: PathBuf,
         watcher: FileWatcher,
-        outline: Vec<OutlineItem>,
+        document: (Vec<OutlineItem>, PdfRevision),
         defaults: AppDefaults,
     ) -> Self {
+        let (outline, revision) = document;
         let default_fit = defaults.fit;
         let default_invert = defaults.invert;
         Self {
@@ -832,6 +853,7 @@ impl App {
             tabs: vec![Tab {
                 document_id: INITIAL_DOCUMENT_ID,
                 path,
+                revision,
                 watcher,
                 page_count,
                 page,
@@ -879,6 +901,7 @@ impl App {
             forward_socket: defaults.forward_socket,
             forward_listener: None,
             pending_flash: None,
+            pending_forward: None,
             pending_link_picker_open: false,
             link_picker: None,
             persistent_link_picker: defaults.persistent_link_picker,
@@ -923,6 +946,7 @@ impl App {
         document_id: DocumentId,
         pages: u32,
         outline: Vec<OutlineItem>,
+        revision: PdfRevision,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let Some(pending) = self.pending_open.take() else {
@@ -938,6 +962,7 @@ impl App {
                 };
                 let tab = &mut self.tabs[index];
                 tab.watcher.accept(fingerprint);
+                tab.revision = revision;
                 tab.page_count = pages;
                 tab.page = tab.page.min(pages - 1);
                 tab.scroll_x = 0;
@@ -964,6 +989,7 @@ impl App {
                 self.tabs.push(Tab {
                     document_id,
                     path,
+                    revision,
                     watcher,
                     page_count: pages,
                     page: 0,
@@ -1001,6 +1027,7 @@ impl App {
         error: &str,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        self.finish_forward(Some(format!("document open failed: {error}")));
         let state = match self.pending_open.take() {
             Some(PendingOpen::Reload {
                 document_id: expected,
@@ -1592,22 +1619,105 @@ impl App {
             Err(error) => return Err(error.into()),
         };
         let result = Self::read_forward_payload(&mut stream)
-            .and_then(|payload| parse_forward_request(&payload))
-            .and_then(|request| {
-                self.apply_forward_request(request, Instant::now(), output)
-                    .map_err(io::Error::other)
-            });
-        let reply = crate::editor::Reply {
-            ok: result.is_ok(),
-            error: result.err().map(|error| error.to_string()),
-        };
-        if let Err(error) = serde_json::to_writer(&mut stream, &reply) {
-            self.draw_status(
-                output,
-                self.viewport()?,
-                &format!("forward reply failed: {error}"),
-            )?;
-        } else if let Some(error) = reply.error {
+            .and_then(|payload| parse_forward_request(&payload));
+        let mut reply = crate::editor::ForwardReply::new(stream);
+        match result {
+            Ok(request) => {
+                self.cancel_forward("forward search superseded by a newer request")?;
+                self.pending_forward = Some(PendingForward {
+                    request,
+                    reply,
+                    deadline: Instant::now() + crate::editor::FORWARD_TIMEOUT,
+                    started: false,
+                });
+            }
+            Err(error) => {
+                reply.finish(Some(error.to_string()));
+                self.draw_status(
+                    output,
+                    self.viewport()?,
+                    &format!("forward search: {error}"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_forward(&mut self, error: Option<String>) {
+        if let Some(mut pending) = self.pending_forward.take() {
+            pending.reply.finish(error);
+        }
+    }
+
+    fn cancel_forward(&mut self, reason: &str) -> Result<(), AppError> {
+        if self.pending_forward.is_some() {
+            self.finish_forward(Some(reason.into()));
+            if let Some(flash) = self.pending_flash.as_mut() {
+                flash.expires_at = Some(Instant::now());
+            }
+            self.poll_flash_expiry()?;
+        }
+        Ok(())
+    }
+
+    fn poll_pending_forward(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let result = (|| -> Result<(), AppError> {
+            let Some(pending) = self.pending_forward.as_ref() else {
+                return Ok(());
+            };
+            if pending.reply.disconnected()? {
+                return Err(io::Error::other("forward-search client disconnected").into());
+            }
+            if Instant::now() >= pending.deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "forward frame submission timed out",
+                )
+                .into());
+            }
+            pending.request.revision.check(&pending.request.pdf)?;
+            if pending.started || self.pending_open.is_some() {
+                return Ok(());
+            }
+            let pdf = fs::canonicalize(&pending.request.pdf)?;
+            let index = self
+                .tabs
+                .iter()
+                .position(|tab| tab.path == pdf)
+                .ok_or_else(|| {
+                    io::Error::other(format!("PDF is not open in this viewer: {}", pdf.display()))
+                })?;
+            if self.tabs[index].revision != pending.request.revision {
+                let document_id = self.tabs[index].document_id;
+                let fingerprint = FileFingerprint::read(&pdf)?;
+                self.worker
+                    .open(document_id, pdf)
+                    .map_err(AppError::Renderer)?;
+                self.pending_open = Some(PendingOpen::Reload {
+                    document_id,
+                    fingerprint,
+                });
+                return Ok(());
+            }
+            // Take the connection while positioning so internal tab/scroll transitions
+            // cannot acknowledge an older cached frame.
+            let mut pending = self.pending_forward.take().unwrap();
+            match self.apply_forward_request(&pending.request, output) {
+                Ok(()) => {
+                    pending.started = true;
+                    self.pending_forward = Some(pending);
+                }
+                Err(error) => {
+                    return {
+                        pending.reply.finish(Some(error.to_string()));
+                        Err(error)
+                    };
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.cancel_forward(&error.to_string())?;
             self.draw_status(
                 output,
                 self.viewport()?,
@@ -1619,8 +1729,7 @@ impl App {
 
     fn apply_forward_request(
         &mut self,
-        request: ForwardRequest,
-        now: Instant,
+        request: &ForwardRequest,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         if self.pending_open.is_some() {
@@ -1665,11 +1774,13 @@ impl App {
             } else {
                 rect.top
             }),
-            expires_at: now + Duration::from_millis(self.viewer.flash_duration_ms),
+            expires_at: None,
         });
         self.worker.flash(document_id, page, rect);
         self.generation += 1;
         self.worker.begin_generation(self.generation);
+        // A cached unhighlighted target is not a submitted forward-search frame.
+        self.tab_mut().cache.retain(|key, _| key.page != page);
         let viewport = self.viewport()?;
         let key = self.render_key(viewport);
         self.desired_key = Some(key);
@@ -1686,31 +1797,38 @@ impl App {
     }
 
     fn poll_flash_expiry(&mut self) -> Result<(), AppError> {
-        if !self.pending_flash.is_some() {
-            return Ok(());
-        }
-        if Instant::now() < self.pending_flash.as_ref().unwrap().expires_at {
+        if !self.pending_flash.as_ref().is_some_and(|flash| {
+            flash
+                .expires_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        }) {
             return Ok(());
         }
         let flash = self.pending_flash.take().unwrap();
         self.worker.clear_flash(flash.document_id);
-        self.generation += 1;
-        self.worker.begin_generation(self.generation);
-        let viewport = self.viewport()?;
-        let mut key = self.render_key(viewport);
-        key.document_id = flash.document_id;
-        key.page = flash.page;
         if let Some(index) = self.tab_index(flash.document_id) {
             self.tabs[index]
                 .cache
                 .retain(|key, _| key.page != flash.page);
         }
-        self.worker
-            .render(RenderRequest {
-                key,
-                generation: self.generation,
-            })
-            .map_err(AppError::Renderer)?;
+        // Clearing an overlay must not cancel an unrelated in-flight page render.
+        if self.tab().document_id == flash.document_id
+            && (self.tab().page == flash.page
+                || self
+                    .visible_pages
+                    .iter()
+                    .any(|page| page.frame.key.page == flash.page))
+        {
+            let key = self.page_key(flash.page, self.viewport()?);
+            if self.pending.insert(key) {
+                self.worker
+                    .render(RenderRequest {
+                        key,
+                        generation: self.generation,
+                    })
+                    .map_err(AppError::Renderer)?;
+            }
+        }
         Ok(())
     }
 
@@ -2862,6 +2980,25 @@ impl App {
     }
 
     fn receive_frame(&mut self, frame: Frame, output: &mut impl Write) -> Result<(), AppError> {
+        if frame.generation != self.generation {
+            return Ok(());
+        }
+        if frame.flash_page_height_pt > 0.0
+            && !self.pending_flash.as_ref().is_some_and(|flash| {
+                flash.document_id == frame.key.document_id && flash.page == frame.key.page
+            })
+        {
+            // ClearFlash may have arrived while this frame was rendering.
+            if self.pending.contains(&frame.key) {
+                self.worker
+                    .render(RenderRequest {
+                        key: frame.key,
+                        generation: self.generation,
+                    })
+                    .map_err(AppError::Renderer)?;
+            }
+            return Ok(());
+        }
         let key = frame.key;
         self.pending.remove(&key);
         let frame = Arc::new(frame);
@@ -2919,8 +3056,6 @@ impl App {
             } else {
                 self.tab_mut().scroll_y = target.max(0) as u32;
             }
-            self.pending_flash.as_mut().unwrap().expires_at =
-                Instant::now() + Duration::from_millis(self.viewer.flash_duration_ms);
         }
 
         if key.document_id == self.tab().document_id && self.pending_vertical_scroll != 0 {
@@ -2957,9 +3092,51 @@ impl App {
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        if let Some(pending) = self.pending_forward.as_ref()
+            && let Err(error) = pending.request.revision.check(&pending.request.pdf)
+        {
+            self.cancel_forward(&error.to_string())?;
+            return Ok(());
+        }
         synchronized_output(output, |output| {
             self.draw_frame_unsynchronized(frame, viewport, output)
-        })
+        })?;
+        let submitted = self.pending_flash.as_ref().is_some_and(|flash| {
+            let matches = |rendered: &Frame| {
+                rendered.key.document_id == flash.document_id
+                    && rendered.key.page == flash.page
+                    && rendered.flash_page_height_pt > 0.0
+            };
+            flash.center_pt.is_none()
+                && self.pending_vertical_scroll == 0
+                && if self.viewer.continuous_scroll
+                    && self.link_picker.is_none()
+                    && self.search_picker.is_none()
+                {
+                    self.visible_pages.iter().any(|page| matches(&page.frame))
+                } else {
+                    matches(frame)
+                }
+        });
+        if submitted {
+            let flash = self.pending_flash.as_mut().unwrap();
+            flash.expires_at.get_or_insert_with(|| {
+                Instant::now() + Duration::from_millis(self.viewer.flash_duration_ms)
+            });
+            let error = self
+                .pending_forward
+                .as_ref()
+                .and_then(|pending| pending.request.revision.check(&pending.request.pdf).err())
+                .map(|error| error.to_string());
+            if self
+                .pending_forward
+                .as_ref()
+                .is_some_and(|pending| pending.started)
+            {
+                self.finish_forward(error);
+            }
+        }
+        Ok(())
     }
 
     fn draw_frame_unsynchronized(

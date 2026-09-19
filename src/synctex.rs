@@ -1,6 +1,6 @@
 use crate::pdf::SearchRect;
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::Path, process::Command};
+use std::{fs, io, os::unix::fs::MetadataExt, path::Path, process::Command};
 
 /// Source coordinates: one-based line, zero-based UTF-8 byte offset;
 /// column is one-based UTF-16 (VS Code), column_char is one-based Unicode scalar.
@@ -15,10 +15,49 @@ pub struct SourceLocation {
     pub precise: bool,
 }
 
+/// Identity of a local PDF revision, including atomic replacement and in-place writes.
+/// Not a content digest: the protocol assumes a non-adversarial local filesystem.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PdfRevision {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl PdfRevision {
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    pub fn check(self, path: &Path) -> io::Result<()> {
+        if Self::read(path)? != self {
+            return Err(io::Error::other(
+                "PDF revision changed; repeat forward search",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardRequest {
     pub pdf: std::path::PathBuf,
+    pub revision: PdfRevision,
     pub page: u32,
     pub h: f32,
     pub v: f32,
@@ -78,6 +117,7 @@ pub fn resolve_forward(
     }
     let pdf = fs::canonicalize(pdf)?;
     let file = fs::canonicalize(file)?;
+    let revision = PdfRevision::read(&pdf)?;
     let spec = format!(
         "{line}:{column}:{}",
         file.to_str()
@@ -113,6 +153,7 @@ pub fn resolve_forward(
             (page, h, v, width, height)
         {
             let result = ForwardRequest {
+                revision,
                 pdf,
                 page,
                 h,
@@ -121,6 +162,7 @@ pub fn resolve_forward(
                 height,
             };
             result.validate()?;
+            revision.check(&result.pdf)?;
             return Ok(result);
         }
     }
@@ -298,6 +340,22 @@ fn source_word_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_revision_rejects_rewrites_and_atomic_replacements() {
+        let root = tempfile::tempdir().unwrap();
+        let pdf = root.path().join("paper.pdf");
+        fs::write(&pdf, b"first").unwrap();
+        let first = PdfRevision::read(&pdf).unwrap();
+        first.check(&pdf).unwrap();
+        fs::write(&pdf, b"second").unwrap();
+        assert!(first.check(&pdf).is_err());
+        let second = PdfRevision::read(&pdf).unwrap();
+        let replacement = root.path().join("replacement.pdf");
+        fs::write(&replacement, b"second").unwrap();
+        fs::rename(replacement, &pdf).unwrap();
+        assert!(second.check(&pdf).is_err());
+    }
     #[test]
     fn inverse_word_matching_resolves_context_and_utf8_byte_columns() {
         let source = "A repeated word far away.\nÉlie uses \\emph{repeated} maps near fibers.\nRepeated noise.\n";
@@ -355,8 +413,12 @@ mod tests {
 
     #[test]
     fn forward_geometry_preserves_top_down_coordinates_and_rejects_overflow() {
-        let payload = r#"{"pdf":"/a:b.pdf","page":2,"h":72,"v":120,"width":250,"height":12}"#;
-        let request = parse_forward_request(payload).unwrap();
+        let revision = PdfRevision::read(Path::new(file!())).unwrap();
+        let payload = format!(
+            r#"{{"pdf":"/a:b.pdf","revision":{},"page":2,"h":72,"v":120,"width":250,"height":12}}"#,
+            serde_json::to_string(&revision).unwrap()
+        );
+        let request = parse_forward_request(&payload).unwrap();
         assert_eq!(
             request.rect(),
             SearchRect {

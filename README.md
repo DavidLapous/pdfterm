@@ -290,15 +290,33 @@ the request without sending it, substitute `--synctex-view` for
 bytes, followed by a write-half-close:
 
 ```json
-{"pdf":"/project/main.pdf","page":2,"h":72.0,"v":120.0,"width":250.0,"height":12.0}
+{"pdf":"/project/main.pdf","revision":{"device":1,"inode":42,"length":12345,"modified_seconds":1700000000,"modified_nanoseconds":0,"changed_seconds":1700000000,"changed_nanoseconds":0},"page":2,"h":72.0,"v":120.0,"width":250.0,"height":12.0}
 ```
 
 `pdf` must be absolute and identify an already-open tab; that tab is selected.
-Unknown documents and out-of-range pages are rejected rather than jumping in
-the wrong PDF. Geometry is in points, with `h` the left edge and `v` the bottom
-edge measured down from the page top. The viewer replies with
-`{"ok":true,"error":null}` or `{"ok":false,"error":"..."}`, then closes.
-Incomplete, malformed, non-finite, and oversized requests are rejected.
+Use `--synctex-view` to obtain `revision` together with the geometry. It records
+the PDF's Unix device/inode, size, and nanosecond modification/change timestamps,
+checked before and after SyncTeX resolution. This is local filesystem identity,
+not a cryptographic content digest. Geometry is in points, with `h` the left edge
+and `v` the bottom edge measured down from the page top.
+
+The viewer reloads a different revision **before** validating page count, positions
+the target, and replies `{"ok":true,"error":null}` only after submitting the
+matching rendered frame to the terminal and flushing output. This does not wait
+for Kitty/Ghostty compositor completion. The highlight lifetime starts at that
+submission, not while loading or rendering.
+
+Each connection receives one terminal reply and closes; no status polling or
+request IDs are needed. Changed-again PDFs, unknown documents, out-of-range pages,
+invalid requests, supersession, user-input cancellation, and renderer/viewer
+failure return `{"ok":false,"error":"..."}`. Repeat SyncTeX resolution after a
+revision rejection; do not resend stale coordinates against a newer revision.
+The viewer's submission deadline is 30 seconds; CLI/Neovim allow 31 seconds for
+the final reply. These are failure ceilings, not readiness delays. A disconnected
+client is discarded without retaining its pending request.
+
+Incomplete, malformed, non-finite, unknown-field, and oversized requests are
+rejected. Send the complete request and half-close within 100 ms after connecting.
 
 ## Neovim integration
 

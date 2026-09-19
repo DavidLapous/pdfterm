@@ -13,6 +13,8 @@ use pdfium_render::prelude::{
     PdfRect, PdfRenderConfig, Pdfium,
 };
 
+use crate::synctex::PdfRevision;
+
 const LOW_CHROMA_THRESHOLD: u8 = 10;
 const MAX_DARK_MODE_WORKERS: usize = 8;
 const MAX_FORM_DEPTH: u8 = 32;
@@ -188,11 +190,13 @@ pub enum WorkerMessage {
     Ready {
         pages: u32,
         outline: Vec<OutlineItem>,
+        revision: PdfRevision,
     },
     Opened {
         document_id: DocumentId,
         pages: u32,
         outline: Vec<OutlineItem>,
+        revision: PdfRevision,
     },
     PagePoint {
         document_id: DocumentId,
@@ -418,9 +422,13 @@ impl RenderWorker {
         }
     }
 
-    pub fn wait_until_ready(&self) -> Result<(u32, Vec<OutlineItem>), String> {
+    pub fn wait_until_ready(&self) -> Result<(u32, Vec<OutlineItem>, PdfRevision), String> {
         match self.message_rx.recv() {
-            Ok(WorkerMessage::Ready { pages, outline }) => Ok((pages, outline)),
+            Ok(WorkerMessage::Ready {
+                pages,
+                outline,
+                revision,
+            }) => Ok((pages, outline, revision)),
             Ok(WorkerMessage::Error(error)) => Err(error),
             Ok(
                 WorkerMessage::Opened { .. }
@@ -541,6 +549,7 @@ fn run_worker(
     } = channels;
     let result = (|| -> Result<(), String> {
         let pdfium = load_pdfium(pdfium_library)?;
+        let revision = PdfRevision::read(&path).map_err(|error| error.to_string())?;
         let document = pdfium
             .load_pdf_from_file(&path, None)
             .map_err(|error| format!("could not open {}: {error}", path.display()))?;
@@ -550,8 +559,13 @@ fn run_worker(
             return Err(format!("{} has no pages", path.display()));
         }
         let outline = extract_outline(&document);
+        revision.check(&path).map_err(|error| error.to_string())?;
         message_tx
-            .send(WorkerMessage::Ready { pages, outline })
+            .send(WorkerMessage::Ready {
+                pages,
+                outline,
+                revision,
+            })
             .map_err(|_| "viewer stopped".to_string())?;
         let mut documents = HashMap::from([(initial_document_id, document)]);
         let mut text_cache: HashMap<DocumentId, Vec<Option<CachedPageText>>> =
@@ -604,8 +618,19 @@ fn run_worker(
                     document_id,
                     path: new_path,
                 } => {
-                    match pdfium.load_pdf_from_file(&new_path, None) {
-                        Ok(replacement) => {
+                    let opened = (|| {
+                        let revision =
+                            PdfRevision::read(&new_path).map_err(|error| error.to_string())?;
+                        let document = pdfium
+                            .load_pdf_from_file(&new_path, None)
+                            .map_err(|error| error.to_string())?;
+                        revision
+                            .check(&new_path)
+                            .map_err(|error| error.to_string())?;
+                        Ok::<_, String>((document, revision))
+                    })();
+                    match opened {
+                        Ok((replacement, revision)) => {
                             let pages = u32::try_from(replacement.pages().len()).map_err(|_| {
                                 "PDFium returned a negative page count while opening a document"
                                     .to_string()
@@ -630,6 +655,7 @@ fn run_worker(
                                         document_id,
                                         pages,
                                         outline,
+                                        revision,
                                     })
                                     .map_err(|_| "viewer stopped".to_string())?;
                             }
