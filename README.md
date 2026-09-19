@@ -313,19 +313,29 @@ rejected. Send the complete request and half-close within 100 ms after connectin
 ### Inverse-search precision
 
 `Alt`/`Option`-click resolves the clicked location with `synctex edit`, then
-matches the clicked PDF word and nearby text against source lines within
+matches the clicked PDF word or mathematical atom against source lines within
 `viewer.source_context_lines` of the result (default four).
 Inside a literal `\begin{frame}` … `\end{frame}` block, it searches that frame
 instead: Beamer often maps every `\pause`/`\only` overlay to `\end{frame}`.
 Nearby PDF words disambiguate repeated source words; equally good matches within
 a frame remain line only rather than favoring the occurrence nearest its end.
 
-Ambiguous words, macros, and non-text clicks remain explicitly marked **line only**;
-the matcher does not expand TeX. Non-alphanumeric math symbols such as `\longmapsto`
-and font-private glyphs are not word candidates. Source matching uses the saved
-file, so save and rebuild after edits. With `transport = "none"`, the target is
-shown in the status bar and copied to the clipboard (OSC 52). Configured transport
-failures are reported.
+Mathematical matching recognizes literal `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
+and common equation environments. It matches supported TeX commands to Unicode
+symbols and normalizes mathematical alphabet styles without lowercasing variables.
+Commands retain their source position at the backslash; literal letters retain
+their own position. Supplementary Unicode characters remain intact even when
+PDFium exposes their UTF-16 halves separately.
+
+This is lexical matching, not a TeX macro expander. Unsupported expressions,
+ambiguous matches, and font-private glyphs remain **line only**; there is no
+nearest-word fallback. Reordered scripts and complex notation can also prevent
+an unambiguous match. Native PDF glyph hit-testing can select an adjacent glyph
+when characters are small or overlap; refinement uses the glyph actually selected.
+
+Source matching uses the saved file, so save and rebuild after edits.
+With `transport = "none"`, the target is shown in the status bar and copied to the
+clipboard (OSC 52). Configured transport failures are reported.
 
 Each configuration supports one viewer socket and one editor adapter socket.
 The viewer may contain several document tabs. Use separate `XDG_CONFIG_HOME`

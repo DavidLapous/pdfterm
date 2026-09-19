@@ -1,3 +1,5 @@
+mod math;
+
 use crate::pdf::SearchRect;
 use serde::{Deserialize, Serialize};
 use std::{fs, io, os::unix::fs::MetadataExt, path::Path, process::Command};
@@ -307,15 +309,31 @@ fn source_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>>
     None
 }
 
-/// Resolve a PDF word near SyncTeX's source line, using neighboring words to
-/// disambiguate repeats. Columns are zero-based UTF-8 byte offsets.
-/// ponytail: prose matching, not a TeX expander; macros may remain line-only.
+/// Refine prose and mathematical atoms without expanding arbitrary TeX macros.
 fn source_word_location(
     source: &str,
     line: u32,
     context: &str,
     offset: usize,
     radius: u32,
+) -> Option<(u32, usize)> {
+    let frame = source_frame_range(source, line);
+    let within_frame = frame.is_some();
+    let lines = frame.unwrap_or_else(|| {
+        line.saturating_sub(radius.saturating_add(1)) as usize
+            ..(line as usize).saturating_add(radius as usize)
+    });
+    let prose = source_prose_location(source, line, context, offset, lines.clone(), within_frame);
+    math::source_location(source, line, lines, within_frame, context, offset, prose)
+}
+
+fn source_prose_location(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    lines: std::ops::Range<usize>,
+    within_frame: bool,
 ) -> Option<(u32, usize)> {
     fn words(text: &str) -> Vec<(usize, &str)> {
         let mut result = Vec::new();
@@ -346,11 +364,6 @@ fn source_word_location(
         .position(|(start, word)| *start <= offset && offset < start + word.len())?;
     let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized(word)).collect();
     let mut candidates = Vec::new();
-    let frame = source_frame_range(source, line);
-    let within_frame = frame.is_some();
-    let lines = frame.unwrap_or_else(|| {
-        line.saturating_sub(radius + 1) as usize..line as usize + radius as usize
-    });
     for (index, text) in source.lines().enumerate().take(lines.end).skip(lines.start) {
         let text = source_line_text(text);
         for (byte, word) in words(text) {

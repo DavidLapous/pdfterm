@@ -1625,22 +1625,59 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
     ) else {
         return Ok(None);
     };
-    let clicked = character.index();
-    let mut context = String::new();
+    unicode_context(chars.len(), character.index(), |index| {
+        chars
+            .get(index)
+            .map(|character| character.unicode_value())
+            .map_err(|error| error.to_string())
+    })
+    .map(Some)
+}
+
+/// PDFium may expose either Unicode scalars or separate UTF-16 surrogate units.
+/// Both halves of a pair must select the same UTF-8 glyph, including at the
+/// neighborhood boundary. Invalid units are errors, never adjacent-glyph jumps.
+fn unicode_context(
+    len: usize,
+    clicked: usize,
+    mut value: impl FnMut(usize) -> Result<u32, String>,
+) -> Result<(String, usize), String> {
+    if clicked >= len {
+        return Err("clicked character is outside PDF text".into());
+    }
+    let high = |value| (0xd800..=0xdbff).contains(&value);
+    let low = |value| (0xdc00..=0xdfff).contains(&value);
+    let mut start = clicked.saturating_sub(96);
+    let mut end = len.min(clicked.saturating_add(97));
+    if start > 0 && low(value(start)?) && high(value(start - 1)?) {
+        start -= 1;
+    }
+    if end < len && high(value(end - 1)?) && low(value(end)?) {
+        end += 1;
+    }
+    let mut context = String::with_capacity(end - start);
     let mut offset = 0;
-    for index in clicked.saturating_sub(96)..chars.len().min(clicked + 97) {
-        if index == clicked {
+    let mut index = start;
+    while index < end {
+        let unit = value(index)?;
+        let next = if high(unit) && index + 1 < end {
+            Some(value(index + 1)?)
+        } else {
+            None
+        };
+        let (scalar, width) = match next {
+            Some(next) if low(next) => (0x10000 + ((unit - 0xd800) << 10) + next - 0xdc00, 2),
+            _ => (unit, 1),
+        };
+        let character = char::from_u32(scalar)
+            .ok_or_else(|| format!("invalid PDF Unicode value {unit:#x} at character {index}"))?;
+        if (index..index + width).contains(&clicked) {
             offset = context.len();
         }
-        if let Some(value) = chars
-            .get(index)
-            .map_err(|error| error.to_string())?
-            .unicode_char()
-        {
-            context.push(value);
-        }
+        context.push(character);
+        index += width;
     }
-    Ok(Some((context, offset)))
+    Ok((context, offset))
 }
 
 fn empty_text_cache(pages: u32) -> Vec<Option<CachedPageText>> {
@@ -2594,6 +2631,34 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clicked_unicode_maps_both_surrogate_halves_to_one_glyph() {
+        let values = [0xe9, 0xd835, 0xdefc, b'z' as u32, 0x1d465];
+        for (clicked, offset) in [0, 2, 2, 6, 7].into_iter().enumerate() {
+            let (text, actual) =
+                super::unicode_context(values.len(), clicked, |i| Ok(values[i])).unwrap();
+            assert_eq!(text, "é𝛼z𝑥");
+            assert_eq!(actual, offset);
+        }
+        for values in [[0xd835, 0x61], [0xdc00, 0x61], [0x110000, 0x61]] {
+            assert!(super::unicode_context(values.len(), 0, |i| Ok(values[i])).is_err());
+        }
+    }
+
+    #[test]
+    fn clicked_unicode_neighborhood_never_splits_surrogate_pairs() {
+        let mut values = vec![b'x' as u32; 260];
+        values[..2].copy_from_slice(&[0xd835, 0xdefc]);
+        let (text, offset) = super::unicode_context(values.len(), 97, |i| Ok(values[i])).unwrap();
+        assert!(text.starts_with('𝛼'));
+        assert_eq!(&text[offset..offset + 1], "x");
+        values[..2].fill(b'x' as u32);
+        values[192..194].copy_from_slice(&[0xd835, 0xdefc]);
+        let (text, offset) = super::unicode_context(values.len(), 96, |i| Ok(values[i])).unwrap();
+        assert!(text.ends_with('𝛼'));
+        assert_eq!(&text[offset..offset + 1], "x");
+    }
+
     use super::{
         DarkModeStyle, DarkModeTransform, FitMode, LinkTarget, PageLink, PageLinkRect, PixelRect,
         apply_dark_mode_link_contrast, apply_link_highlights, apply_selected_link_highlights,
