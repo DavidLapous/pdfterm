@@ -317,10 +317,12 @@ rejected. Send the complete request and half-close within 100 ms after connectin
 `Alt`/`Option`-click resolves the clicked location with `synctex edit`, then
 matches the clicked PDF word or mathematical atom against source lines within
 `viewer.source_context_lines` of the result (default four).
-Inside a literal `\begin{frame}` … `\end{frame}` block, it searches that frame
-instead: Beamer often maps every `\pause`/`\only` overlay to `\end{frame}`.
-Nearby PDF words disambiguate repeated source words; equally good matches within
-a frame remain line only rather than favoring the occurrence nearest its end.
+Inside a literal `\begin{frame}` … `\end{frame}` block or `\caption{...}` argument,
+it searches that complete scope instead: collected frame/caption bodies can map
+all their contents to the closing line. Nearby PDF words disambiguate repeated
+source words; equally good matches within the scope remain line only rather than
+favoring the occurrence nearest its end. For inline math, immediately adjacent
+literal prose also helps distinguish repeated expressions.
 
 Mathematical matching recognizes literal `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
 and common equation environments. It matches supported TeX commands to Unicode

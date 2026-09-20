@@ -169,6 +169,82 @@ fn regions(source: &str) -> Vec<Range<usize>> {
     result
 }
 
+/// Captions are collected before expansion, so SyncTeX can report the closing
+/// line for every word. Restrict refinement to that complete literal argument.
+pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
+    let mut i = 0;
+    while i < source.len() {
+        let ch = source[i..].chars().next()?;
+        if ch == '%' {
+            i += source[i..].find('\n').unwrap_or(source.len() - i);
+        } else if ch == '\\' {
+            let (name, end) = command(source, i);
+            i = end;
+            if name == "caption" {
+                if source[i..].starts_with('*') {
+                    i += 1;
+                }
+                if let Some((body, end)) = group(source, i) {
+                    let first = source[..body.start].bytes().filter(|c| *c == b'\n').count();
+                    let last = source[..end].bytes().filter(|c| *c == b'\n').count();
+                    if (first..=last).contains(&(line.checked_sub(1)? as usize)) {
+                        return Some(first..last + 1);
+                    }
+                    i = end;
+                }
+            }
+        } else {
+            i += ch.len_utf8();
+        }
+    }
+    None
+}
+
+/// Literal prose immediately beside inline math is evidence for which
+/// occurrence was clicked. Stop at markup and line boundaries (which may hide
+/// comments); never invent a TeX expansion.
+fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<Atom> {
+    let (before, after) =
+        if source[..range.start].ends_with("\\(") && source[range.end..].starts_with("\\)") {
+            (range.start - 2, range.end + 2)
+        } else if source[..range.start].ends_with('$')
+            && !source[..range.start].ends_with("$$")
+            && source[range.end..].starts_with('$')
+            && !source[range.end..].starts_with("$$")
+        {
+            (range.start - 1, range.end + 1)
+        } else {
+            return atoms;
+        };
+    let literal = |c: char| {
+        !matches!(
+            c,
+            '\\' | '$' | '{' | '}' | '%' | '^' | '_' | '&' | '~' | '\n' | '\r'
+        )
+    };
+    let prefix: Vec<_> = source[..before]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| literal(*c))
+        .filter(|(_, c)| !c.is_whitespace())
+        .take(8)
+        .collect();
+    let mut result = Vec::with_capacity(atoms.len() + 16);
+    for (i, c) in prefix.into_iter().rev() {
+        append(&mut result, c, i..i + c.len_utf8());
+    }
+    result.extend(atoms);
+    for (i, c) in source[after..]
+        .char_indices()
+        .take_while(|(_, c)| literal(*c))
+        .filter(|(_, c)| !c.is_whitespace())
+        .take(8)
+    {
+        append(&mut result, c, after + i..after + i + c.len_utf8());
+    }
+    result
+}
+
 /// Opaque expressions cannot produce precise results, but their known atoms
 /// must still participate in ambiguity detection. Dropping an opaque duplicate
 /// would incorrectly make a different, supported expression look unique.
@@ -323,11 +399,12 @@ pub(super) fn source_location(
         {
             continue;
         }
-        let Some((atoms, opaque)) = atoms(source, range) else {
+        let Some((atoms, opaque)) = atoms(source, range.clone()) else {
             continue;
         };
+        let atoms = inline_context(source, &range, atoms);
         for (index, atom) in atoms.iter().enumerate() {
-            if atom.value != pdf[selected].value {
+            if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
                 continue;
             }
             let row = starts.partition_point(|start| *start <= atom.span.start);

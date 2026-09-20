@@ -317,14 +317,14 @@ fn source_word_location(
     offset: usize,
     radius: u32,
 ) -> Option<(u32, usize)> {
-    let frame = source_frame_range(source, line);
-    let within_frame = frame.is_some();
-    let lines = frame.unwrap_or_else(|| {
+    let scope = math::caption_lines(source, line).or_else(|| source_frame_range(source, line));
+    let within_scope = scope.is_some();
+    let lines = scope.unwrap_or_else(|| {
         line.saturating_sub(radius.saturating_add(1)) as usize
             ..(line as usize).saturating_add(radius as usize)
     });
-    let prose = source_prose_location(source, line, context, offset, lines.clone(), within_frame);
-    math::source_location(source, line, lines, within_frame, context, offset, prose)
+    let prose = source_prose_location(source, line, context, offset, lines.clone(), within_scope);
+    math::source_location(source, line, lines, within_scope, context, offset, prose)
 }
 
 fn source_prose_location(
@@ -393,7 +393,7 @@ fn source_prose_location(
                 }
             }
         }
-        // A Beamer boundary is not evidence that the last occurrence is best.
+        // A collected frame/caption boundary does not favor its last occurrence.
         let proximity = if within_frame { 0 } else { row.abs_diff(line) };
         let rank = (score, std::cmp::Reverse(proximity));
         match best {
@@ -499,6 +499,45 @@ mod tests {
         assert_eq!(source_word_location(source, 10, "hidden", 1, 4), None);
         let unterminated = "\\begin{frame}\ntarget\n\n\n\n\n";
         assert_eq!(source_word_location(unterminated, 6, "target", 1, 0), None);
+    }
+
+    #[test]
+    fn inverse_caption_math_uses_literal_context_not_closing_line_proximity() {
+        let source = "\\caption{Selected views.\n\
+            cloud vertices at exact quotient distance at most \\(\\rho_q\\) from the\n\
+            exact reference segment.\n\n\n\n\n\
+            The transverse coordinate is in units of \\(\\rho_q\\), hence magnified.\n\
+            End of caption.}\n";
+        let line = source.lines().count() as u32;
+        for (context, row) in [
+            ("distance at most 𝜌𝑞 from the exact reference segment.", 2),
+            ("coordinate is in units of 𝜌𝑞, hence magnified.", 8),
+        ] {
+            assert_eq!(
+                source_word_location(source, line, context, context.find('𝜌').unwrap(), 4),
+                Some((
+                    row,
+                    source
+                        .lines()
+                        .nth(row as usize - 1)
+                        .unwrap()
+                        .find("\\rho")
+                        .unwrap()
+                ))
+            );
+        }
+        // The glyph alone cannot identify which repeated expression was clicked.
+        assert_eq!(source_word_location(source, line, "𝜌𝑞", 0, 4), None);
+    }
+
+    #[test]
+    fn inverse_inline_math_does_not_use_hidden_comment_context() {
+        let source = "\\caption{\\emph{at most} \\(\\rho_q\\)\n\
+                      % at most\n\\(\\rho_q\\)\n}";
+        assert_eq!(
+            source_word_location(source, 4, "at most 𝜌𝑞", "at most ".len(), 4),
+            None
+        );
     }
 
     #[test]
