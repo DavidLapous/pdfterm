@@ -71,6 +71,7 @@ impl Config {
             ("page_scroll_percent", viewer.page_scroll_percent, 1, 100),
             ("flash_duration_ms", viewer.flash_duration_ms, 1, 60000),
             ("source_context_lines", viewer.source_context_lines, 0, 100),
+            ("prefetch_pages", viewer.prefetch_pages, 0, 8),
         ] {
             if !(low..=high).contains(&value) {
                 return Err(format!("viewer.{name} must be in {low}..={high}").into());
@@ -203,6 +204,7 @@ impl Default for Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ViewerSettings {
     pub continuous_scroll: bool,
+    pub prefetch_pages: u64,
     pub smooth_scroll: bool,
     pub scroll_frame_ms: u64,
     pub scroll_ease_divisor: u64,
@@ -219,6 +221,7 @@ impl Default for ViewerSettings {
     fn default() -> Self {
         Self {
             continuous_scroll: true,
+            prefetch_pages: 2,
             smooth_scroll: true,
             scroll_frame_ms: 16,
             scroll_ease_divisor: 4,
@@ -356,5 +359,22 @@ mod tests {
         );
         fs::write(&path, "[viewer]\nscroll_frame_ms = 0\n").unwrap();
         assert!(Config::load_path(&path).is_err());
+    }
+
+    #[test]
+    fn rejects_prefetch_counts_outside_bounded_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for pages in [0, 1, 2, 8] {
+            fs::write(&path, format!("[viewer]\nprefetch_pages = {pages}\n")).unwrap();
+            assert_eq!(
+                Config::load_path(&path).unwrap().viewer.prefetch_pages,
+                pages
+            );
+        }
+        for pages in ["-1", "9", "18446744073709551615"] {
+            fs::write(&path, format!("[viewer]\nprefetch_pages = {pages}\n")).unwrap();
+            assert!(Config::load_path(&path).is_err());
+        }
     }
 }

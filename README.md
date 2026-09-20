@@ -141,14 +141,23 @@ ranges, and file-access errors stop startup with the configuration path.
 
 - Top level: fit, colors, link-browser layout, SyncTeX, and socket paths.
 - `[editor]`: inverse-search delivery: `none`, `command`, or `socket`.
-- `[viewer]`: continuous/smooth scrolling, animation interval and easing,
-  small/page scroll distances, filename titles, forward-search centering and
-  flash duration, word matching and source-context radius.
+- `[viewer]`: continuous/smooth scrolling, adjacent-page prefetch, animation
+  interval and easing, small/page scroll distances, filename titles,
+  forward-search centering and flash duration, word matching and source-context radius.
 
 Restart the viewer after editing its configuration. `?` shows controls and the
 active configuration path.
 Scrolling eases over terminal rows; `smooth_scroll = false` restores immediate
 steps. `continuous_scroll = false` retains single-page scrolling.
+
+`viewer.prefetch_pages = 2` renders and caches up to two pages before and after
+the current page in the background. Set it to `1` for a smaller cache, or `0` to
+disable speculative rendering; visible pages still render on demand. Values
+from `0` through `8` are accepted. More pages use more memory and background
+CPU, but avoid rendering those pages again when you navigate to them after
+prefetch finishes. Foreground requests take priority over queued prefetch work;
+an already-running PDFium render must finish first. Resize, zoom, color changes,
+and PDF reloads can require fresh renders.
 
 Relative socket names resolve under the configuration directory's `run/`
 directory, which is created with mode `0700`. Socket files use mode `0600`.

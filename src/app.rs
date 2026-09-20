@@ -3008,13 +3008,16 @@ impl App {
             return Ok(());
         };
         let current_page = self.tabs[index].page;
+        // Keep one on-demand neighbor even with prefetch disabled: continuous
+        // scrolling may need its dimensions before it becomes visible.
+        let cache_radius = (self.viewer.prefetch_pages as u32).max(1);
         let visible_end = self
             .visible_pages
             .last()
             .filter(|page| page.frame.key.document_id == key.document_id)
             .map_or(current_page, |page| page.frame.key.page)
             .max(current_page)
-            .saturating_add(1);
+            .saturating_add(cache_radius);
         self.tabs[index].cache.insert(key, Arc::clone(&frame));
         self.tabs[index].cache.retain(|cached, _| {
             cached.width == key.width
@@ -3023,7 +3026,7 @@ impl App {
                 && cached.fit == key.fit
                 && cached.invert == key.invert
                 && cached.dark_mode_style == key.dark_mode_style
-                && cached.page >= current_page.saturating_sub(1)
+                && cached.page >= current_page.saturating_sub(cache_radius)
                 && cached.page <= visible_end
                 && (cached.selected_link_ordinal.is_none()
                     || cached.selected_link_ordinal == key.selected_link_ordinal)
@@ -3500,8 +3503,13 @@ impl App {
 
     fn prefetch_neighbors(&mut self, key: RenderKey) {
         let page_count = self.tab().page_count;
-        for page in [key.page.checked_sub(1), key.page.checked_add(1)]
-            .into_iter()
+        for page in (1..=self.viewer.prefetch_pages as u32)
+            .flat_map(|distance| {
+                [
+                    key.page.checked_sub(distance),
+                    key.page.checked_add(distance),
+                ]
+            })
             .flatten()
             .filter(|page| *page < page_count)
         {
@@ -5930,7 +5938,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         Paragraph::new(vec![
             Line::from(format!("Config: {path}")),
             Line::from("[viewer]: smooth_scroll, scroll_frame_ms, scroll_ease_divisor"),
-            Line::from("[viewer]: continuous_scroll, set_window_title, center_forward_search"),
+            Line::from("[viewer]: continuous_scroll, prefetch_pages, set_window_title, center_forward_search"),
             Line::from("[viewer]: flash_duration_ms, word_precision, source_context_lines"),
             Line::from("[nvim]: focus_on_inverse, viewer, compile; [nvim.keys]: editor keys"),
             Line::from("Commented defaults on first launch. Edit config, then restart."),
