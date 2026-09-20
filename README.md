@@ -54,7 +54,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `j` / down / space / `PageDown` | scroll down continuously across pages |
 | `k` / up / `Backspace` / `PageUp` | scroll up continuously across pages |
 | `h` / `l` / left / right | scroll horizontally, or change page at the edge |
-| Mouse wheel / trackpad | scroll continuously (outside pickers and prompts) |
+| Mouse wheel / trackpad | scroll the document, or move through entries in the outline |
 | `g` / `G` | first / last page |
 | `:` | go-to-page prompt (type a number, `Enter` to jump, `Esc` to cancel) |
 | `/` | search selectable document text |
@@ -231,6 +231,8 @@ remains visible after the recent-files heading is replaced by search results. Us
 `j`/`k` or arrows to move, `Ctrl-b`/`Ctrl-f` to move by a page, and, before
 entering a filter, `g`/`G` to jump to the first or last result. The file, outline,
 theme, link, and search-result pickers use the same navigation conventions.
+The outline also accepts mouse-wheel and trackpad scrolling, including while
+filtering; the selected entry stays visible and `Enter` jumps to it.
 
 ## Editor-neutral SyncTeX
 

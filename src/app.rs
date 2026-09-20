@@ -4590,6 +4590,11 @@ fn pick_outline(
         }
         let key = match read_event()? {
             Event::Key(key) => key,
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                MouseEventKind::ScrollDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                _ => continue,
+            },
             Event::Resize(_, _) => {
                 redraw = true;
                 continue;
@@ -4793,7 +4798,7 @@ fn draw_outline(
     frame.render_widget(
         Paragraph::new(picker_hint_line(
             &[
-                ("j/k", "select"),
+                ("j/k/wheel", "select"),
                 ("^b/^f", "page"),
                 ("g/G", "ends"),
                 ("/", "filter"),
