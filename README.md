@@ -432,6 +432,11 @@ working directory or an output PDF run serially, retaining only the newest
 pending build.
 Builds time out after 120 seconds; captured build/resolution output is capped
 at 1 MiB. Failures are reported rather than launching with stale coordinates.
+Build notifications show the last five output lines (at most 2,000 bytes), updating
+at most every 100 ms while compiling. They finish with `Compilation OK` or
+`Compilation failed`, retaining the log tail for five seconds. A notification
+provider supporting notification IDs, such as Snacks, updates the same popup
+instead of appending a separate message on each refresh.
 
 For output directories or a different engine, add a minimal project descriptor
 to `setup()`:

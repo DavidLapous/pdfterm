@@ -336,11 +336,7 @@ function M.build()
       return
     end
     local p = project.describe(options.project, main_file or file)
-    project.build(p, id, function(result)
-      if result.code ~= 0 then
-        notify(result.stderr ~= '' and result.stderr or result.stdout)
-      end
-    end)
+    project.build(p, id)
   end)
 end
 function M.forward()
@@ -377,9 +373,7 @@ function M.forward()
     end
     if options.compile then
       project.build(p, id, function(result)
-        if result.code ~= 0 then
-          notify(result.stderr ~= '' and result.stderr or result.stdout)
-        else
+        if result.code == 0 then
           resolve()
         end
       end)

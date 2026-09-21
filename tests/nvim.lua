@@ -44,6 +44,60 @@ local ok, failure = xpcall(function()
     table.concat(vim.fn.readfile(log), ',') == 'start:A,end:A,start:C,end:C',
     'builds overlapped or obsolete pending build ran'
   )
+  -- Compiler output must arrive before exit; late refreshes must not erase completion.
+  local original_notify, notices = vim.notify, {}
+  vim.notify = function(message, level, options)
+    assert(not vim.in_fast_event(), 'notification emitted from process callback')
+    notices[#notices + 1] = { message = message, level = level, id = options.id }
+  end
+  for _, exit_code in ipairs({ 0, 2 }) do
+    notices = {}
+    local finished = false
+    local release = directory .. '/release-' .. exit_code
+    project.build(
+      {
+        cwd = directory,
+        pdf = directory .. '/progress.pdf',
+        build = {
+          '/bin/sh',
+          '-c',
+          'printf "discarded\\nline2\\nline3\\nline4\\nline5\\npar"; sleep .05; printf "tial\\n"; while ! test -f "$2"; do sleep .01; done; printf "diagnostic\\n" >&2; exit "$1"',
+          'test',
+          tostring(exit_code),
+          release,
+        },
+      },
+      project.next(),
+      function(result)
+        assert(result.code == exit_code)
+        finished = true
+      end
+    )
+    wait(function()
+      return #notices > 1 and notices[#notices].message:find('partial', 1, true)
+    end)
+    assert(not finished, 'compiler output was buffered until exit')
+    local progress = notices[#notices].message
+    assert(progress:find('partial', 1, true) and not progress:find('discarded', 1, true))
+    assert(#vim.split(progress, '\n') == 6, 'progress did not retain five log lines')
+    vim.fn.writefile({}, release)
+    wait(function()
+      return finished
+    end)
+    local final = notices[#notices]
+    assert(final.message:match('^[^\n]+') == (exit_code == 0 and 'Compilation OK' or 'Compilation failed'))
+    assert(final.message:find('diagnostic', 1, true), 'stderr omitted from compilation notification')
+    assert(final.level == (exit_code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR))
+    local count = #notices
+    vim.wait(150, function()
+      return false
+    end, 10)
+    assert(#notices == count, 'delayed progress overwrote compilation result')
+    for _, notice in ipairs(notices) do
+      assert(notice.id == final.id, 'compilation updates created separate notifications')
+    end
+  end
+  vim.notify = original_notify
   local result
   project.run({ '/bin/sh', '-c', 'sleep 30 & wait' }, directory, 40, function(value)
     result = value
