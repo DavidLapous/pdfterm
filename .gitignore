@@ -6,4 +6,5 @@
 *.dll
 /review.md
 /next_steps.md
+/invariants/
 
