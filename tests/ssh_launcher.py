@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 launcher = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/pdfterm-ssh'))
 Bridge = launcher['Bridge']
@@ -157,6 +158,27 @@ class LauncherTests(unittest.TestCase):
             os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
             launcher['kill_group'](child)
             self.assertEqual(child.returncode, 0)
+
+    def test_master_allows_forwarding_without_confirmation(self):
+        class CaptureMaster(Exception):
+            pass
+
+        # Resolve the actual launch argv through OpenSSH, without connecting.
+        # Combining ControlMaster=yes with -M silently enables confirmation.
+        with patch.dict(os.environ, SSH_CONNECTION='', SSH_TTY='', TMUX=''), \
+                patch.object(sys, 'argv', ['pdfterm-ssh', 'test.invalid']), \
+                patch.object(sys.stdin, 'isatty', return_value=True), \
+                patch.object(os, 'tcgetpgrp', return_value=0), \
+                patch.dict(launcher['main'].__globals__, Windows=lambda: self.windows), \
+                patch.object(subprocess, 'Popen', side_effect=CaptureMaster) as start:
+            with self.assertRaises(CaptureMaster):
+                launcher['main']()
+        argv = start.call_args.args[0]
+        result = subprocess.run([argv[0], '-G', '-F', os.devnull, *argv[1:]],
+                                capture_output=True, text=True, check=True, timeout=5)
+        policy = dict(line.split(maxsplit=1) for line in result.stdout.splitlines())
+        self.assertIn(policy['controlmaster'], ('true', 'yes'))
+        self.assertEqual(policy['stdinnull'], 'yes')
 
 
 class ShellHookTests(unittest.TestCase):

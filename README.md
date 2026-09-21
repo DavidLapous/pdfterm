@@ -430,6 +430,8 @@ aliases, users, ports, and proxies come from the SSH configuration.
 The wrapper opens a remote login shell (or Neovim when arguments follow the host)
 and creates a private reverse Unix-socket tunnel. The shell exports the bridge
 address so subsequently launched Neovim instances inherit it.
+The private SSH master shares the interactive session's foreground process group
+and does not request extra confirmation for each multiplexed forwarding request.
 On first forward search, the adapter asks the client helper to open a viewer
 running **SSH back to the same host**, with the same PDF, session, `PATH`, and
 configuration directory. Ghostty splits the original source terminal to the right,

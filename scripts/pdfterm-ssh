@@ -261,7 +261,7 @@ def main():
             foreground = os.tcgetpgrp(sys.stdin.fileno())
             master = subprocess.Popen(
                 ssh[:-1] + ['-o', 'ControlMaster=yes', '-o', 'ControlPersist=no',
-                            '-o', 'ForkAfterAuthentication=no', '-MN', args.host],
+                            '-o', 'ForkAfterAuthentication=no', '-nN', args.host],
                 process_group=0)
             previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
             try:
@@ -296,8 +296,16 @@ def main():
             else:
                 command = ('export PDFTERM_LAUNCH_SOCKET=' + shlex.quote(remote_socket)
                            + '; exec "$SHELL" -l')
-            child = subprocess.Popen([*editor_ssh, command])
-            return child.wait()
+            # The master reads the multiplexed session's terminal descriptors.
+            # Keep both SSH processes foreground, or input stops it with SIGTTIN.
+            previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                os.tcsetpgrp(sys.stdin.fileno(), master.pid)
+                child = subprocess.Popen([*editor_ssh, command], process_group=master.pid)
+                return child.wait()
+            finally:
+                os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                signal.signal(signal.SIGTTOU, previous_ttou)
         finally:
             if child is not None and child.poll() is None:
                 child.terminate()
