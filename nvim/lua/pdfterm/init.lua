@@ -11,7 +11,8 @@ local launch_generation, launch_process
 local setup_options, config_waiters, install_mappings
 
 local function remote_session()
-  return (vim.env.SSH_CONNECTION or '') ~= '' or (vim.env.SSH_TTY or '') ~= ''
+  return ((vim.env.SSH_CONNECTION or '') ~= '' or (vim.env.SSH_TTY or '') ~= '')
+    and (vim.env.PDFTERM_LAUNCH_SOCKET or '') == ''
 end
 
 local function notify(message)
@@ -214,7 +215,7 @@ local function deliver(pdf, payload, id, source)
     if not alive(id) then
       return
     end
-    cancel_forward = socket.forward(options.forward_socket, payload, function(error, connection_error)
+    cancel_forward = socket.request(options.forward_socket, payload, function(error, connection_error)
       if not alive(id) then
         return
       end

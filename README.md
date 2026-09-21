@@ -348,10 +348,40 @@ Each editor gets a unique session unless `session` is explicitly supplied.
 Forward search first tries the socket, without detecting or controlling a
 terminal. Locally, if unavailable and `attach_only` is false (default), the
 Kitty/Ghostty adapter may launch a matching viewer. Focus control is independently
-opt-in. Under SSH (`SSH_CONNECTION` or `SSH_TTY`), launch and focus automation are
-disabled even if terminal identifiers were forwarded.
+opt-in. Plain SSH sessions do not control client windows just because terminal
+identifiers were forwarded.
 
-For SSH, run Neovim and the viewer on the same remote machine. In Neovim, use:
+For automatic windows over SSH, start the editor from the **terminal client**:
+
+```sh
+./scripts/pdfterm-ssh HOST paper.tex
+# Optional alternate OpenSSH configuration; editor arguments follow HOST:
+./scripts/pdfterm-ssh -F ./ssh-config HOST -u init.lua paper.tex
+```
+
+The client needs Python 3.8+, OpenSSH, and Kitty with remote control enabled, or
+Ghostty on macOS with AppleScript control available. Run outside tmux and outside
+an existing SSH session. The remote needs Neovim, the pdfterm adapter, the viewer
+binary, and TeX tools; its login shell supplies the editor's `PATH`. SSH host
+aliases, users, ports, and proxies come from the SSH configuration.
+
+The wrapper runs remote Neovim and creates a private reverse Unix-socket tunnel.
+On first forward search, the adapter asks the client helper to open a new terminal
+window running **SSH back to the same host**, with the same PDF, session, `PATH`,
+and configuration directory. The PDF, SyncTeX data, and editor/viewer sockets stay
+remote; Kitty graphics travel over the viewer's SSH connection. Existing viewers
+still attach without opening another window. Inverse-focus, if enabled, returns
+to the original client editor window.
+
+The helper lives only for that editor connection. Normal exit, hangup, and
+termination close its owned viewer windows and SSH master; cleanup errors are
+reported. SIGKILL or a client crash cannot guarantee cleanup. Requests and helper
+output are bounded. The SSH server must permit reverse Unix-socket forwarding;
+refusal fails explicitly. There is no persistent daemon, TCP listener, or
+automatic change to SSH configuration. `attach_only = true` still forbids launch.
+
+For manual pairing in an ordinary SSH session, keep Neovim and the viewer on the
+same remote machine. In Neovim, use:
 
 ```vim
 :PdfTermViewerCommand
@@ -362,7 +392,7 @@ matching session and PDF. Run that command in a second SSH terminal connected to
 the same machine. Use `:PdfTermViewerCommand /path/to/document.pdf` to select a PDF
 directly. Activate this command **before** inverse-clicking a separately started
 viewer; no forward search is required. The local terminal must support Kitty
-graphics over SSH. No local window-control helper or socket forwarding is needed.
+graphics over SSH. This manual mode needs no client helper or socket forwarding.
 
 Public actions are `forward()`, `build()`, `set_main(file)`, and `toggle_compile()`;
 commands are `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and

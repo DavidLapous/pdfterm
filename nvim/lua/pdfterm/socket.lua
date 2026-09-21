@@ -1,11 +1,11 @@
 -- Socket transport does not require terminal/window control.
 local M = {}
 
-function M.forward(path, payload, callback)
+function M.request(path, payload, callback, timeout)
   local pipe = assert(vim.uv.new_pipe(false))
   local timer = assert(vim.uv.new_timer())
   local chunks, size, done = {}, 0, false
-  local function finish(error, connection_error)
+  local function finish(error, connection_error, reply)
     if done then
       return
     end
@@ -16,11 +16,11 @@ function M.forward(path, payload, callback)
       pipe:close()
     end
     vim.schedule(function()
-      callback(error, connection_error)
+      callback(error, connection_error, reply)
     end)
   end
-  timer:start(31000, 0, function()
-    finish('forward connection/reply timed out')
+  timer:start(timeout or 31000, 0, function()
+    finish('socket connection/reply timed out')
   end)
   pipe:connect(path, function(error)
     if done then
@@ -39,16 +39,16 @@ function M.forward(path, payload, callback)
       elseif chunk then
         size = size + #chunk
         if size > 4096 then
-          finish('forward reply exceeds 4096 bytes')
+          finish('socket reply exceeds 4096 bytes')
         else
           chunks[#chunks + 1] = chunk
         end
       else
         local ok, reply = pcall(vim.json.decode, table.concat(chunks))
         if not ok or type(reply) ~= 'table' or reply.ok ~= true then
-          finish(ok and type(reply) == 'table' and reply.error or 'forward request rejected or invalid reply')
+          finish(ok and type(reply) == 'table' and reply.error or 'socket request rejected or invalid reply')
         else
-          finish()
+          finish(nil, nil, reply)
         end
       end
     end)
@@ -68,7 +68,7 @@ function M.forward(path, payload, callback)
     end)
   end)
   return function()
-    finish('forward request cancelled')
+    finish('socket request cancelled')
   end
 end
 

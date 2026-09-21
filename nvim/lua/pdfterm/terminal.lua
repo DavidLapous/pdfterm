@@ -3,7 +3,7 @@
 local platform = require 'pdfterm.platform'
 local M = {}
 local kitty, ghostty = {}, {}
-local adapters = { kitty = kitty, ghostty = ghostty }
+local adapters = { kitty = kitty, ghostty = ghostty, ssh = require 'pdfterm.ssh' }
 
 local function remote(arguments, callback)
   local command = { 'kitten', '@' }
@@ -120,6 +120,10 @@ local function adapter(handle)
 end
 
 function M.capture_source(callback)
+  if (vim.env.PDFTERM_LAUNCH_SOCKET or '') ~= '' then
+    callback(nil, { kind = 'ssh', id = 'source' })
+    return
+  end
   local kind = vim.env.KITTY_WINDOW_ID and 'kitty' or vim.env.TERM_PROGRAM == 'ghostty' and 'ghostty'
   if not kind then callback('terminal launch/focus requires Kitty or Ghostty'); return end
   if kind == 'kitty' then callback(nil, { kind = kind, id = vim.env.KITTY_WINDOW_ID }); return end

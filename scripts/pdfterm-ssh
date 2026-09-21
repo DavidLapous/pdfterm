@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Run remote Neovim with automatic client-side Kitty/Ghostty PDF windows."""
+import argparse
+import json
+import os
+import re
+import selectors
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+
+def run(argv, timeout=2):
+    # Keep the controlling terminal for SSH authentication, but bound helper output.
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        chunks = {child.stdout: bytearray(), child.stderr: bytearray()}
+        deadline, size = time.monotonic() + timeout, 0
+        try:
+            with selectors.DefaultSelector() as pending:
+                for stream in chunks:
+                    pending.register(stream, selectors.EVENT_READ)
+                while pending.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    for key, _ in pending.select(min(remaining, 0.05)):
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            pending.unregister(key.fileobj)
+                            continue
+                        size += len(chunk)
+                        if size > 1024 * 1024:
+                            raise RuntimeError('helper output exceeds 1 MiB')
+                        chunks[key.fileobj].extend(chunk)
+            child.wait(timeout=max(0.001, deadline - time.monotonic()))
+            if child.returncode:
+                error = chunks[child.stderr].decode(errors='replace').strip()
+                raise RuntimeError(error or f'{argv[0]} exited {child.returncode}')
+            return chunks[child.stdout].decode(errors='replace').strip()
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+
+
+def applescript(body, *arguments):
+    return run(['osascript', '-e', 'on run argv\ntell application "Ghostty"\n' + body
+                + '\nend tell\nend run', *arguments])
+
+
+class Windows:
+    def __init__(self):
+        if os.environ.get('KITTY_WINDOW_ID'):
+            self.kind, self.source = 'kitty', os.environ['KITTY_WINDOW_ID']
+        elif os.environ.get('TERM_PROGRAM') == 'ghostty' and sys.platform == 'darwin':
+            self.kind = 'ghostty'
+            self.source = applescript('return id of focused terminal of selected tab of front window')
+        else:
+            raise RuntimeError('start pdfterm-ssh in Kitty, or Ghostty on macOS (without tmux)')
+
+    def launch(self, argv):
+        if self.kind == 'kitty':
+            return run(['kitten', '@', 'launch', '--type=os-window', '--keep-focus', *argv])
+        return applescript('''set cfg to new surface configuration
+set command of cfg to item 1 of argv
+set wait after command of cfg to false
+set viewerWindow to new window with configuration cfg
+set viewer to focused terminal of selected tab of viewerWindow
+focus terminal id (item 2 of argv)
+return id of viewer''', shlex.join(argv), self.source)
+
+    def focus(self, identifier):
+        if self.kind == 'kitty':
+            run(['kitten', '@', 'focus-window', '--match', 'id:' + identifier])
+        else:
+            applescript('focus terminal id (item 1 of argv)', identifier)
+
+    def close(self, identifier):
+        if self.kind == 'kitty':
+            windows = json.loads(run(['kitten', '@', 'ls', '--match', 'id:' + identifier]))
+            if windows:
+                run(['kitten', '@', 'send-text', '--match', 'id:' + identifier, '\x03'])
+        else:
+            applescript('''repeat 15 times
+if not (exists terminal id (item 1 of argv)) then return
+send key "c" modifiers "control" to terminal id (item 1 of argv)
+delay 0.1
+end repeat
+if exists terminal id (item 1 of argv) then error "owned viewer did not exit"''', identifier)
+
+
+class Bridge:
+    def __init__(self, path, ssh, windows):
+        self.ssh, self.windows, self.owned = ssh, windows, set()
+        self.stop = threading.Event()
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(path)
+        os.chmod(path, 0o600)
+        self.listener.listen(4)
+        self.listener.settimeout(0.1)
+        self.thread = threading.Thread(target=self.serve)
+        self.thread.start()
+
+    def dispatch(self, request):
+        if not isinstance(request, dict):
+            raise ValueError('expected an object')
+        action = request.get('action')
+        if action == 'launch':
+            argv = request.get('argv')
+            if (not isinstance(argv, list) or not 2 <= len(argv) <= 8
+                    or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in argv)):
+                raise ValueError('invalid viewer argv')
+            if len(self.owned) >= 16:
+                raise ValueError('too many owned viewer windows')
+            env = []
+            for key, field in [('PATH', 'path'), ('XDG_CONFIG_HOME', 'config_home')]:
+                value = request.get(field)
+                if value is not None:
+                    if not isinstance(value, str) or '\0' in value:
+                        raise ValueError('invalid remote environment')
+                    env.append(key + '=' + value)
+            # Everything supplied by the remote runs THERE, never in the client shell.
+            command = shlex.join(['env', *env, *argv])
+            identifier = self.windows.launch(self.ssh[:-1] + ['-tt', self.ssh[-1], command])
+            if not identifier:
+                raise RuntimeError('terminal launcher returned no window ID')
+            self.owned.add(identifier)
+            return {'ok': True, 'id': identifier}
+        identifier = request.get('id')
+        if not isinstance(identifier, str):
+            raise ValueError('invalid window ID')
+        if action == 'focus' and identifier == 'source':
+            self.windows.focus(self.windows.source)
+        elif identifier in self.owned and action == 'focus':
+            self.windows.focus(identifier)
+        elif identifier in self.owned and action == 'close':
+            self.windows.close(identifier)
+            self.owned.remove(identifier)
+        else:
+            raise ValueError('unknown action or unowned window')
+        return {'ok': True}
+
+    def serve(self):
+        while not self.stop.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            with client:
+                try:
+                    deadline = time.monotonic() + 1
+                    data = bytearray()
+                    while True:
+                        client.settimeout(max(0.001, deadline - time.monotonic()))
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                        if len(data) > 32768 or time.monotonic() >= deadline:
+                            raise ValueError('launcher request exceeds size/time limit')
+                    reply = self.dispatch(json.loads(data))
+                except (ValueError, RecursionError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    reply = {'ok': False, 'error': str(error)[:2000]}
+                try:
+                    client.settimeout(0.1)
+                    client.sendall(json.dumps(reply).encode())
+                except OSError as error:
+                    print(f'pdfterm-ssh: launcher reply: {error}', file=sys.stderr)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+        self.listener.close()
+        failures = []
+        for identifier in list(self.owned):
+            try:
+                self.windows.close(identifier)
+                self.owned.remove(identifier)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError('; '.join(failures))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Configure ports, users and proxies in ~/.ssh/config. The remote needs nvim and pdfterm with its adapter installed.')
+    parser.add_argument('-F', '--ssh-config', help='alternate OpenSSH configuration file')
+    parser.add_argument('host', help='SSH host or configured alias')
+    parser.add_argument('files', nargs=argparse.REMAINDER, help='arguments passed to remote nvim')
+    args = parser.parse_args()
+    if args.host.startswith('-') or '\0' in args.host:
+        parser.error('invalid SSH host')
+    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY') or os.environ.get('TMUX'):
+        parser.error('run this wrapper on the terminal client, outside SSH and tmux')
+    windows = Windows()
+    with tempfile.TemporaryDirectory(prefix='pdfterm-', dir='/tmp') as directory:
+        # One private SSH master shares authentication with viewer connections.
+        ssh = ['ssh', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto',
+               '-o', 'ControlPersist=30', '-o', 'ControlPath=' + directory + '/master']
+        if args.ssh_config:
+            ssh.extend(['-F', os.path.abspath(args.ssh_config)])
+        ssh.append(args.host)
+        remote_directory = None
+        bridge = None
+        child = None
+        try:
+            candidate = run([*ssh, 'mktemp -d /tmp/pdfterm-XXXXXXXX'], timeout=30)
+            if not re.fullmatch(r'/tmp/pdfterm-[A-Za-z0-9]+', candidate):
+                raise RuntimeError('SSH bootstrap returned an invalid private directory')
+            remote_directory = candidate
+            remote_socket = remote_directory + '/launch.sock'
+            local_socket = directory + '/launch.sock'
+            bridge = Bridge(local_socket, ssh, windows)
+            # Options must precede the host; the remote command is one quoted string.
+            editor_ssh = ssh[:-1] + ['-o', 'ExitOnForwardFailure=yes', '-R',
+                                    remote_socket + ':' + local_socket, '-tt', args.host]
+            command = shlex.join(['env', 'PDFTERM_LAUNCH_SOCKET=' + remote_socket, 'nvim', *args.files])
+            child = subprocess.Popen([*editor_ssh, 'exec "$SHELL" -lc ' + shlex.quote(command)])
+            return child.wait()
+        finally:
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except (OSError, RuntimeError) as error:
+                    print(f'pdfterm-ssh: cleanup: {error}', file=sys.stderr)
+            if remote_directory is not None:
+                try:
+                    run([*ssh, shlex.join(['rm', '-f', remote_directory + '/launch.sock'])
+                         + ' && ' + shlex.join(['rmdir', remote_directory])], timeout=15)
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    print(f'pdfterm-ssh: remote cleanup: {error}', file=sys.stderr)
+            if os.path.exists(directory + '/master'):
+                try:
+                    run(ssh[:-1] + ['-O', 'exit', args.host])
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    print(f'pdfterm-ssh: SSH master cleanup: {error}', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    for stop_signal in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stop_signal, lambda signum, _: sys.exit(128 + signum))
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        sys.exit('pdfterm-ssh: ' + str(error))
+    except KeyboardInterrupt:
+        sys.exit(130)
