@@ -1,4 +1,5 @@
 """Headless regressions for the local launcher's ownership and bounded protocol."""
+import errno
 import json
 import os
 import pty
@@ -23,19 +24,28 @@ class Windows:
     def __init__(self):
         self.live = set()
         self.fail = False
+        self.serial = 0
+        self.query_fail = False
 
     def launch(self, argv):
         if self.fail:
             raise RuntimeError('terminal control unavailable')
-        self.live.add('viewer')
-        return 'viewer'
+        self.serial += 1
+        identifier = 'viewer-' + str(self.serial)
+        self.live.add(identifier)
+        return identifier
 
     def focus(self, identifier):
         if identifier != self.source and identifier not in self.live:
             raise RuntimeError('window is gone')
 
+    def existing(self, identifiers):
+        if self.query_fail:
+            raise RuntimeError('liveness query failed')
+        return self.live & identifiers
+
     def close(self, identifier):
-        self.live.remove(identifier)
+        self.live.discard(identifier)
 
 
 class LauncherTests(unittest.TestCase):
@@ -52,7 +62,12 @@ class LauncherTests(unittest.TestCase):
             client.settimeout(3)
             client.connect(self.path)
             client.sendall(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
-            client.shutdown(socket.SHUT_WR)
+            try:
+                client.shutdown(socket.SHUT_WR)
+            except OSError as error:
+                # An early rejection may close before the client's half-close.
+                if error.errno != errno.ENOTCONN:
+                    raise
             chunks = []
             while chunk := client.recv(4096):
                 chunks.append(chunk)
@@ -66,10 +81,11 @@ class LauncherTests(unittest.TestCase):
         self.windows.fail = True
         self.assertFalse(self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})['ok'])
         self.windows.fail = False
-        self.assertTrue(self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})['ok'])
+        viewer = self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})
+        self.assertTrue(viewer['ok'])
         self.assertFalse(self.request({'action': 'close', 'id': 'editor'})['ok'])
-        self.assertIn('viewer', self.windows.live)
-        self.assertTrue(self.request({'action': 'close', 'id': 'viewer'})['ok'])
+        self.assertIn(viewer['id'], self.windows.live)
+        self.assertTrue(self.request({'action': 'close', 'id': viewer['id']})['ok'])
         self.assertFalse(self.windows.live)
 
     def test_stalled_peer_expires_and_disconnect_does_not_orphan_owned_viewer(self):
@@ -88,6 +104,59 @@ class LauncherTests(unittest.TestCase):
             launcher['run']([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.03)
         with self.assertRaisesRegex(RuntimeError, '1 MiB'):
             launcher['run']([sys.executable, '-c', 'import os; os.write(1, b\"x\" * 1100000)'])
+
+    def test_external_exits_do_not_exhaust_limit_and_late_close_is_owned(self):
+        retired = []
+        for _ in range(32):
+            response = self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})
+            self.assertTrue(response['ok'], response)
+            retired.append(response['id'])
+            self.windows.live.remove(response['id'])
+        for identifier in retired:
+            self.assertTrue(self.request({'action': 'close', 'id': identifier})['ok'])
+        self.assertFalse(self.request({'action': 'close', 'id': 'unowned'})['ok'])
+        for _ in range(16):
+            self.assertTrue(self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})['ok'])
+        self.assertFalse(self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})['ok'])
+        self.assertEqual(len(self.windows.live), 16)
+
+    def test_query_failure_does_not_forget_ownership_or_launch(self):
+        viewer = self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})['id']
+        self.windows.query_fail = True
+        response = self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})
+        self.assertFalse(response['ok'])
+        self.assertIn('liveness query failed', response['error'])
+        self.assertEqual(self.windows.live, {viewer})
+        self.windows.query_fail = False
+        self.assertTrue(self.request({'action': 'close', 'id': viewer})['ok'])
+
+    def test_helper_descendants_are_stopped_on_timeout_overflow_and_success(self):
+        for outcome in ('timeout', 'overflow', 'success', 'inherited-pipe'):
+            with self.subTest(outcome=outcome):
+                marker = Path(self.directory.name) / outcome
+                child_code = f'import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).touch()'
+                helper = ('import subprocess, sys, time, os; '
+                          f'subprocess.Popen([sys.executable, "-c", {child_code!r}]'
+                          + ('); ' if outcome == 'inherited-pipe' else
+                             ', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); '))
+                helper += {'timeout': 'time.sleep(30)',
+                           'overflow': 'os.write(1, b"x" * 1100000)',
+                           'success': 'print("finished")',
+                           'inherited-pipe': 'print("parent finished")'}[outcome]
+                if outcome == 'success':
+                    self.assertEqual(launcher['run']([sys.executable, '-c', helper]), 'finished')
+                else:
+                    exception = RuntimeError if outcome == 'overflow' else subprocess.TimeoutExpired
+                    with self.assertRaises(exception):
+                        launcher['run']([sys.executable, '-c', helper], timeout=0.4)
+                time.sleep(1.1)
+                self.assertFalse(marker.exists(), 'helper descendant survived cleanup')
+
+    def test_exited_unreaped_master_group_cleans_up(self):
+        with subprocess.Popen([sys.executable, '-c', 'pass'], process_group=0) as child:
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            launcher['kill_group'](child)
+            self.assertEqual(child.returncode, 0)
 
 
 class ShellHookTests(unittest.TestCase):

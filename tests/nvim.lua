@@ -1,6 +1,6 @@
 -- Run: PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua
 local root = vim.fn.getcwd()
-vim.opt.runtimepath:prepend(root .. '/nvim')
+vim.opt.runtimepath:prepend(root)
 local directory = assert(vim.uv.fs_mkdtemp(root .. '/.nvim-test-XXXXXX'))
 vim.fn.mkdir(directory .. '/pdfterm', 'p', 448)
 vim.env.XDG_CONFIG_HOME = directory
@@ -24,7 +24,14 @@ local ok, failure = xpcall(function()
       {
         cwd = tag == 'A' and directory or directory .. '/other',
         pdf = directory .. '/shared.pdf',
-        build = { '/bin/sh', '-c', 'echo start:$1 >> "$2"; sleep .05; echo end:$1 >> "$2"', 'test', tag, log },
+        build = {
+          '/bin/sh',
+          '-c',
+          'echo start:$1 >> "$2"; sleep .05; echo end:$1 >> "$2"',
+          'test',
+          tag,
+          log,
+        },
       },
       id,
       function(result)
@@ -85,8 +92,14 @@ local ok, failure = xpcall(function()
       return finished
     end)
     local final = notices[#notices]
-    assert(final.message:match('^[^\n]+') == (exit_code == 0 and 'Compilation OK' or 'Compilation failed'))
-    assert(final.message:find('diagnostic', 1, true), 'stderr omitted from compilation notification')
+    assert(
+      final.message:match('^[^\n]+')
+        == (exit_code == 0 and 'Compilation OK' or 'Compilation failed')
+    )
+    assert(
+      final.message:find('diagnostic', 1, true),
+      'stderr omitted from compilation notification'
+    )
     assert(final.level == (exit_code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR))
     local count = #notices
     vim.wait(150, function()
@@ -126,7 +139,9 @@ local ok, failure = xpcall(function()
     'echo selected >> ' .. vim.fn.shellescape(directory .. '/bootstrap.log'),
     'if test -f ' .. vim.fn.shellescape(directory .. '/hold-resolution') .. '; then',
     '  touch ' .. vim.fn.shellescape(directory .. '/resolution-started'),
-    '  while test -f ' .. vim.fn.shellescape(directory .. '/hold-resolution') .. '; do sleep .01; done',
+    '  while test -f '
+      .. vim.fn.shellescape(directory .. '/hold-resolution')
+      .. '; do sleep .01; done',
     'fi',
     'exec ' .. vim.fn.shellescape(binary) .. ' "$@"',
   }, wrapper)
@@ -157,16 +172,24 @@ local ok, failure = xpcall(function()
   wait(function()
     return vim.fn.filereadable(directory .. '/bootstrap.log') == 1
   end)
-  assert(vim.fn.readfile(directory .. '/bootstrap.log')[1] == 'selected', 'bootstrap executable ignored')
+  assert(
+    vim.fn.readfile(directory .. '/bootstrap.log')[1] == 'selected',
+    'bootstrap executable ignored'
+  )
   assert(vim.fn.exists(':PdfTermForward') == 2 and vim.fn.exists(':PdfTermBuild') == 2)
   for _, mapping in ipairs(vim.api.nvim_get_keymap('n')) do
     assert(not (mapping.desc or ''):match('^pdfterm'), 'default mappings are not opt-in')
   end
   local config = vim.json.decode(
-    vim.system({ binary, '--session', 'adapter', '--print-config' }, { text = true }):wait(10000).stdout
+    vim
+      .system({ binary, '--session', 'adapter', '--print-config' }, { text = true })
+      :wait(10000).stdout
   )
   assert(config.forward_socket:match('/adapter%-forward.sock$'))
-  assert(not vim.uv.fs_lstat(config.editor.path), 'setup opened an inverse listener before first use')
+  assert(
+    not vim.uv.fs_lstat(config.editor.path),
+    'setup opened an inverse listener before first use'
+  )
   local requests = {}
   server = assert(vim.uv.new_pipe(false))
   assert(server:bind(config.forward_socket))
@@ -221,8 +244,14 @@ local ok, failure = xpcall(function()
     return #requests == 2
   end)
   assert(requests[2].pdf == vim.uv.fs_realpath(pdf) and requests[2].page == 1)
-  assert(vim.deep_equal(requests[2].revision, expected.revision), 'PDF revision differs from native metadata')
-  assert(not vim.uv.fs_stat(directory .. '/artifacts/navigation.synctex.gz'), 'opening PDF unexpectedly rebuilt TeX')
+  assert(
+    vim.deep_equal(requests[2].revision, expected.revision),
+    'PDF revision differs from native metadata'
+  )
+  assert(
+    not vim.uv.fs_stat(directory .. '/artifacts/navigation.synctex.gz'),
+    'opening PDF unexpectedly rebuilt TeX'
+  )
   -- A missing SyncTeX sidecar must not prevent opening the existing PDF.
   adapter.toggle_compile()
   local navigation_notices = {}
@@ -250,7 +279,10 @@ local ok, failure = xpcall(function()
   vim.wait(150, function()
     return false
   end, 10)
-  assert(#requests == 4 and #navigation_notices == 0, 'superseded resolution still opened or warned')
+  assert(
+    #requests == 4 and #navigation_notices == 0,
+    'superseded resolution still opened or warned'
+  )
   assert(vim.uv.fs_unlink(directory .. '/hold-resolution'))
 
   -- Build failure is not a SyncTeX failure: do not open an old PDF.
@@ -271,19 +303,97 @@ local ok, failure = xpcall(function()
   end, 10)
   assert(#requests == 4, 'failed build opened stale output')
   vim.notify = original_notify
-  local inverse = assert(vim.uv.new_pipe(false))
-  inverse:connect(config.editor.path, function(error)
-    assert(not error, error)
-    inverse:write(vim.json.encode({ file = source, line = 4, byte_column = 6 }), function()
-      inverse:shutdown(function()
-        inverse:close()
+  local function inverse_jump()
+    local inverse = assert(vim.uv.new_pipe(false))
+    inverse:connect(config.editor.path, function(error)
+      assert(not error, error)
+      inverse:write(vim.json.encode({ file = source, line = 4, byte_column = 6 }), function()
+        inverse:shutdown(function()
+          inverse:close()
+        end)
       end)
     end)
-  end)
+  end
+  inverse_jump()
   wait(function()
     return vim.api.nvim_win_get_cursor(0)[1] == 4
   end)
   assert(vim.api.nvim_win_get_cursor(0)[2] == 6)
+  -- The terminal selected before a slow resolver owns launch/inverse focus.
+  vim.env.SSH_CONNECTION = nil
+  local foreground, focused = 'A', nil
+  terminal.capture_source = function(callback)
+    local captured = foreground
+    vim.defer_fn(function()
+      callback(nil, { kind = 'ghostty', id = captured })
+    end, 10)
+  end
+  terminal.focus = function(handle, callback)
+    focused = handle.id
+    callback({ code = 0 })
+  end
+  adapter.toggle_compile()
+  vim.uv.fs_unlink(directory .. '/resolution-started')
+  vim.fn.writefile({}, directory .. '/hold-resolution')
+  adapter.forward()
+  wait(function()
+    return vim.fn.filereadable(directory .. '/resolution-started') == 1
+  end)
+  foreground = 'B'
+  vim.uv.fs_unlink(directory .. '/hold-resolution')
+  wait(function()
+    return #requests == 5
+  end)
+  inverse_jump()
+  wait(function()
+    return focused ~= nil
+  end)
+  assert(focused == 'A', 'slow navigation retargeted inverse focus to a later terminal')
+
+  -- Explicit source handles win; socket attachment still works without capture.
+  terminal.capture_source = function()
+    error('supplied source must not be recaptured')
+  end
+  adapter.forward_search(pdf, vim.json.encode(requests[1]), { kind = 'ghostty', id = 'explicit' })
+  wait(function()
+    return #requests == 6
+  end)
+  focused = nil
+  inverse_jump()
+  wait(function()
+    return focused ~= nil
+  end)
+  assert(focused == 'explicit')
+  terminal.capture_source = function(callback)
+    callback('terminal discovery unavailable')
+  end
+  adapter.open(pdf)
+  wait(function()
+    return #requests == 7
+  end)
+
+  -- A late capture cannot resurrect a superseded navigation.
+  local captures = {}
+  terminal.capture_source = function(callback)
+    captures[#captures + 1] = callback
+  end
+  adapter.open(pdf)
+  adapter.open(pdf)
+  captures[2](nil, { kind = 'ghostty', id = 'new' })
+  captures[1](nil, { kind = 'ghostty', id = 'old' })
+  wait(function()
+    return #requests == 8
+  end)
+  vim.wait(50, function()
+    return false
+  end, 5)
+  assert(#requests == 8, 'superseded terminal capture delivered navigation')
+  focused = nil
+  inverse_jump()
+  wait(function()
+    return focused ~= nil
+  end)
+  assert(focused == 'new', 'superseded capture changed inverse focus')
   print(
     'adapter regressions passed: serialized/latest build, timeout/output cap, bootstrap, named session, attach-only, inverse socket; event ticks='
       .. ticks

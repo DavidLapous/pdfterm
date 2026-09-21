@@ -15,9 +15,26 @@ import threading
 import time
 
 
+def kill_group(child):
+    try:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except PermissionError:
+            # Darwin reports EPERM for a zombie-only group. Reap our leader
+            # before retrying; a denial against a live leader remains an error.
+            if child.poll() is None:
+                raise
+            os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    finally:
+        child.wait(timeout=2)
+
+
 def run(argv, timeout=2):
-    # Keep the controlling terminal for SSH authentication, but bound helper output.
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+    # Finite helpers own a process group. Interactive authentication is separate.
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          start_new_session=True) as child:
         chunks = {child.stdout: bytearray(), child.stderr: bytearray()}
         deadline, size = time.monotonic() + timeout, 0
         try:
@@ -43,9 +60,7 @@ def run(argv, timeout=2):
                 raise RuntimeError(error or f'{argv[0]} exited {child.returncode}')
             return chunks[child.stdout].decode(errors='replace').strip()
         finally:
-            if child.poll() is None:
-                child.kill()
-            child.wait()
+            kill_group(child)
 
 
 def applescript(body, *arguments):
@@ -80,6 +95,25 @@ return id of viewer''', shlex.join(argv), self.source)
         else:
             applescript('focus terminal id (item 1 of argv)', identifier)
 
+    def existing(self, identifiers):
+        if not identifiers:
+            return set()
+        if self.kind == 'kitty':
+            listing = json.loads(run(['kitten', '@', 'ls']))
+            try:
+                live = {str(window['id']) for surface in listing
+                        for tab in surface['tabs'] for window in tab['windows']}
+            except (KeyError, TypeError) as error:
+                raise RuntimeError('invalid Kitty window listing') from error
+            return set(identifiers) & live
+        result = applescript('''set liveIDs to {}
+repeat with identifier in argv
+if exists terminal id (identifier as text) then set end of liveIDs to identifier as text
+end repeat
+set AppleScript's text item delimiters to linefeed
+return liveIDs as text''', *sorted(identifiers))
+        return set(result.splitlines())
+
     def close(self, identifier):
         if self.kind == 'kitty':
             windows = json.loads(run(['kitten', '@', 'ls', '--match', 'id:' + identifier]))
@@ -97,6 +131,7 @@ if exists terminal id (item 1 of argv) then error "owned viewer did not exit"'''
 class Bridge:
     def __init__(self, path, ssh, windows):
         self.ssh, self.windows, self.owned = ssh, windows, set()
+        self.retired = set()  # Ownership receipts: late closes are no-ops, never terminal actions.
         self.stop = threading.Event()
         self.listener = socket.socket(socket.AF_UNIX)
         self.listener.bind(path)
@@ -115,6 +150,9 @@ class Bridge:
             if (not isinstance(argv, list) or not 2 <= len(argv) <= 8
                     or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in argv)):
                 raise ValueError('invalid viewer argv')
+            live = self.windows.existing(self.owned)
+            self.retired.update(self.owned - live)
+            self.owned = live
             if len(self.owned) >= 16:
                 raise ValueError('too many owned viewer windows')
             env = []
@@ -130,6 +168,7 @@ class Bridge:
             if not identifier:
                 raise RuntimeError('terminal launcher returned no window ID')
             self.owned.add(identifier)
+            self.retired.discard(identifier)
             return {'ok': True, 'id': identifier}
         identifier = request.get('id')
         if not isinstance(identifier, str):
@@ -141,6 +180,9 @@ class Bridge:
         elif identifier in self.owned and action == 'close':
             self.windows.close(identifier)
             self.owned.remove(identifier)
+            self.retired.add(identifier)
+        elif identifier in self.retired and action == 'close':
+            pass
         else:
             raise ValueError('unknown action or unowned window')
         return {'ok': True}
@@ -196,20 +238,47 @@ def main():
     args = parser.parse_args()
     if args.host.startswith('-') or '\0' in args.host:
         parser.error('invalid SSH host')
+    if not sys.stdin.isatty():
+        parser.error('interactive authentication requires a terminal')
     if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY') or os.environ.get('TMUX'):
         parser.error('run this wrapper on the terminal client, outside SSH and tmux')
     windows = Windows()
     with tempfile.TemporaryDirectory(prefix='pdfterm-', dir='/tmp') as directory:
         # One private SSH master shares authentication with viewer connections.
-        ssh = ['ssh', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto',
-               '-o', 'ControlPersist=30', '-o', 'ControlPath=' + directory + '/master']
+        ssh = ['ssh', '-o', 'ConnectTimeout=10',
+               '-o', 'ControlPath=' + directory + '/master']
         if args.ssh_config:
             ssh.extend(['-F', os.path.abspath(args.ssh_config)])
         ssh.append(args.host)
         remote_directory = None
         bridge = None
         child = None
+        master = None
         try:
+            # Keep authentication on the controlling terminal, but put the master
+            # and its proxies in an owned group that lives until this scope exits.
+            # Do not daemonize: a forked master would escape descendant cleanup.
+            foreground = os.tcgetpgrp(sys.stdin.fileno())
+            master = subprocess.Popen(
+                ssh[:-1] + ['-o', 'ControlMaster=yes', '-o', 'ControlPersist=no',
+                            '-o', 'ForkAfterAuthentication=no', '-MN', args.host],
+                process_group=0)
+            previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                os.tcsetpgrp(sys.stdin.fileno(), master.pid)
+                os.killpg(master.pid, signal.SIGCONT)
+                deadline = time.monotonic() + 30
+                while not os.path.exists(directory + '/master'):
+                    if master.poll() is not None:
+                        raise RuntimeError(f'SSH authentication exited {master.returncode}')
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(master.args, 30)
+                    time.sleep(0.02)
+                run(ssh[:-1] + ['-O', 'check', args.host])
+            finally:
+                os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                signal.signal(signal.SIGTTOU, previous_ttou)
+            ssh = ssh[:-1] + ['-o', 'ControlMaster=no', '-o', 'BatchMode=yes', args.host]
             candidate = run([*ssh, 'mktemp -d /tmp/pdfterm-XXXXXXXX'], timeout=30)
             if not re.fullmatch(r'/tmp/pdfterm-[A-Za-z0-9]+', candidate):
                 raise RuntimeError('SSH bootstrap returned an invalid private directory')
@@ -248,11 +317,8 @@ def main():
                          + ' && ' + shlex.join(['rmdir', remote_directory])], timeout=15)
                 except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                     print(f'pdfterm-ssh: remote cleanup: {error}', file=sys.stderr)
-            if os.path.exists(directory + '/master'):
-                try:
-                    run(ssh[:-1] + ['-O', 'exit', args.host])
-                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-                    print(f'pdfterm-ssh: SSH master cleanup: {error}', file=sys.stderr)
+            if master is not None:
+                kill_group(master)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 -- Run with PDFTERM_EXECUTABLE set, like tests/nvim.lua.
 local root = vim.fn.getcwd()
-vim.opt.runtimepath:prepend(root .. '/nvim')
+vim.opt.runtimepath:prepend(root)
 local binary = assert(vim.env.PDFTERM_EXECUTABLE)
 local function wait(predicate)
   assert(vim.wait(10000, predicate, 2), 'session operation timed out')
@@ -9,8 +9,9 @@ local case = vim.env.PDFTERM_SESSION_CASE
 if case then
   local directory = assert(vim.env.XDG_CONFIG_HOME)
   if case == 'make_stale' then
-    local config =
-      vim.json.decode(vim.system({ binary, '--session', 'shared', '--print-config' }, { text = true }):wait().stdout)
+    local config = vim.json.decode(
+      vim.system({ binary, '--session', 'shared', '--print-config' }, { text = true }):wait().stdout
+    )
     local server = assert(vim.uv.new_pipe(false))
     assert(server:bind(config.editor.path))
     assert(server:listen(1, function() end))
@@ -42,9 +43,14 @@ if case then
   local adapter = require('pdfterm')
   local started = vim.uv.hrtime()
   adapter.setup({
-    executable = case == 'missing' and directory .. '/missing-viewer' or directory .. '/slow-viewer',
-    session = case == 'invalid' and '../invalid' or (case == 'live' or case == 'stale') and 'shared' or nil,
+    executable = case == 'missing' and directory .. '/missing-viewer'
+      or directory .. '/slow-viewer',
+    session = case == 'invalid' and '../invalid'
+      or (case == 'live' or case == 'stale') and 'shared'
+      or nil,
     focus_on_inverse = true,
+    keys = { forward = '', build = '<F6>', main_file = '<F5>', compile = '' },
+    open_pdf = true,
   })
   local setup_ns = vim.uv.hrtime() - started
   assert(vim.fn.exists(':PdfTermViewerCommand') == 2)
@@ -56,6 +62,26 @@ if case then
     end)
     assert(messages[1]:match('configuration:'))
     assert(vim.api.nvim_get_current_line() == 'still editable')
+    local before = #messages
+    vim.api.nvim_buf_set_name(0, directory .. '/failure.tex')
+    vim.fn.maparg('<F5>', 'n', false, true).callback()
+    wait(function()
+      return #messages > before
+    end)
+    assert(messages[#messages]:match('configuration:'), 'broken integration lost its action error')
+    vim.bo.modified = false
+    before = #messages
+    vim.cmd.edit(vim.fn.fnameescape(directory .. '/paper.pdf'))
+    wait(function()
+      return #messages > before
+    end)
+    assert(vim.bo.buftype == 'nofile' and not vim.bo.modifiable and not vim.bo.modified)
+    before = #messages
+    vim.fn.maparg('<CR>', 'n', false, true).callback()
+    wait(function()
+      return #messages > before
+    end)
+    assert(messages[#messages]:match('configuration:'), 'PDF retry lost its dependency error')
     print(vim.json.encode({ case = case, setup_ns = setup_ns }))
     vim.cmd('qa!')
     return
@@ -81,7 +107,9 @@ if case then
     return
   end
   local command = messages[1]
-  local resolved = vim.system({ '/bin/sh', '-c', command .. ' --print-config' }, { text = true }):wait(10000)
+  local resolved = vim
+    .system({ '/bin/sh', '-c', command .. ' --print-config' }, { text = true })
+    :wait(10000)
   assert(resolved.code == 0, resolved.stderr)
   local config = vim.json.decode(resolved.stdout)
   assert(config.editor.path:match('/n%x+%-editor.sock$'), command)
@@ -106,7 +134,14 @@ if case then
   end)
   assert(messages[2]:find(command, 1, true), messages[2])
   assert(messages[2]:match('another terminal'))
-  print(vim.json.encode({ case = case, setup_ns = setup_ns, ticks = ticks, endpoint = config.editor.path }))
+  print(
+    vim.json.encode({
+      case = case,
+      setup_ns = setup_ns,
+      ticks = ticks,
+      endpoint = config.editor.path,
+    })
+  )
   vim.cmd('qa!')
   return
 end
@@ -127,7 +162,11 @@ local ok, failure = xpcall(function()
   local function spawn(name, callback)
     return vim.system(
       { vim.v.progpath, '--headless', '-u', 'NONE', '-l', root .. '/tests/nvim_sessions.lua' },
-      { text = true, timeout = 15000, env = { PDFTERM_SESSION_CASE = name, XDG_CONFIG_HOME = directory } },
+      {
+        text = true,
+        timeout = 15000,
+        env = { PDFTERM_SESSION_CASE = name, XDG_CONFIG_HOME = directory },
+      },
       callback
     )
   end
@@ -143,7 +182,10 @@ local ok, failure = xpcall(function()
     return vim.json.decode(vim.trim(result.stdout ~= '' and result.stdout or result.stderr))
   end
   local config_result = vim
-    .system({ binary, '--session', 'shared', '--print-config' }, { text = true, env = { XDG_CONFIG_HOME = directory } })
+    .system(
+      { binary, '--session', 'shared', '--print-config' },
+      { text = true, env = { XDG_CONFIG_HOME = directory } }
+    )
     :wait(10000)
   assert(config_result.code == 0, config_result.stderr)
   local config = vim.json.decode(config_result.stdout)

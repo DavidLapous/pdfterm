@@ -3,11 +3,11 @@ local M = {}
 local socket = require('pdfterm.socket')
 local project = require('pdfterm.project')
 local terminal = require('pdfterm.terminal')
-local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h:h')
+local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h')
 local options, main_file, initialized, exiting
 local cancel_forward, cancel_resolution, close_listener
 local owned_splits, launch_waiters = {}, nil
-local launch_generation, launch_process
+local launch_process
 local setup_options, config_waiters, install_mappings
 
 local function remote_session()
@@ -32,6 +32,21 @@ local function intent()
     cancel_resolution = nil
   end
   return id
+end
+local function with_source(id, source, callback)
+  local function captured(error, handle)
+    if alive(id) then
+      callback(handle, error)
+    end
+  end
+  if source or remote_session() or (options or setup_options or {}).attach_only then
+    captured(nil, source)
+    return
+  end
+  local ok, error = pcall(terminal.capture_source, captured)
+  if not ok then
+    captured(tostring(error))
+  end
 end
 local function command(arguments)
   local argv = { options.executable }
@@ -84,32 +99,37 @@ local function configure(callback)
   end
   config_waiters = callback and { callback } or {}
   local executable = setup_options.executable or root .. '/target/release/pdfterm'
-  project.run({ executable, '--print-config', '--session', setup_options.session }, nil, 10000, function(result)
-    if exiting then
-      return
+  project.run(
+    { executable, '--print-config', '--session', setup_options.session },
+    nil,
+    10000,
+    function(result)
+      if exiting then
+        return
+      end
+      local waiters = config_waiters
+      config_waiters = nil
+      local ok, error = pcall(function()
+        assert(result.code == 0, 'configuration: ' .. result.stderr)
+        local config = vim.json.decode(result.stdout)
+        options = vim.tbl_extend('force', config.nvim, setup_options, {
+          executable = setup_options.executable
+            or (config.nvim.executable ~= '' and config.nvim.executable or executable),
+          editor = config.editor,
+          forward_socket = config.forward_socket,
+        })
+        install_mappings()
+      end)
+      if not ok then
+        options = nil
+        notify(error)
+        return
+      end
+      for _, waiter in ipairs(waiters) do
+        waiter()
+      end
     end
-    local waiters = config_waiters
-    config_waiters = nil
-    local ok, error = pcall(function()
-      assert(result.code == 0, 'configuration: ' .. result.stderr)
-      local config = vim.json.decode(result.stdout)
-      options = vim.tbl_extend('force', config.nvim, setup_options, {
-        executable = setup_options.executable
-          or (config.nvim.executable ~= '' and config.nvim.executable or executable),
-        editor = config.editor,
-        forward_socket = config.forward_socket,
-      })
-      install_mappings()
-    end)
-    if not ok then
-      options = nil
-      notify(error)
-      return
-    end
-    for _, waiter in ipairs(waiters) do
-      waiter()
-    end
-  end)
+  )
 end
 
 local function ready(callback, listen)
@@ -148,12 +168,14 @@ local function viewer_command(pdf)
   return table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' ')
 end
 
-local function launch(id, callback)
+local function launch(id, source, source_error, callback)
   if remote_session() or options.attach_only then
-    callback('viewer unavailable; run on this machine in another terminal: ' .. viewer_command(M._launch_pdf))
+    callback(
+      'viewer unavailable; run on this machine in another terminal: '
+        .. viewer_command(M._launch_pdf)
+    )
     return
   end
-  launch_generation = id
   if launch_waiters then
     launch_waiters[#launch_waiters + 1] = callback
     return
@@ -166,17 +188,16 @@ local function launch(id, callback)
       waiter(error)
     end
   end
-  terminal.capture_source(function(error, source)
-    if error then
-      complete(error)
-      return
-    end
-    if not alive(launch_generation) then
-      complete('navigation superseded')
-      return
-    end
-    M._source_terminal = source
-    local ok, process = pcall(terminal.launch_split, source, options.executable, M._launch_pdf, function(result, split)
+  if not source then
+    complete(source_error or 'source terminal unavailable')
+    return
+  end
+  local ok, process = pcall(
+    terminal.launch_split,
+    source,
+    options.executable,
+    M._launch_pdf,
+    function(result, split)
       launch_process = nil
       if split then
         owned_splits[#owned_splits + 1] = split
@@ -185,19 +206,22 @@ local function launch(id, callback)
         if exiting then
           complete('editor stopped')
         else
-          complete(not split and ('terminal split failed: ' .. (result.stderr or 'missing ID')) or nil)
+          complete(
+            not split and ('terminal split failed: ' .. (result.stderr or 'missing ID')) or nil
+          )
         end
       end)
-    end, options.session)
-    if ok then
-      launch_process = process
-    else
-      complete(tostring(process))
-    end
-  end)
+    end,
+    options.session
+  )
+  if ok then
+    launch_process = process
+  else
+    complete(tostring(process))
+  end
 end
 
-local function deliver(pdf, payload, id, source)
+local function deliver(pdf, payload, id, source, source_error)
   assert(initialized, 'pdfterm: call setup() first')
   if not alive(id) then
     return
@@ -206,76 +230,74 @@ local function deliver(pdf, payload, id, source)
     notify('forward_socket is disabled')
     return
   end
-  if source then
-    M._source_terminal = source
-  end
+  M._source_terminal = source
   local launched, attempts = false, 0
   local attempt
   attempt = function()
     if not alive(id) then
       return
     end
-    cancel_forward = socket.request(options.forward_socket, payload, function(error, connection_error)
-      if not alive(id) then
-        return
-      end
-      cancel_forward = nil
-      if not error then
-        if options.focus_on_inverse and not remote_session() and not M._source_terminal then
-          terminal.capture_source(function(capture_error, captured)
+    cancel_forward = socket.request(
+      options.forward_socket,
+      payload,
+      function(error, connection_error)
+        if not alive(id) then
+          return
+        end
+        cancel_forward = nil
+        if not error then
+          if options.focus_on_inverse and not remote_session() and not source then
+            notify(
+              'navigation succeeded; focus unavailable: '
+                .. (source_error or 'source terminal unavailable')
+            )
+          end
+          return
+        end
+        if not connection_error or not (error:match('ENOENT') or error:match('ECONNREFUSED')) then
+          notify(error)
+          return
+        end
+        if not launched then
+          launched = true
+          M._launch_pdf = pdf
+          launch(id, source, source_error, function(launch_error)
             if not alive(id) then
               return
             end
-            if capture_error then
-              notify('navigation succeeded; focus unavailable: ' .. capture_error)
+            if launch_error then
+              notify(launch_error)
             else
-              M._source_terminal = captured
+              attempt()
             end
           end)
-        end
-        return
-      end
-      if not connection_error or not (error:match('ENOENT') or error:match('ECONNREFUSED')) then
-        notify(error)
-        return
-      end
-      if not launched then
-        launched = true
-        M._launch_pdf = pdf
-        launch(id, function(launch_error)
-          if not alive(id) then
-            return
-          end
-          if launch_error then
-            notify(launch_error)
-          else
-            attempt()
-          end
-        end)
-      else
-        attempts = attempts + 1
-        if attempts >= 25 then
-          notify('viewer did not open its forward socket')
         else
-          vim.defer_fn(attempt, 200)
+          attempts = attempts + 1
+          if attempts >= 25 then
+            notify('viewer did not open its forward socket')
+          else
+            vim.defer_fn(attempt, 200)
+          end
         end
       end
-    end)
+    )
   end
   attempt()
 end
 
 function M.forward_search(pdf, payload, source)
   local id = intent()
-  ready(function()
-    if alive(id) then
-      deliver(pdf, payload, id, source)
-    end
-  end, true)
+  with_source(id, source, function(captured, capture_error)
+    ready(function()
+      if alive(id) then
+        deliver(pdf, payload, id, captured, capture_error)
+      end
+    end, true)
+  end)
 end
 
 -- Open a standalone PDF at page one, without TeX or a SyncTeX sidecar.
-local function open_pdf(pdf, id)
+local function open_pdf(pdf, id, source, source_error)
   pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
   ready(function()
     if not alive(id) then
@@ -301,12 +323,16 @@ local function open_pdf(pdf, id)
       width = 0,
       height = 0,
     })
-    deliver(path, payload, id)
+    deliver(path, payload, id, source, source_error)
   end, true)
 end
 
 function M.open(pdf)
-  open_pdf(pdf, intent())
+  local id = intent()
+  pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
+  with_source(id, nil, function(source, source_error)
+    open_pdf(pdf, id, source, source_error)
+  end)
 end
 function M.set_main(file)
   file = file or vim.api.nvim_buf_get_name(0)
@@ -327,7 +353,8 @@ end
 function M.viewer_command(pdf)
   local source = vim.api.nvim_buf_get_name(0)
   ready(function()
-    pdf = pdf and vim.fn.fnamemodify(pdf, ':p') or project.describe(options.project, main_file or source).pdf
+    pdf = pdf and vim.fn.fnamemodify(pdf, ':p')
+      or project.describe(options.project, main_file or source).pdf
     vim.notify(viewer_command(pdf))
   end, true)
 end
@@ -348,47 +375,57 @@ function M.forward()
   local file = vim.api.nvim_buf_get_name(0)
   local column = vim.fn.strchars(vim.api.nvim_get_current_line():sub(1, cursor[2])) + 1
   vim.cmd('write')
-  ready(function()
-    if not alive(id) then
-      return
-    end
-    local p = project.describe(options.project, main_file or file)
-    local function resolve()
+  with_source(id, nil, function(source, source_error)
+    ready(function()
       if not alive(id) then
         return
       end
-      cancel_resolution = project.run(
-        command({ p.pdf, '--synctex-view', file, '--line', tostring(cursor[1]), '--column', tostring(column) }),
-        p.cwd,
-        11000,
-        function(result)
-          if not alive(id) then
-            return
-          end
-          cancel_resolution = nil
-          if result.code ~= 0 then
-            vim.notify(
-              'pdfterm: SyncTeX failed; opening PDF at page 1 without source positioning.\n'
-                .. vim.trim(result.stderr):gsub('^pdfterm:%s*', ''),
-              vim.log.levels.WARN
-            )
-            open_pdf(p.pdf, id)
-            return
-          end
-          deliver(p.pdf, result.stdout, id)
+      local p = project.describe(options.project, main_file or file)
+      local function resolve()
+        if not alive(id) then
+          return
         end
-      )
-    end
-    if options.compile then
-      project.build(p, id, function(result)
-        if result.code == 0 then
-          resolve()
-        end
-      end)
-    else
-      resolve()
-    end
-  end, true)
+        cancel_resolution = project.run(
+          command({
+            p.pdf,
+            '--synctex-view',
+            file,
+            '--line',
+            tostring(cursor[1]),
+            '--column',
+            tostring(column),
+          }),
+          p.cwd,
+          11000,
+          function(result)
+            if not alive(id) then
+              return
+            end
+            cancel_resolution = nil
+            if result.code ~= 0 then
+              vim.notify(
+                'pdfterm: SyncTeX failed; opening PDF at page 1 without source positioning.\n'
+                  .. vim.trim(result.stderr):gsub('^pdfterm:%s*', ''),
+                vim.log.levels.WARN
+              )
+              open_pdf(p.pdf, id, source, source_error)
+              return
+            end
+            deliver(p.pdf, result.stdout, id, source, source_error)
+          end
+        )
+      end
+      if options.compile then
+        project.build(p, id, function(result)
+          if result.code == 0 then
+            resolve()
+          end
+        end)
+      else
+        resolve()
+      end
+    end, true)
+  end)
 end
 
 function M.setup(opts)
@@ -400,7 +437,13 @@ function M.setup(opts)
     or (
       'n'
       .. vim.fn
-        .sha256(tostring(vim.fn.getpid()) .. ':' .. tostring(vim.uv.hrtime()) .. ':' .. tostring(os.time()))
+        .sha256(
+          tostring(vim.fn.getpid())
+            .. ':'
+            .. tostring(vim.uv.hrtime())
+            .. ':'
+            .. tostring(os.time())
+        )
         :sub(1, 12)
     )
   initialized, exiting = true, false
@@ -410,10 +453,11 @@ function M.setup(opts)
     end
   end
   install_mappings = function()
-    local keys = options.keys or {}
+    local keys = (options or setup_options).keys or {}
     map(keys.forward, M.forward, { desc = 'pdfterm forward search' })
     map(keys.main_file, M.set_main, { desc = 'pdfterm set main TeX file' })
     map(keys.compile, M.toggle_compile, { desc = 'pdfterm toggle compilation' })
+    vim.api.nvim_clear_autocmds({ group = 'pdfterm', event = 'FileType' })
     local function build_map(buffer)
       map(keys.build, M.build, { buffer = buffer, desc = 'pdfterm build TeX' })
     end
@@ -431,6 +475,35 @@ function M.setup(opts)
     end
   end
   local group = vim.api.nvim_create_augroup('pdfterm', { clear = true })
+  install_mappings()
+  vim.api.nvim_create_user_command('PdfTermOpen', function(args)
+    M.open(args.args ~= '' and args.args or nil)
+  end, { nargs = '?', complete = 'file' })
+  if setup_options.open_pdf then
+    vim.api.nvim_create_autocmd('BufReadCmd', {
+      group = group,
+      pattern = '*.[pP][dD][fF]',
+      callback = function(event)
+        local pdf = vim.api.nvim_buf_get_name(event.buf)
+        vim.bo[event.buf].buftype = 'nofile'
+        vim.bo[event.buf].modifiable = true
+        vim.bo[event.buf].swapfile = false
+        vim.api.nvim_buf_set_lines(event.buf, 0, -1, false, {
+          'pdfterm',
+          pdf,
+          '',
+          'Press Enter to open or retry.',
+        })
+        vim.bo[event.buf].modified = false
+        vim.bo[event.buf].modifiable = false
+        local function open()
+          M.open(pdf)
+        end
+        vim.keymap.set('n', '<CR>', open, { buffer = event.buf, desc = 'Open PDF with pdfterm' })
+        open()
+      end,
+    })
+  end
   vim.api.nvim_create_user_command('PdfTermForward', M.forward, {})
   vim.api.nvim_create_user_command('PdfTermBuild', M.build, {})
   vim.api.nvim_create_user_command('PdfTermMain', function(args)

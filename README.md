@@ -325,17 +325,54 @@ client is discarded without retaining its pending request.
 Incomplete, malformed, non-finite, unknown-field, and oversized requests are
 rejected. Send the complete request and half-close within 100 ms after connecting.
 
-### Bundled Neovim adapter
+### Neovim plugin (nvim-pdfterm)
 
-Requires Neovim 0.10 or newer. Add the repository's `nvim` directory to its runtime
-path. Select the executable **before** loading configuration:
+Requires Neovim 0.10 or newer. This repository is also a standard Neovim plugin:
+its `lua/pdfterm` modules live at the repository root. It integrates Neovim with
+pdfterm only; it does not configure other viewers or editors.
+
+With [Lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
-require("pdfterm").setup({
-  executable = "/path/to/pdfterm",
-  -- session = "paper",   -- optional explicit pairing; otherwise unique per editor
-  -- attach_only = true, -- optional; never launch a viewer automatically
-})
+{
+  "DavidLapous/pdfterm",
+  name = "nvim-pdfterm",
+  main = "pdfterm",
+  lazy = false, -- register PDF interception before initial buffers are read
+  opts = {
+    executable = "pdfterm", -- install the viewer separately; PATH or absolute path
+    open_pdf = true,        -- optional: opening *.pdf launches/selects pdfterm
+    keys = {
+      forward = "<localleader>pf",
+      build = "<localleader>pb",
+      main_file = "<localleader>pm",
+      compile = "<localleader>pc",
+    },
+    -- session = "paper",   -- optional explicit pairing; otherwise unique per editor
+    -- attach_only = true, -- optional; never launch a viewer automatically
+  },
+}
+```
+
+For a local checkout, replace the repository string with `dir = "/path/to/pdfterm"`.
+With another plugin manager, add the repository root to `runtimepath` and call
+`require("pdfterm").setup(opts)` with the same options. Remove any old runtime-path
+entry pointing at the former `nvim` subdirectory.
+
+`open_pdf` defaults to false. When enabled, the plugin owns PDF buffer interception
+and its Enter-to-retry mapping. Disable competing PDF buffer handlers in your
+configuration. Personal paths and keybindings stay in your plugin specification;
+builds, sessions, navigation, terminal control, and cleanup belong to the plugin.
+
+For an explicit LaTeX command, add `project` inside `opts`:
+
+```lua
+project = {
+  main = "main.tex",
+  cwd = "/project",
+  pdf = "build/main.pdf",
+  build = { "latexmk", "-lualatex", "-synctex=1", "-outdir=build", "main.tex" },
+}
 ```
 
 Without `executable`, the bundled adapter uses `target/release/pdfterm` beside
@@ -345,11 +382,13 @@ listener errors are notifications, not exceptions through the editor's startup.
 The inverse listener opens only on the first navigation or viewer-command action.
 Each editor gets a unique session unless `session` is explicitly supplied.
 
-Forward search first tries the socket, without detecting or controlling a
-terminal. Locally, if unavailable and `attach_only` is false (default), the
-Kitty/Ghostty adapter may launch a matching viewer. Focus control is independently
-opt-in. Plain SSH sessions do not control client windows just because terminal
-identifiers were forwarded.
+Local navigation captures its source terminal at invocation, before asynchronous
+configuration, builds, or resolution can observe another focused window. It then
+tries the viewer socket. A capture failure does not prevent socket-only attachment.
+If no viewer is available and `attach_only` is false, the Kitty/Ghostty backend
+may launch one using that captured identity. Focus control is independently opt-in.
+Plain SSH sessions do not control client windows just because terminal identifiers
+were forwarded.
 
 Local `nvim paper.tex` needs no SSH helper. For the same workflow after typing
 `ssh HOST`, add this once to the **client's** Bash/Zsh interactive startup file:
@@ -382,7 +421,7 @@ pdfterm-ssh HOST paper.tex       # start remote Neovim directly
 pdfterm-ssh -F ./ssh-config HOST # shell using an alternate SSH configuration
 ```
 
-The client needs Python 3.8+, OpenSSH, and Kitty with remote control enabled, or
+The client needs Python 3.11+, OpenSSH, and Kitty with remote control enabled, or
 Ghostty on macOS with AppleScript control available. Run outside tmux and outside
 an existing SSH session. The remote needs Neovim, the pdfterm adapter, the viewer
 binary, and TeX tools; its login shell supplies the editor's `PATH`. SSH host
@@ -427,7 +466,7 @@ If `forward()` cannot resolve a SyncTeX location, it warns and opens the PDF at
 page one without source positioning. This also works when no viewer is running.
 A failed compile-before-forward build still stops navigation rather than opening
 stale output.
-Commands are `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
+Commands are `:PdfTermOpen [pdf]`, `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
 `:PdfTermCompile`. `:PdfTermViewerCommand [pdf]` / `viewer_command(pdf)` print the
 paired viewer invocation. `forward_search(pdf, json_payload)` sends an already-resolved
 request. Builds, configuration, and resolution are asynchronous. Navigation generations start
@@ -443,26 +482,24 @@ at most every 100 ms while compiling. They finish with `Compilation OK` or
 provider supporting notification IDs, such as Snacks, updates the same popup
 instead of appending a separate message on each refresh.
 
-For output directories or a different engine, add a minimal project descriptor
-to `setup()`:
+`project.build` is an argument vector, not a shell command string. It runs in
+`project.cwd` with the same serialized queue, progress reporting, output bound,
+and timeout as the default LaTeX build. Use an explicit shell invocation only when
+shell syntax is required. The configured command must produce `project.pdf` and,
+for source navigation, its SyncTeX sidecar. This plugin currently supports LaTeX;
+Typst and other generators are not implemented.
 
-```lua
-project = {
-  main = "main.tex",
-  cwd = "/project",
-  pdf = "build/main.pdf", -- relative paths resolve against cwd
-  build = { "latexmk", "-lualatex", "-synctex=1", "-outdir=build", "main.tex" },
-}
-```
+Without a project descriptor, the selected/current TeX file, its directory,
+adjacent PDF, and `latexmk -pdf -interaction=nonstopmode -synctex=1` are used.
 
-Without a descriptor, the selected/current TeX file, its directory, adjacent
-PDF, and `latexmk -pdf -interaction=nonstopmode -synctex=1` are used.
-
-No editor keybindings are installed by default. Set your own bindings under
-`[nvim.keys]`: `forward` saves and forward-searches, `build` builds the main TeX
-file in TeX buffers, `main_file` selects the current TeX file as the main document,
-and `compile` toggles compilation before forward search. Empty or omitted keys
-remain unmapped. Mappings appear after background configuration finishes.
+No editor keybindings are installed by default. Set `opts.keys` in your plugin
+specification or `[nvim.keys]` in TOML: `forward` saves and forward-searches,
+`build` builds the main TeX file in TeX buffers, `main_file` selects the current
+TeX file as main, and `compile` toggles compilation before forward search.
+Empty or omitted keys remain unmapped. Explicit Lua keys are available immediately,
+including when the executable or TOML is broken; actions report the failure.
+TOML-only mappings appear after background configuration finishes. `opts.keys`
+replaces the complete TOML key table rather than merging individual bindings.
 Restart Neovim after changing the configuration.
 
 ### Forward-search precision
