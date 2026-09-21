@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Open a remote shell or Neovim with automatic client-side PDF windows."""
 import argparse
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -73,20 +74,59 @@ def applescript(body, *arguments, deadline=None):
                 + '\nend tell\nend run', *arguments], deadline=deadline)
 
 
-class Windows:
-    def __init__(self):
-        if os.environ.get('KITTY_WINDOW_ID'):
-            self.kind, self.source = 'kitty', os.environ['KITTY_WINDOW_ID']
-        elif os.environ.get('TERM_PROGRAM') == 'ghostty' and sys.platform == 'darwin':
-            self.kind = 'ghostty'
-            self.source = applescript('return id of focused terminal of selected tab of front window')
-        else:
-            raise RuntimeError('start pdfterm-ssh in Kitty, or Ghostty on macOS (without tmux)')
+class Terminal(ABC):
+    """Exact-handle terminal operations; the bridge owns sessions and handoff."""
 
+    def __init__(self, source):
+        self.source = source
+
+    @abstractmethod
     def launch(self, argv, deadline=None):
-        if self.kind == 'kitty':
-            return run(['kitten', '@', 'launch', '--type=os-window', '--keep-focus', *argv],
-                       deadline=deadline)
+        """Return the ID of a right-hand split beside the captured source."""
+
+    @abstractmethod
+    def focus(self, identifier, deadline=None):
+        """Focus one exact surface, never whichever surface is currently active."""
+
+    @abstractmethod
+    def existing(self, identifiers, deadline=None):
+        """Return the live subset; query failures must raise."""
+
+    @abstractmethod
+    def close(self, identifier, deadline=None):
+        """Gracefully quit the reader; an already-gone surface is a no-op."""
+
+
+class KittyTerminal(Terminal):
+    def launch(self, argv, deadline=None):
+        run(['kitten', '@', 'goto-layout', '--match', 'window_id:' + self.source, 'splits'],
+            deadline=deadline)
+        return run(['kitten', '@', 'launch', '--match', 'window_id:' + self.source,
+                    '--type=window', '--location=vsplit', '--keep-focus',
+                    '--next-to', 'id:' + self.source, *argv], deadline=deadline)
+
+    def focus(self, identifier, deadline=None):
+        run(['kitten', '@', 'focus-window', '--match', 'id:' + identifier], deadline=deadline)
+
+    def existing(self, identifiers, deadline=None):
+        if not identifiers:
+            return set()
+        listing = json.loads(run(['kitten', '@', 'ls'], deadline=deadline))
+        try:
+            live = {str(window['id']) for surface in listing
+                    for tab in surface['tabs'] for window in tab['windows']}
+        except (KeyError, TypeError) as error:
+            raise RuntimeError('invalid Kitty window listing') from error
+        return set(identifiers) & live
+
+    def close(self, identifier, deadline=None):
+        if self.existing({identifier}, deadline=deadline):
+            run(['kitten', '@', 'send-text', '--match', 'id:' + identifier, '\x03'],
+                deadline=deadline)
+
+
+class GhosttyTerminal(Terminal):
+    def launch(self, argv, deadline=None):
         return applescript('''set cfg to new surface configuration
 set command of cfg to item 1 of argv
 set wait after command of cfg to false
@@ -96,22 +136,11 @@ focus terminal id (item 2 of argv)
 return id of viewer''', shlex.join(argv), self.source, deadline=deadline)
 
     def focus(self, identifier, deadline=None):
-        if self.kind == 'kitty':
-            run(['kitten', '@', 'focus-window', '--match', 'id:' + identifier], deadline=deadline)
-        else:
-            applescript('focus terminal id (item 1 of argv)', identifier, deadline=deadline)
+        applescript('focus terminal id (item 1 of argv)', identifier, deadline=deadline)
 
     def existing(self, identifiers, deadline=None):
         if not identifiers:
             return set()
-        if self.kind == 'kitty':
-            listing = json.loads(run(['kitten', '@', 'ls'], deadline=deadline))
-            try:
-                live = {str(window['id']) for surface in listing
-                        for tab in surface['tabs'] for window in tab['windows']}
-            except (KeyError, TypeError) as error:
-                raise RuntimeError('invalid Kitty window listing') from error
-            return set(identifiers) & live
         result = applescript('''set liveIDs to {}
 repeat with identifier in argv
 if exists terminal id (identifier as text) then set end of liveIDs to identifier as text
@@ -121,20 +150,22 @@ return liveIDs as text''', *sorted(identifiers), deadline=deadline)
         return set(result.splitlines())
 
     def close(self, identifier, deadline=None):
-        if self.kind == 'kitty':
-            windows = json.loads(run(['kitten', '@', 'ls', '--match', 'id:' + identifier],
-                                     deadline=deadline))
-            if windows:
-                run(['kitten', '@', 'send-text', '--match', 'id:' + identifier, '\x03'],
-                    deadline=deadline)
-        else:
-            applescript('''repeat 15 times
+        applescript('''repeat 15 times
 if not (exists terminal id (item 1 of argv)) then return
 send key "c" modifiers "control" to terminal id (item 1 of argv)
 delay 0.1
 end repeat
 if exists terminal id (item 1 of argv) then error "owned viewer did not exit"''', identifier,
-                        deadline=deadline)
+                    deadline=deadline)
+
+
+def capture_terminal():
+    if os.environ.get('KITTY_WINDOW_ID'):
+        return KittyTerminal(os.environ['KITTY_WINDOW_ID'])
+    if os.environ.get('TERM_PROGRAM') == 'ghostty' and sys.platform == 'darwin':
+        return GhosttyTerminal(applescript(
+            'return id of focused terminal of selected tab of front window'))
+    raise RuntimeError('start pdfterm-ssh in Kitty, or Ghostty on macOS (without tmux)')
 
 
 class Bridge:
@@ -307,7 +338,7 @@ def main():
         parser.error('interactive authentication requires a terminal')
     if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY') or os.environ.get('TMUX'):
         parser.error('run this wrapper on the terminal client, outside SSH and tmux')
-    windows = Windows()
+    windows = capture_terminal()
     with tempfile.TemporaryDirectory(prefix='pdfterm-', dir='/tmp') as directory:
         # One private SSH master shares authentication with viewer connections.
         ssh = ['ssh', '-o', 'ConnectTimeout=10',

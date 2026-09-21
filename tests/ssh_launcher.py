@@ -322,7 +322,7 @@ vim.cmd('qa!')
                 patch.object(sys, 'argv', ['pdfterm-ssh', 'test.invalid']), \
                 patch.object(sys.stdin, 'isatty', return_value=True), \
                 patch.object(os, 'tcgetpgrp', return_value=0), \
-                patch.dict(launcher['main'].__globals__, Windows=lambda: self.windows), \
+                patch.dict(launcher['main'].__globals__, capture_terminal=lambda: self.windows), \
                 patch.object(subprocess, 'Popen', side_effect=CaptureMaster) as start:
             with self.assertRaises(CaptureMaster):
                 launcher['main']()

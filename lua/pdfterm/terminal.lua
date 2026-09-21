@@ -1,10 +1,10 @@
 -- Terminal control, not graphics: Kitty and Ghostty both render Kitty protocol.
 -- Handles identify exact surfaces; closing a handle gracefully quits its reader.
-local platform = require 'pdfterm.platform'
-local ghostty_control = require 'pdfterm.ghostty'
+local platform = require('pdfterm.platform')
+local ghostty_control = require('pdfterm.ghostty')
 local M = {}
 local kitty, ghostty = {}, {}
-local adapters = { kitty = kitty, ghostty = ghostty, ssh = require 'pdfterm.ssh' }
+local adapters = { kitty = kitty, ghostty = ghostty, ssh = require('pdfterm.ssh') }
 
 local function remote(arguments, callback)
   local command = { 'kitten', '@' }
@@ -12,8 +12,7 @@ local function remote(arguments, callback)
   return vim.system(command, { text = true, timeout = 3000 }, callback)
 end
 
-
-function kitty.launch(source, executable, pdf, callback, session)
+function kitty.launch(source, argv, callback)
   local arguments = {
     'launch',
     '--match',
@@ -27,11 +26,18 @@ function kitty.launch(source, executable, pdf, callback, session)
     'PATH=' .. vim.env.PATH,
     '--env',
     'XDG_CONFIG_HOME=' .. (vim.env.XDG_CONFIG_HOME or ''),
-    executable,
-    pdf,
   }
-  if session then vim.list_extend(arguments, { '--session', session }) end
-  return remote(arguments, callback)
+  vim.list_extend(arguments, argv)
+  return remote(
+    { 'goto-layout', '--match', 'window_id:' .. source.id, 'splits' },
+    vim.schedule_wrap(function(result)
+      if result.code ~= 0 then
+        callback(result)
+        return
+      end
+      remote(arguments, callback)
+    end)
+  )
 end
 
 function kitty.focus(source, callback)
@@ -39,18 +45,24 @@ function kitty.focus(source, callback)
 end
 
 function kitty.close(split)
-  local found = remote({ 'ls', '--match', 'id:' .. split.id }):wait()
+  local found = remote({ 'ls' }):wait()
   if found.code ~= 0 then
     error('pdfterm: could not locate PDF split: ' .. (found.stderr or ''))
   end
-  if #vim.json.decode(found.stdout) > 0 then
-    local result = remote({ 'send-text', '--match', 'id:' .. split.id, '\003' }):wait()
-    if result.code ~= 0 then
-      error('pdfterm: could not quit owned PDF split: ' .. (result.stderr or ''))
+  for _, os_window in ipairs(vim.json.decode(found.stdout)) do
+    for _, tab in ipairs(os_window.tabs) do
+      for _, window in ipairs(tab.windows) do
+        if tostring(window.id) == split.id then
+          local result = remote({ 'send-text', '--match', 'id:' .. split.id, '\003' }):wait()
+          if result.code ~= 0 then
+            error('pdfterm: could not quit owned PDF split: ' .. (result.stderr or ''))
+          end
+          return
+        end
+      end
     end
   end
 end
-
 
 local split_script = [[
 on run argv
@@ -67,10 +79,13 @@ on run argv
 end run
 ]]
 
-function ghostty.launch(source, executable, pdf, callback, session)
-  local command = vim.fn.shellescape(executable) .. ' ' .. vim.fn.shellescape(pdf)
-  if session then command = command .. ' --session ' .. vim.fn.shellescape(session) end
-  return platform.applescript(split_script, { command, source.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' }, callback)
+function ghostty.launch(source, argv, callback)
+  local command = table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' ')
+  return platform.applescript(
+    split_script,
+    { command, source.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' },
+    callback
+  )
 end
 
 function ghostty.focus(source, callback)
@@ -104,34 +119,75 @@ end
 local function adapter(handle)
   local result = adapters[handle.kind]
   if not result or type(handle.id) ~= 'string' or handle.id == '' then
-    error 'pdfterm: invalid terminal handle'
+    error('pdfterm: invalid terminal handle')
   end
   return result
 end
 
+function kitty.capture(callback)
+  callback(nil, vim.env.KITTY_WINDOW_ID)
+end
+
+function ghostty.capture(callback)
+  return ghostty_control.request(
+    'capture',
+    nil,
+    vim.schedule_wrap(function(result)
+      callback(result.code ~= 0 and result.stderr or nil, vim.trim(result.stdout or ''))
+    end)
+  )
+end
+
+-- A backend implements the entire contract; session/argv/handle policy stays here.
+for name, backend in pairs(adapters) do
+  for _, action in ipairs({ 'capture', 'launch', 'focus', 'close' }) do
+    assert(type(backend[action]) == 'function', name .. ' terminal lacks ' .. action)
+  end
+end
+
 function M.capture_source(callback)
-  if (vim.env.PDFTERM_LAUNCH_SOCKET or '') ~= '' then
-    callback(nil, { kind = 'ssh', id = 'source' })
+  local kind = (vim.env.PDFTERM_LAUNCH_SOCKET or '') ~= '' and 'ssh'
+    or vim.env.KITTY_WINDOW_ID and 'kitty'
+    or vim.env.TERM_PROGRAM == 'ghostty' and 'ghostty'
+  if not kind then
+    callback('terminal launch/focus requires Kitty or Ghostty')
     return
   end
-  local kind = vim.env.KITTY_WINDOW_ID and 'kitty' or vim.env.TERM_PROGRAM == 'ghostty' and 'ghostty'
-  if not kind then callback('terminal launch/focus requires Kitty or Ghostty'); return end
-  if kind == 'kitty' then callback(nil, { kind = kind, id = vim.env.KITTY_WINDOW_ID }); return end
-  local ok, error = pcall(ghostty_control.request, 'capture', nil, vim.schedule_wrap(function(result)
-      local id = vim.trim(result.stdout or '')
-      if result.code ~= 0 or id == '' then callback('could not identify source Ghostty terminal: ' .. (result.stderr or ''))
-      else callback(nil, { kind = kind, id = id }) end
-    end))
-  if not ok then callback(tostring(error)) end
+  local ok, error = pcall(adapters[kind].capture, function(problem, id)
+    if problem or not id or id == '' then
+      callback(problem or ('could not identify source ' .. kind .. ' terminal'))
+    else
+      callback(nil, { kind = kind, id = id })
+    end
+  end)
+  if not ok then
+    callback(tostring(error))
+  end
 end
 
 -- Callback runs before scheduling editor work so VimLeavePre can retain ownership
 -- even when it is waiting for an in-flight launch to finish.
 function M.launch_split(source, executable, pdf, callback, session)
-  return adapter(source).launch(source, executable, pdf, function(result)
+  local argv = { executable, pdf }
+  if session then
+    vim.list_extend(argv, { '--session', session })
+  end
+  local done, reply = false, nil
+  adapter(source).launch(source, argv, function(result)
+    done, reply = true, result
     local id = vim.trim(result.stdout)
     callback(result, result.code == 0 and id ~= '' and { kind = source.kind, id = id } or nil)
-  end, session)
+  end)
+  return {
+    wait = function(_, timeout)
+      if not vim.wait(timeout or 6500, function()
+        return done
+      end, 10) then
+        error('pdfterm: terminal launch timed out')
+      end
+      return reply
+    end,
+  }
 end
 
 function M.focus(source, callback)

@@ -28,11 +28,11 @@ local function request(payload, callback)
   }
 end
 
-function M.launch(_, executable, pdf, callback, session)
-  local argv = { executable, pdf }
-  if session then
-    vim.list_extend(argv, { '--session', session })
-  end
+function M.capture(callback)
+  callback(nil, 'source')
+end
+
+function M.launch(_, argv, callback)
   return request(
     { action = 'launch', argv = argv, path = vim.env.PATH, config_home = vim.env.XDG_CONFIG_HOME },
     callback
