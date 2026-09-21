@@ -401,7 +401,7 @@ setup_keys = function(opts)
 		end
 		if main_tex_file == nil then
 			vim.notify(
-				"Could not determine TeX filename. Use <leader>csl to set main file manually.",
+				"Could not determine TeX filename. Select a TeX buffer and use the configured nvim.keys.main_file binding.",
 				vim.log.levels.INFO
 			)
 			return

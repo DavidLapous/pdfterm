@@ -321,6 +321,18 @@ client is discarded without retaining its pending request.
 Incomplete, malformed, non-finite, unknown-field, and oversized requests are
 rejected. Send the complete request and half-close within 100 ms after connecting.
 
+### Bundled Neovim adapter
+
+Add the repository's `nvim` directory to Neovim's runtime path and call
+`require("pdfterm").setup()`. The adapter reads the shared configuration through
+`pdfterm --print-config`.
+
+No editor keybindings are installed by default. Set your own bindings under
+`[nvim.keys]`: `forward` saves and forward-searches, `build` builds the main TeX
+file in TeX buffers, `main_file` selects the current TeX file as the main document,
+and `compile` toggles compilation before forward search. Empty or omitted keys
+remain unmapped. Restart Neovim after changing the configuration.
+
 ### Inverse-search precision
 
 `Alt`/`Option`-click resolves the clicked location with `synctex edit`, then

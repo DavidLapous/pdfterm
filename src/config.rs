@@ -245,24 +245,13 @@ pub struct NvimSettings {
     pub keys: NvimKeys,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NvimKeys {
     pub forward: String,
     pub build: String,
     pub main_file: String,
     pub compile: String,
-}
-
-impl Default for NvimKeys {
-    fn default() -> Self {
-        Self {
-            forward: "<leader>cl".into(),
-            build: "<leader>cb".into(),
-            main_file: "<leader>csl".into(),
-            compile: "<leader>cscl".into(),
-        }
-    }
 }
 
 #[cfg(test)]

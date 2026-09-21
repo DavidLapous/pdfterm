@@ -43,7 +43,8 @@ focus_on_inverse = false           # Opt in to focusing the source terminal afte
 executable = ""                    # Empty: target/release/pdfterm beside bundled plugin; or absolute path
 
 [nvim.keys]
-forward = "<leader>cl"              # Save and forward-search (optionally compile)
-build = "<leader>cb"                # Build main TeX file (TeX buffers only)
-main_file = "<leader>csl"           # Use current TeX file as main document
-compile = "<leader>cscl"            # Toggle compilation before forward search
+# Empty keys disable mappings. Choose bindings in your local config.
+forward = ""                       # Save and forward-search (optionally compile)
+build = ""                         # Build main TeX file (TeX buffers only)
+main_file = ""                     # Use current TeX file as main document
+compile = ""                       # Toggle compilation before forward search
