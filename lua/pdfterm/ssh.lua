@@ -4,14 +4,20 @@ local M = {}
 
 local function request(payload, callback)
   local done, result = false, nil
-  local cancel = socket.request(vim.env.PDFTERM_LAUNCH_SOCKET, vim.json.encode(payload), function(error, _, reply)
-    result = { code = error and 1 or 0, stdout = reply and reply.id or '', stderr = error or '' }
-    done = true
-    callback(result)
-  end, 3000)
+  local cancel = socket.request(
+    vim.env.PDFTERM_LAUNCH_SOCKET,
+    vim.json.encode(payload),
+    function(error, _, reply)
+      result = { code = error and 1 or 0, stdout = reply and reply.id or '', stderr = error or '' }
+      done = true
+      callback(result)
+    end,
+    6000,
+    payload.action == 'launch'
+  )
   return {
     wait = function(_, timeout)
-      if not vim.wait(timeout or 3500, function()
+      if not vim.wait(timeout or 6500, function()
         return done
       end, 10) then
         cancel()

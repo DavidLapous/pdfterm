@@ -1,7 +1,7 @@
 -- Socket transport does not require terminal/window control.
 local M = {}
 
-function M.request(path, payload, callback, timeout)
+function M.request(path, payload, callback, timeout, acknowledge)
   local pipe = assert(vim.uv.new_pipe(false))
   local timer = assert(vim.uv.new_timer())
   local chunks, size, done = {}, 0, false
@@ -12,12 +12,57 @@ function M.request(path, payload, callback, timeout)
     done = true
     timer:stop()
     timer:close()
-    if not pipe:is_closing() then
+    if (error or not acknowledge) and not pipe:is_closing() then
       pipe:close()
     end
     vim.schedule(function()
-      callback(error, connection_error, reply)
+      if error or not acknowledge then
+        callback(error, connection_error, reply)
+        return
+      end
+      -- The callback records the handle before the bridge releases provisional
+      -- ownership. Callback failure or editor exit without a receipt rolls back.
+      local ok, failure = xpcall(function()
+        callback(error, connection_error, reply)
+      end, debug.traceback)
+      if not ok then
+        if not pipe:is_closing() then
+          pipe:close()
+        end
+        assert(ok, failure)
+      end
+      if acknowledge and not error then
+        local function receipt_done(write_error)
+          if not pipe:is_closing() then
+            pipe:close()
+          end
+          if write_error then
+            vim.schedule(function()
+              vim.notify(
+                'pdfterm: launch ownership receipt failed: ' .. write_error,
+                vim.log.levels.ERROR
+              )
+            end)
+          end
+        end
+        local sent, write_error = pipe:write('\006', receipt_done)
+        if not sent then
+          receipt_done(write_error)
+        end
+      end
     end)
+  end
+  local function response(data)
+    local ok, reply = pcall(vim.json.decode, data)
+    if not ok or type(reply) ~= 'table' or reply.ok ~= true then
+      finish(
+        ok and type(reply) == 'table' and reply.error or 'socket request rejected or invalid reply'
+      )
+    elseif acknowledge and (type(reply.id) ~= 'string' or reply.id == '') then
+      finish('launch reply has no window ID')
+    else
+      finish(nil, nil, reply)
+    end
   end
   timer:start(timeout or 31000, 0, function()
     finish('socket connection/reply timed out')
@@ -42,17 +87,18 @@ function M.request(path, payload, callback, timeout)
           finish('socket reply exceeds 4096 bytes')
         else
           chunks[#chunks + 1] = chunk
+          if acknowledge then
+            local line = table.concat(chunks):match('^(.-)\n')
+            if line then
+              response(line)
+            end
+          end
         end
       else
-        local ok, reply = pcall(vim.json.decode, table.concat(chunks))
-        if not ok or type(reply) ~= 'table' or reply.ok ~= true then
-          finish(ok and type(reply) == 'table' and reply.error or 'socket request rejected or invalid reply')
-        else
-          finish(nil, nil, reply)
-        end
+        response(table.concat(chunks))
       end
     end)
-    pipe:write(payload, function(write_error)
+    pipe:write(payload .. (acknowledge and '\n' or ''), function(write_error)
       if done then
         return
       end
@@ -60,11 +106,13 @@ function M.request(path, payload, callback, timeout)
         finish(write_error)
         return
       end
-      pipe:shutdown(function(shutdown_error)
-        if shutdown_error then
-          finish(shutdown_error)
-        end
-      end)
+      if not acknowledge then
+        pipe:shutdown(function(shutdown_error)
+          if shutdown_error then
+            finish(shutdown_error)
+          end
+        end)
+      end
     end)
   end)
   return function()
@@ -101,7 +149,9 @@ function M.diagnose(path, callback)
     if not error then
       finish('a live editor owns this session; choose a different session')
     elseif error:match('ECONNREFUSED') then
-      finish('stale socket (connection refused); remove it only after stopping editors using this session')
+      finish(
+        'stale socket (connection refused); remove it only after stopping editors using this session'
+      )
     else
       finish('listener probe failed: ' .. error .. '; endpoint left untouched')
     end

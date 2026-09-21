@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Open a remote shell or Neovim with automatic client-side PDF windows."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -31,12 +32,16 @@ def kill_group(child):
         child.wait(timeout=2)
 
 
-def run(argv, timeout=2):
+def run(argv, timeout=2, deadline=None):
+    now = time.monotonic()
+    deadline = min(now + timeout, deadline) if deadline is not None else now + timeout
+    if deadline <= now:
+        raise subprocess.TimeoutExpired(argv, 0)
     # Finite helpers own a process group. Interactive authentication is separate.
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          start_new_session=True) as child:
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True) as child:
         chunks = {child.stdout: bytearray(), child.stderr: bytearray()}
-        deadline, size = time.monotonic() + timeout, 0
+        size = 0
         try:
             with selectors.DefaultSelector() as pending:
                 for stream in chunks:
@@ -63,9 +68,9 @@ def run(argv, timeout=2):
             kill_group(child)
 
 
-def applescript(body, *arguments):
+def applescript(body, *arguments, deadline=None):
     return run(['osascript', '-e', 'on run argv\ntell application "Ghostty"\n' + body
-                + '\nend tell\nend run', *arguments])
+                + '\nend tell\nend run', *arguments], deadline=deadline)
 
 
 class Windows:
@@ -78,28 +83,29 @@ class Windows:
         else:
             raise RuntimeError('start pdfterm-ssh in Kitty, or Ghostty on macOS (without tmux)')
 
-    def launch(self, argv):
+    def launch(self, argv, deadline=None):
         if self.kind == 'kitty':
-            return run(['kitten', '@', 'launch', '--type=os-window', '--keep-focus', *argv])
+            return run(['kitten', '@', 'launch', '--type=os-window', '--keep-focus', *argv],
+                       deadline=deadline)
         return applescript('''set cfg to new surface configuration
 set command of cfg to item 1 of argv
 set wait after command of cfg to false
 set sourceTerminal to terminal id (item 2 of argv)
 set viewer to split sourceTerminal direction right with configuration cfg
 focus terminal id (item 2 of argv)
-return id of viewer''', shlex.join(argv), self.source)
+return id of viewer''', shlex.join(argv), self.source, deadline=deadline)
 
-    def focus(self, identifier):
+    def focus(self, identifier, deadline=None):
         if self.kind == 'kitty':
-            run(['kitten', '@', 'focus-window', '--match', 'id:' + identifier])
+            run(['kitten', '@', 'focus-window', '--match', 'id:' + identifier], deadline=deadline)
         else:
-            applescript('focus terminal id (item 1 of argv)', identifier)
+            applescript('focus terminal id (item 1 of argv)', identifier, deadline=deadline)
 
-    def existing(self, identifiers):
+    def existing(self, identifiers, deadline=None):
         if not identifiers:
             return set()
         if self.kind == 'kitty':
-            listing = json.loads(run(['kitten', '@', 'ls']))
+            listing = json.loads(run(['kitten', '@', 'ls'], deadline=deadline))
             try:
                 live = {str(window['id']) for surface in listing
                         for tab in surface['tabs'] for window in tab['windows']}
@@ -111,21 +117,24 @@ repeat with identifier in argv
 if exists terminal id (identifier as text) then set end of liveIDs to identifier as text
 end repeat
 set AppleScript's text item delimiters to linefeed
-return liveIDs as text''', *sorted(identifiers))
+return liveIDs as text''', *sorted(identifiers), deadline=deadline)
         return set(result.splitlines())
 
-    def close(self, identifier):
+    def close(self, identifier, deadline=None):
         if self.kind == 'kitty':
-            windows = json.loads(run(['kitten', '@', 'ls', '--match', 'id:' + identifier]))
+            windows = json.loads(run(['kitten', '@', 'ls', '--match', 'id:' + identifier],
+                                     deadline=deadline))
             if windows:
-                run(['kitten', '@', 'send-text', '--match', 'id:' + identifier, '\x03'])
+                run(['kitten', '@', 'send-text', '--match', 'id:' + identifier, '\x03'],
+                    deadline=deadline)
         else:
             applescript('''repeat 15 times
 if not (exists terminal id (item 1 of argv)) then return
 send key "c" modifiers "control" to terminal id (item 1 of argv)
 delay 0.1
 end repeat
-if exists terminal id (item 1 of argv) then error "owned viewer did not exit"''', identifier)
+if exists terminal id (item 1 of argv) then error "owned viewer did not exit"''', identifier,
+                        deadline=deadline)
 
 
 class Bridge:
@@ -133,6 +142,9 @@ class Bridge:
         self.ssh, self.windows, self.owned = ssh, windows, set()
         self.retired = set()  # Ownership receipts: late closes are no-ops, never terminal actions.
         self.stop = threading.Event()
+        self.control = threading.Lock()
+        self.slots = threading.BoundedSemaphore(4)
+        self.workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix='pdfterm-launch')
         self.listener = socket.socket(socket.AF_UNIX)
         self.listener.bind(path)
         os.chmod(path, 0o600)
@@ -141,7 +153,7 @@ class Bridge:
         self.thread = threading.Thread(target=self.serve)
         self.thread.start()
 
-    def dispatch(self, request):
+    def dispatch(self, request, deadline):
         if not isinstance(request, dict):
             raise ValueError('expected an object')
         action = request.get('action')
@@ -150,7 +162,7 @@ class Bridge:
             if (not isinstance(argv, list) or not 2 <= len(argv) <= 8
                     or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in argv)):
                 raise ValueError('invalid viewer argv')
-            live = self.windows.existing(self.owned)
+            live = self.windows.existing(self.owned, deadline=deadline)
             self.retired.update(self.owned - live)
             self.owned = live
             if len(self.owned) >= 16:
@@ -164,7 +176,8 @@ class Bridge:
                     env.append(key + '=' + value)
             # Everything supplied by the remote runs THERE, never in the client shell.
             command = shlex.join(['env', *env, *argv])
-            identifier = self.windows.launch(self.ssh[:-1] + ['-tt', self.ssh[-1], command])
+            identifier = self.windows.launch(self.ssh[:-1] + ['-tt', self.ssh[-1], command],
+                                             deadline=deadline)
             if not identifier:
                 raise RuntimeError('terminal launcher returned no window ID')
             self.owned.add(identifier)
@@ -174,11 +187,11 @@ class Bridge:
         if not isinstance(identifier, str):
             raise ValueError('invalid window ID')
         if action == 'focus' and identifier == 'source':
-            self.windows.focus(self.windows.source)
+            self.windows.focus(self.windows.source, deadline=deadline)
         elif identifier in self.owned and action == 'focus':
-            self.windows.focus(identifier)
+            self.windows.focus(identifier, deadline=deadline)
         elif identifier in self.owned and action == 'close':
-            self.windows.close(identifier)
+            self.windows.close(identifier, deadline=deadline)
             self.owned.remove(identifier)
             self.retired.add(identifier)
         elif identifier in self.retired and action == 'close':
@@ -193,30 +206,82 @@ class Bridge:
                 client, _ = self.listener.accept()
             except socket.timeout:
                 continue
+            if not self.slots.acquire(blocking=False):
+                client.close()
+                continue
+            # Accept promptly: the budget includes waiting for terminal control.
+            future = self.workers.submit(self.serve_client, client, time.monotonic() + 5)
+            future.add_done_callback(lambda job: job.result())  # Surface unexpected worker failures.
+
+    def serve_client(self, client, deadline):
+        provisional = None
+        locked = False
+        try:
             with client:
                 try:
-                    deadline = time.monotonic() + 1
+                    read_deadline = min(deadline, time.monotonic() + 1)
                     data = bytearray()
                     while True:
-                        client.settimeout(max(0.001, deadline - time.monotonic()))
+                        client.settimeout(max(0.001, read_deadline - time.monotonic()))
                         chunk = client.recv(4096)
                         if not chunk:
                             break
                         data.extend(chunk)
-                        if len(data) > 32768 or time.monotonic() >= deadline:
+                        if len(data) > 32768 or time.monotonic() >= read_deadline:
                             raise ValueError('launcher request exceeds size/time limit')
-                    reply = self.dispatch(json.loads(data))
+                        if b'\n' in data:
+                            break
+                    request = json.loads(data)
+                    locked = self.control.acquire(timeout=max(0, deadline - time.monotonic()))
+                    if not locked or self.stop.is_set() or time.monotonic() >= deadline:
+                        raise TimeoutError('launcher queue/operation deadline exceeded')
+                    launching = isinstance(request, dict) and request.get('action') == 'launch'
+                    if launching:
+                        if not data.endswith(b'\n'):
+                            raise ValueError('launch requires a framed request and ownership receipt')
+                        # Launch peers keep their write side open for the receipt.
+                        client.setblocking(False)
+                        try:
+                            if client.recv(1, socket.MSG_PEEK) == b'':
+                                raise ConnectionError('launch client disconnected')
+                        except BlockingIOError:
+                            pass
+                    reply = self.dispatch(request, deadline)
+                    if launching:
+                        provisional = reply['id']
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('launcher queue/operation deadline exceeded')
+                    client.settimeout(min(0.5, deadline - time.monotonic()))
+                    client.sendall(json.dumps(reply).encode() + b'\n')
+                    if provisional:
+                        client.settimeout(min(0.5, max(0.001, deadline - time.monotonic())))
+                        if client.recv(1) != b'\x06':
+                            raise ConnectionError('launch ownership was not acknowledged')
+                        provisional = None
                 except (ValueError, RecursionError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-                    reply = {'ok': False, 'error': str(error)[:2000]}
+                    try:
+                        client.settimeout(0.1)
+                        client.sendall(json.dumps({'ok': False, 'error': str(error)[:2000]}).encode() + b'\n')
+                    except OSError:
+                        print(f'pdfterm-ssh: launcher request: {error}', file=sys.stderr)
+        finally:
+            if provisional:
                 try:
-                    client.settimeout(0.1)
-                    client.sendall(json.dumps(reply).encode())
-                except OSError as error:
-                    print(f'pdfterm-ssh: launcher reply: {error}', file=sys.stderr)
+                    # Rollback has a separate bounded cleanup budget. Keep bridge
+                    # ownership if cleanup fails, so shell exit can try again.
+                    self.windows.close(provisional, deadline=time.monotonic() + 2)
+                    self.owned.remove(provisional)
+                    self.retired.add(provisional)
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    print(f'pdfterm-ssh: unclaimed viewer cleanup: {error}', file=sys.stderr)
+            if locked:
+                self.control.release()
+            self.slots.release()
 
     def close(self):
         self.stop.set()
         self.thread.join()
+        self.workers.shutdown(wait=True)
         self.listener.close()
         failures = []
         for identifier in list(self.owned):

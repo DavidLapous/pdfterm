@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -28,7 +29,7 @@ class Windows:
         self.serial = 0
         self.query_fail = False
 
-    def launch(self, argv):
+    def launch(self, argv, deadline=None):
         if self.fail:
             raise RuntimeError('terminal control unavailable')
         self.serial += 1
@@ -36,16 +37,16 @@ class Windows:
         self.live.add(identifier)
         return identifier
 
-    def focus(self, identifier):
+    def focus(self, identifier, deadline=None):
         if identifier != self.source and identifier not in self.live:
             raise RuntimeError('window is gone')
 
-    def existing(self, identifiers):
+    def existing(self, identifiers, deadline=None):
         if self.query_fail:
             raise RuntimeError('liveness query failed')
         return self.live & identifiers
 
-    def close(self, identifier):
+    def close(self, identifier, deadline=None):
         self.live.discard(identifier)
 
 
@@ -60,19 +61,156 @@ class LauncherTests(unittest.TestCase):
 
     def request(self, payload):
         with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(3)
+            client.settimeout(6)
             client.connect(self.path)
-            client.sendall(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
-            try:
-                client.shutdown(socket.SHUT_WR)
-            except OSError as error:
-                # An early rejection may close before the client's half-close.
-                if error.errno != errno.ENOTCONN:
-                    raise
-            chunks = []
+            launching = isinstance(payload, dict) and payload.get('action') == 'launch'
+            client.sendall(payload if isinstance(payload, bytes)
+                           else json.dumps(payload).encode() + (b'\n' if launching else b''))
+            if not launching:
+                try:
+                    client.shutdown(socket.SHUT_WR)
+                except OSError as error:
+                    # An early rejection may close before the client's half-close.
+                    if error.errno != errno.ENOTCONN:
+                        raise
+            chunks = bytearray()
             while chunk := client.recv(4096):
-                chunks.append(chunk)
-            return json.loads(b''.join(chunks))
+                chunks.extend(chunk)
+                if b'\n' in chunks:
+                    break
+            reply = json.loads(chunks)
+            if launching and reply['ok']:
+                client.sendall(b'\x06')
+            return reply
+
+    def nvim(self, code):
+        script = Path(self.directory.name) / 'client.lua'
+        root = str(Path(launcher['__file__']).resolve().parent.parent)
+        script.write_text('vim.opt.runtimepath:prepend(' + json.dumps(root) + ')\n' + code)
+        result = subprocess.run(
+            ['nvim', '--headless', '-u', 'NONE', '-l', str(script)],
+            env={**os.environ, 'PDFTERM_LAUNCH_SOCKET': self.path},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, '', result.stderr)
+
+    def test_slow_launch_transfers_ownership_to_real_lua_client(self):
+        existing, launch = self.windows.existing, self.windows.launch
+
+        def slow_existing(identifiers, deadline=None):
+            time.sleep(1.7)
+            return existing(identifiers, deadline)
+
+        def slow_launch(argv, deadline=None):
+            time.sleep(1.7)
+            return launch(argv, deadline)
+
+        with patch.object(self.windows, 'existing', slow_existing), \
+                patch.object(self.windows, 'launch', slow_launch):
+            self.nvim("""
+local terminal = require('pdfterm.terminal')
+local owned
+local process = terminal.launch_split({ kind = 'ssh', id = 'source' }, 'pdfterm', 'paper.pdf',
+  function(result, split)
+    assert(result.code == 0, result.stderr)
+    owned = assert(split)
+  end)
+assert(process:wait().code == 0)
+assert(owned, 'successful launch did not transfer ownership')
+terminal.close(owned)
+vim.cmd('qa!')
+""")
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+
+    def test_editor_exit_waits_for_pending_launch_then_closes_viewer(self):
+        root = Path(launcher['__file__']).resolve().parent.parent
+        binary = os.environ.get('PDFTERM_EXECUTABLE', str(root / 'target/debug/pdfterm'))
+        pdf = Path(self.directory.name) / 'paper.pdf'
+        pdf.write_text('%PDF-1.7\n')
+        launch = self.windows.launch
+
+        def slow_launch(argv, deadline=None):
+            time.sleep(1)
+            return launch(argv, deadline)
+
+        with patch.object(self.windows, 'launch', slow_launch):
+            self.nvim(f"""
+vim.env.XDG_CONFIG_HOME = {json.dumps(self.directory.name)}
+local adapter = require('pdfterm')
+adapter.setup({{ executable = {json.dumps(binary)} }})
+local terminal = require('pdfterm.terminal')
+local launch = terminal.launch_split
+terminal.launch_split = function(...)
+  local process = launch(...)
+  vim.defer_fn(function() vim.cmd('qa!') end, 50)
+  return process
+end
+adapter.open({json.dumps(str(pdf))})
+vim.wait(7000, function() return false end, 5)
+error('editor did not exit during launch')
+""")
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+        self.assertFalse(self.bridge.owned)
+
+    def test_unacknowledged_launch_rolls_back_while_bridge_stays_alive(self):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(2)
+            client.connect(self.path)
+            client.sendall(b'{"action":"launch","argv":["viewer","paper.pdf"]}\n')
+            reply = json.loads(client.recv(4096))
+            self.assertTrue(reply['ok'])
+            self.assertIn(reply['id'], self.windows.live)
+            # No ownership receipt: a received reply alone cannot commit a launch.
+        self.assertTrue(self.request({'action': 'focus', 'id': 'source'})['ok'])
+        self.assertNotIn(reply['id'], self.windows.live)
+        self.assertNotIn(reply['id'], self.bridge.owned)
+        self.assertTrue(self.bridge.thread.is_alive())
+
+    def test_lua_timeout_during_launch_rolls_back_without_retry(self):
+        launch = self.windows.launch
+        finished = threading.Event()
+
+        def delayed_launch(argv, deadline=None):
+            time.sleep(0.2)
+            result = launch(argv, deadline)
+            finished.set()
+            return result
+
+        with patch.object(self.windows, 'launch', delayed_launch):
+            self.nvim("""
+local count, result = 0, nil
+require('pdfterm.socket').request(vim.env.PDFTERM_LAUNCH_SOCKET,
+  vim.json.encode({ action = 'launch', argv = { 'viewer', 'paper.pdf' } }),
+  function(error, _, reply)
+    count = count + 1
+    assert(error and error:find('timed out'), tostring(error))
+    assert(not reply)
+    result = true
+  end, 50, true)
+assert(vim.wait(1000, function() return result end, 5))
+vim.wait(300, function() return false end, 5)
+assert(count == 1)
+vim.cmd('qa!')
+""")
+            self.assertTrue(finished.wait(1))
+        self.assertTrue(self.request({'action': 'focus', 'id': 'source'})['ok'])
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+        self.assertFalse(self.bridge.owned)
+
+    def test_queued_launch_expires_before_terminal_effects(self):
+        self.bridge.control.acquire()
+        try:
+            start = time.monotonic()
+            reply = self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})
+            self.assertFalse(reply['ok'])
+            self.assertIn('deadline', reply['error'])
+            self.assertLess(time.monotonic() - start, 6)
+            self.assertEqual(self.windows.serial, 0)
+        finally:
+            self.bridge.control.release()
 
     def test_malformed_requests_do_not_kill_listener_or_control_unowned_windows(self):
         for payload in (b'{', [], {'action': 'close', 'id': []}, {'action': 'close', 'id': 'editor'},
@@ -105,6 +243,21 @@ class LauncherTests(unittest.TestCase):
             launcher['run']([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.03)
         with self.assertRaisesRegex(RuntimeError, '1 MiB'):
             launcher['run']([sys.executable, '-c', 'import os; os.write(1, b\"x\" * 1100000)'])
+
+
+    def test_finite_helper_does_not_inherit_terminal_input(self):
+        master, slave = pty.openpty()
+        try:
+            probe = 'import os; print(os.isatty(0), repr(os.read(0, 1)))'
+            code = ('import runpy, sys; '
+                    f'run = runpy.run_path({launcher["__file__"]!r})["run"]; '
+                    f'print(run([sys.executable, "-c", {probe!r}]))')
+            result = subprocess.run([sys.executable, '-c', code], stdin=slave,
+                                    capture_output=True, text=True, timeout=4, check=True)
+            self.assertEqual(result.stdout.strip(), "False b''")
+        finally:
+            os.close(master)
+            os.close(slave)
 
     def test_external_exits_do_not_exhaust_limit_and_late_close_is_owned(self):
         retired = []

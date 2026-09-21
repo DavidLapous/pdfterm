@@ -524,7 +524,7 @@ function M.setup(opts)
         close_listener()
       end
       if launch_process then
-        local ok, error = pcall(launch_process.wait, launch_process, 3500)
+        local ok, error = pcall(launch_process.wait, launch_process, 6500)
         if not ok then
           notify('waiting for terminal launch: ' .. tostring(error))
         end

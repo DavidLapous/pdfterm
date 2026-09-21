@@ -455,6 +455,8 @@ and creates a private reverse Unix-socket tunnel. The shell exports the bridge
 address so subsequently launched Neovim instances inherit it.
 The private SSH master shares the interactive session's foreground process group
 and does not request extra confirmation for each multiplexed forwarding request.
+Finite control/bootstrap helpers use null stdin; they never pass the terminal's
+input descriptor to the background master.
 On first forward search, the adapter asks the client helper to open a viewer
 running **SSH back to the same host**, with the same PDF, session, `PATH`, and
 configuration directory. Ghostty splits the original source terminal to the right,
@@ -466,8 +468,14 @@ Inverse-focus, if enabled, returns to the original client source terminal.
 The helper lives for that SSH connection, across successive editor sessions.
 Exiting Neovim closes its viewers but leaves the remote shell usable. Shell exit, hangup, and
 termination close its owned viewer windows and SSH master; cleanup errors are
-reported. SIGKILL or a client crash cannot guarantee cleanup. Requests and helper
-output are bounded. The SSH server must permit reverse Unix-socket forwarding;
+reported. SIGKILL or a client crash cannot guarantee cleanup. At most four control
+requests are admitted at once, each with a five-second queue/operation budget;
+Neovim allows six seconds for transport and reply. A launched viewer remains
+provisional until Neovim records its handle and acknowledges ownership. A missing
+receipt closes that viewer rather than leaving it for shell shutdown. Cleanup
+failure is reported and the bridge retains ownership. Update the client wrapper
+and remote adapter together, then restart the SSH session.
+Requests and helper output are bounded. The SSH server must permit reverse Unix-socket forwarding;
 refusal fails explicitly. There is no persistent daemon, TCP listener, or
 automatic change to SSH configuration. `attach_only = true` still forbids launch.
 
