@@ -84,8 +84,8 @@ class Windows:
         return applescript('''set cfg to new surface configuration
 set command of cfg to item 1 of argv
 set wait after command of cfg to false
-set viewerWindow to new window with configuration cfg
-set viewer to focused terminal of selected tab of viewerWindow
+set sourceTerminal to terminal id (item 2 of argv)
+set viewer to split sourceTerminal direction right with configuration cfg
 focus terminal id (item 2 of argv)
 return id of viewer''', shlex.join(argv), self.source)
 

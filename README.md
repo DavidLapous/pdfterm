@@ -430,12 +430,13 @@ aliases, users, ports, and proxies come from the SSH configuration.
 The wrapper opens a remote login shell (or Neovim when arguments follow the host)
 and creates a private reverse Unix-socket tunnel. The shell exports the bridge
 address so subsequently launched Neovim instances inherit it.
-On first forward search, the adapter asks the client helper to open a new terminal
-window running **SSH back to the same host**, with the same PDF, session, `PATH`,
-and configuration directory. The PDF, SyncTeX data, and editor/viewer sockets stay
-remote; Kitty graphics travel over the viewer's SSH connection. Existing viewers
-still attach without opening another window. Inverse-focus, if enabled, returns
-to the original client editor window.
+On first forward search, the adapter asks the client helper to open a viewer
+running **SSH back to the same host**, with the same PDF, session, `PATH`, and
+configuration directory. Ghostty splits the original source terminal to the right,
+within the same tab and OS window; Kitty opens a new OS window. The PDF, SyncTeX data,
+and editor/viewer sockets stay remote; Kitty graphics travel over the viewer's SSH
+connection. Existing viewers attach without creating another terminal surface.
+Inverse-focus, if enabled, returns to the original client source terminal.
 
 The helper lives for that SSH connection, across successive editor sessions.
 Exiting Neovim closes its viewers but leaves the remote shell usable. Shell exit, hangup, and
