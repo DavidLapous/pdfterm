@@ -246,7 +246,8 @@ filtering; the selected entry stays visible and `Enter` jumps to it.
 ## Editor-neutral SyncTeX
 
 `src/synctex.rs` owns source/PDF resolution; `src/editor.rs` delivers a typed
-source location through a command or socket. Inverse search is opt-in:
+source location through a command or socket. Socket delivery is enabled by default
+for the Neovim plugin. To use another editor, replace the `[editor]` section:
 
 ```toml
 [editor]
@@ -265,7 +266,7 @@ Nonzero exit status is an error. Placeholders: `{file}` is an absolute source pa
 one-based Unicode scalar, `{byte_column}` is zero-based UTF-8, and
 `{column_byte}` is one-based UTF-8. Unknown placeholders are rejected.
 
-For a custom editor adapter:
+The default socket configuration also supports custom editor adapters:
 
 ```toml
 [editor]
@@ -331,6 +332,18 @@ Requires Neovim 0.10 or newer. This repository is also a standard Neovim plugin:
 its `lua/pdfterm` modules live at the repository root. It integrates Neovim with
 pdfterm only; it does not configure other viewers or editors.
 
+With the repository on `runtimepath`, `require("pdfterm").setup()` needs no
+arguments for bidirectional SyncTeX. Open a compiled TeX document and run
+`:PdfTermForward`; Option/Alt-click the PDF to jump back and focus its source
+terminal. This works locally and through the SSH bridge described below.
+The PDF needs a matching `.synctex.gz` sidecar and `synctex` must be on `PATH`.
+Keybindings and automatic compilation remain optional.
+
+Existing configuration files are never overwritten. If upgrading from the old
+clipboard-only defaults, set `[editor]` to `transport = "socket"` and
+`path = "editor.sock"`, and set `[nvim] focus_on_inverse = true`.
+Restart both Neovim and the viewer after editing the configuration.
+
 With [Lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
@@ -386,7 +399,8 @@ Local navigation captures its source terminal at invocation, before asynchronous
 configuration, builds, or resolution can observe another focused window. It then
 tries the viewer socket. A capture failure does not prevent socket-only attachment.
 If no viewer is available and `attach_only` is false, the Kitty/Ghostty backend
-may launch one using that captured identity. Focus control is independently opt-in.
+may launch one using that captured identity. Inverse focus is enabled by default;
+set `focus_on_inverse = false` to keep focus in the viewer.
 Plain SSH sessions do not control client windows just because terminal identifiers
 were forwarded.
 

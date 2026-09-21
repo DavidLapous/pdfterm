@@ -15,11 +15,11 @@ synctex_enabled = true              # Enable Option/Alt-click PDF-to-source jump
 forward_socket = "forward.sock"    # Empty disables source-to-PDF requests
 
 [editor]
-transport = "none"                 # none (clipboard only), command, or socket
-# For command transport, uncomment argv; no shell expansion is performed.
+transport = "socket"               # socket (Neovim default), command, or none (clipboard only)
+path = "editor.sock"               # Relative to private run/ directory
+# For command transport, remove path and uncomment argv; no shell expansion is performed.
 # argv = ["code", "--reuse-window", "--goto", "{file}:{line}:{column}"]
-# For socket transport (including the Neovim adapter), uncomment path.
-# path = "editor.sock"             # Relative to private run/ directory
+# For clipboard-only mode, use transport = "none" and remove path.
 # {line}: 1-based; {column}: 1-based UTF-16; {column_char}: 1-based Unicode scalar
 # {byte_column}: 0-based UTF-8; {column_byte}: 1-based UTF-8; {file}: absolute path
 
@@ -40,7 +40,7 @@ source_context_lines = 4           # Source radius outside Beamer frames, 0–10
 [nvim]
 compile = false                    # Run latexmk before forward search
 attach_only = false                # true: require an existing viewer; never launch a terminal
-focus_on_inverse = false           # Opt in to focusing the source terminal after inverse search
+focus_on_inverse = true            # Focus the source terminal after inverse search when available
 executable = ""                    # Runtime override; setup({executable=...}) selects the asynchronous config loader
 
 [nvim.keys]

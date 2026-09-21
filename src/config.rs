@@ -233,7 +233,9 @@ impl Default for Config {
             link_picker_split_percent: None,
             link_picker_layout: LinkPickerLayout::Auto,
             synctex_enabled: None,
-            editor: crate::editor::Editor::default(),
+            editor: crate::editor::Editor::Socket {
+                path: "editor.sock".into(),
+            },
             forward_socket: Some("forward.sock".into()),
             viewer: ViewerSettings::default(),
             nvim: NvimSettings::default(),
@@ -277,7 +279,7 @@ impl Default for ViewerSettings {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NvimSettings {
     pub compile: bool,
@@ -285,6 +287,18 @@ pub struct NvimSettings {
     pub executable: String,
     pub attach_only: bool,
     pub keys: NvimKeys,
+}
+
+impl Default for NvimSettings {
+    fn default() -> Self {
+        Self {
+            compile: false,
+            focus_on_inverse: true,
+            executable: String::new(),
+            attach_only: false,
+            keys: NvimKeys::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
