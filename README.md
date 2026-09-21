@@ -334,7 +334,7 @@ path. Select the executable **before** loading configuration:
 require("pdfterm").setup({
   executable = "/path/to/pdfterm",
   -- session = "paper",   -- optional explicit pairing; otherwise unique per editor
-  -- attach_only = true, -- optional locally; SSH never launches local terminals
+  -- attach_only = true, -- optional; never launch a viewer automatically
 })
 ```
 
@@ -351,12 +351,35 @@ Kitty/Ghostty adapter may launch a matching viewer. Focus control is independent
 opt-in. Plain SSH sessions do not control client windows just because terminal
 identifiers were forwarded.
 
-For automatic windows over SSH, start the editor from the **terminal client**:
+Local `nvim paper.tex` needs no SSH helper. For the same workflow after typing
+`ssh HOST`, add this once to the **client's** Bash/Zsh interactive startup file:
 
 ```sh
-./scripts/pdfterm-ssh HOST paper.tex
-# Optional alternate OpenSSH configuration; editor arguments follow HOST:
-./scripts/pdfterm-ssh -F ./ssh-config HOST -u init.lua paper.tex
+export PATH="/path/to/pdfterm/scripts:$PATH"
+export PDFTERM_SSH_HOSTS="workstation other-host"
+source /path/to/pdfterm/scripts/pdfterm-shell.sh
+```
+
+Then use ordinary commands:
+
+```sh
+ssh workstation
+cd project
+nvim paper.tex
+```
+
+The hook intercepts only a bare `ssh HOST` for an explicitly listed alias, in an
+interactive terminal outside SSH/tmux. Commands such as `ssh HOST command`,
+`ssh -N HOST`, and `ssh -F config HOST` go unchanged to OpenSSH. `scp`, `sftp`,
+and Git's SSH subprocesses are unaffected. Use `command ssh HOST` to bypass the
+hook. Nothing edits your shell or SSH configuration automatically.
+
+The launcher can also be used directly:
+
+```sh
+pdfterm-ssh HOST                 # normal remote login shell
+pdfterm-ssh HOST paper.tex       # start remote Neovim directly
+pdfterm-ssh -F ./ssh-config HOST # shell using an alternate SSH configuration
 ```
 
 The client needs Python 3.8+, OpenSSH, and Kitty with remote control enabled, or
@@ -365,7 +388,9 @@ an existing SSH session. The remote needs Neovim, the pdfterm adapter, the viewe
 binary, and TeX tools; its login shell supplies the editor's `PATH`. SSH host
 aliases, users, ports, and proxies come from the SSH configuration.
 
-The wrapper runs remote Neovim and creates a private reverse Unix-socket tunnel.
+The wrapper opens a remote login shell (or Neovim when arguments follow the host)
+and creates a private reverse Unix-socket tunnel. The shell exports the bridge
+address so subsequently launched Neovim instances inherit it.
 On first forward search, the adapter asks the client helper to open a new terminal
 window running **SSH back to the same host**, with the same PDF, session, `PATH`,
 and configuration directory. The PDF, SyncTeX data, and editor/viewer sockets stay
@@ -373,7 +398,8 @@ remote; Kitty graphics travel over the viewer's SSH connection. Existing viewers
 still attach without opening another window. Inverse-focus, if enabled, returns
 to the original client editor window.
 
-The helper lives only for that editor connection. Normal exit, hangup, and
+The helper lives for that SSH connection, across successive editor sessions.
+Exiting Neovim closes its viewers but leaves the remote shell usable. Shell exit, hangup, and
 termination close its owned viewer windows and SSH master; cleanup errors are
 reported. SIGKILL or a client crash cannot guarantee cleanup. Requests and helper
 output are bounded. The SSH server must permit reverse Unix-socket forwarding;

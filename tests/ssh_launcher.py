@@ -1,7 +1,11 @@
 """Headless regressions for the local launcher's ownership and bounded protocol."""
 import json
+import os
+import pty
 from pathlib import Path
 import runpy
+import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -84,6 +88,53 @@ class LauncherTests(unittest.TestCase):
             launcher['run']([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.03)
         with self.assertRaisesRegex(RuntimeError, '1 MiB'):
             launcher['run']([sys.executable, '-c', 'import os; os.write(1, b\"x\" * 1100000)'])
+
+
+class ShellHookTests(unittest.TestCase):
+    def test_only_selected_bare_interactive_connections_use_launcher(self):
+        hook = Path(__file__).resolve().parents[1] / 'scripts/pdfterm-shell.sh'
+        for shell in ('bash', 'zsh'):
+            executable = shutil.which(shell)
+            if executable is None:
+                self.skipTest(f'{shell} is not installed')
+            with self.subTest(shell=shell), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ('ssh', 'pdfterm-ssh'):
+                    program = root / name
+                    program.write_text(f'#!{sys.executable}\n'
+                                       'import json, os, sys\n'
+                                       'with open(os.environ["CALLS"], "a") as f:\n'
+                                       '    f.write(json.dumps(sys.argv) + "\\n")\n')
+                    program.chmod(0o700)
+                env = dict(os.environ, PATH=directory + ':' + os.environ['PATH'],
+                           CALLS=str(root / 'calls'), PDFTERM_SSH_HOSTS='enabled another')
+                for key in ('SSH_CONNECTION', 'SSH_TTY', 'TMUX'):
+                    env.pop(key, None)
+                flags = ['--noprofile', '--norc'] if shell == 'bash' else ['-f']
+                commands = ('ssh enabled; ssh other; ssh enabled true; ssh -N enabled; '
+                            'ssh -F config enabled; command ssh enabled; '
+                            'SSH_CONNECTION=remote ssh enabled')
+                master, slave = pty.openpty()
+                try:
+                    subprocess.run([executable, *flags, '-ic',
+                                    '. ' + shlex.quote(str(hook)) + '; ' + commands],
+                                   env=env, stdin=slave, stdout=slave, stderr=slave,
+                                   check=True, timeout=5)
+                finally:
+                    os.close(slave)
+                    os.close(master)
+                calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
+                self.assertEqual([Path(call[0]).name for call in calls],
+                                 ['pdfterm-ssh'] + ['ssh'] * 6)
+                self.assertEqual([call[1:] for call in calls],
+                                 [['enabled'], ['other'], ['enabled', 'true'],
+                                  ['-N', 'enabled'], ['-F', 'config', 'enabled'],
+                                  ['enabled'], ['enabled']])
+                subprocess.run([executable, *flags, '-c',
+                                '. ' + shlex.quote(str(hook)) + '; ssh enabled'],
+                               env=env, check=True, timeout=5)
+                last = json.loads((root / 'calls').read_text().splitlines()[-1])
+                self.assertEqual(Path(last[0]).name, 'ssh')
 
 
 if __name__ == '__main__':
