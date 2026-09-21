@@ -282,8 +282,11 @@ per connection, terminated by EOF:
 ```
 
 `precise = false` means SyncTeX supplied only a line; all columns point to its
-start. This transport does not expect a reply. Clipboard delivery remains
-`file:line:byte-column` independently of the editor transport.
+start. This transport does not expect a reply. After successful editor delivery,
+the viewer also copies `file:line:byte-column` to the clipboard. With
+`transport = "none"`, only the clipboard copy is performed. Editor-delivery
+failures are reported without copying; the default socket transport requires a
+listening editor.
 
 Any editor can forward-search an already-running viewer:
 
