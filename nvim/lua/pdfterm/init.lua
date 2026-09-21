@@ -273,6 +273,38 @@ function M.forward_search(pdf, payload, source)
     end
   end, true)
 end
+
+-- Open a standalone PDF at page one, without TeX or a SyncTeX sidecar.
+function M.open(pdf)
+  local id = intent()
+  pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
+  ready(function()
+    if not alive(id) then
+      return
+    end
+    local path = assert(vim.uv.fs_realpath(pdf))
+    local stat = assert(vim.uv.fs_stat(path))
+    assert(stat.type == 'file', 'PDF is not a regular file')
+    local payload = vim.json.encode({
+      pdf = path,
+      revision = {
+        device = stat.dev,
+        inode = stat.ino,
+        length = stat.size,
+        modified_seconds = stat.mtime.sec,
+        modified_nanoseconds = stat.mtime.nsec,
+        changed_seconds = stat.ctime.sec,
+        changed_nanoseconds = stat.ctime.nsec,
+      },
+      page = 1,
+      h = 0,
+      v = 0,
+      width = 0,
+      height = 0,
+    })
+    deliver(path, payload, id)
+  end, true)
+end
 function M.set_main(file)
   file = file or vim.api.nvim_buf_get_name(0)
   intent()

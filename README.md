@@ -420,8 +420,10 @@ directly. Activate this command **before** inverse-clicking a separately started
 viewer; no forward search is required. The local terminal must support Kitty
 graphics over SSH. This manual mode needs no client helper or socket forwarding.
 
-Public actions are `forward()`, `build()`, `set_main(file)`, and `toggle_compile()`;
-commands are `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
+Public actions are `open(pdf)`, `forward()`, `build()`, `set_main(file)`, and `toggle_compile()`.
+`open(pdf)` opens or selects a PDF at page one using the same local/SSH session;
+it needs neither TeX sources nor a SyncTeX sidecar.
+Commands are `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
 `:PdfTermCompile`. `:PdfTermViewerCommand [pdf]` / `viewer_command(pdf)` print the
 paired viewer invocation. `forward_search(pdf, json_payload)` sends an already-resolved
 request. Builds, configuration, and resolution are asynchronous. Navigation generations start

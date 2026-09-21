@@ -67,14 +67,11 @@ local ok, failure = xpcall(function()
   )
   local binary = assert(vim.env.PDFTERM_EXECUTABLE, 'set PDFTERM_EXECUTABLE to a built viewer')
   local wrapper = directory .. '/selected-viewer'
-  vim.fn.writefile(
-    {
-      '#!/bin/sh',
-      'echo selected >> ' .. vim.fn.shellescape(directory .. '/bootstrap.log'),
-      'exec ' .. vim.fn.shellescape(binary) .. ' "$@"',
-    },
-    wrapper
-  )
+  vim.fn.writefile({
+    '#!/bin/sh',
+    'echo selected >> ' .. vim.fn.shellescape(directory .. '/bootstrap.log'),
+    'exec ' .. vim.fn.shellescape(binary) .. ' "$@"',
+  }, wrapper)
   assert(vim.uv.fs_chmod(wrapper, 448))
   local source = directory .. '/navigation.tex'
   vim.fn.writefile(vim.fn.readfile(root .. '/tests/fixtures/navigation.tex'), source)
@@ -156,6 +153,17 @@ local ok, failure = xpcall(function()
   local expected = vim.json.decode(resolved.stdout)
   assert(requests[1].v == expected.v and requests[1].h == expected.h, 'latest forward intent lost')
   assert(#vim.fn.readfile(directory .. '/bootstrap.log') == 2, 'obsolete build reached resolution')
+  -- Opening an existing PDF must not invoke TeX/SyncTeX, even with compile enabled.
+  assert(vim.uv.fs_unlink(directory .. '/artifacts/navigation.synctex.gz'))
+  local linked_pdf = directory .. '/linked PDF.PDF'
+  assert(vim.uv.fs_symlink(pdf, linked_pdf))
+  adapter.open(linked_pdf)
+  wait(function()
+    return #requests == 2
+  end)
+  assert(requests[2].pdf == vim.uv.fs_realpath(pdf) and requests[2].page == 1)
+  assert(vim.deep_equal(requests[2].revision, expected.revision), 'PDF revision differs from native metadata')
+  assert(not vim.uv.fs_stat(directory .. '/artifacts/navigation.synctex.gz'), 'opening PDF unexpectedly rebuilt TeX')
   local inverse = assert(vim.uv.new_pipe(false))
   inverse:connect(config.editor.path, function(error)
     assert(not error, error)
