@@ -124,6 +124,10 @@ local ok, failure = xpcall(function()
   vim.fn.writefile({
     '#!/bin/sh',
     'echo selected >> ' .. vim.fn.shellescape(directory .. '/bootstrap.log'),
+    'if test -f ' .. vim.fn.shellescape(directory .. '/hold-resolution') .. '; then',
+    '  touch ' .. vim.fn.shellescape(directory .. '/resolution-started'),
+    '  while test -f ' .. vim.fn.shellescape(directory .. '/hold-resolution') .. '; do sleep .01; done',
+    'fi',
     'exec ' .. vim.fn.shellescape(binary) .. ' "$@"',
   }, wrapper)
   assert(vim.uv.fs_chmod(wrapper, 448))
@@ -145,7 +149,8 @@ local ok, failure = xpcall(function()
       build = {
         '/bin/sh',
         '-c',
-        'sleep .05; exec pdflatex -interaction=nonstopmode -halt-on-error -synctex=1 -output-directory=artifacts navigation.tex',
+        'if test -f fail-build; then echo "deliberate build failure" >&2; exit 1; fi; '
+          .. 'sleep .05; exec pdflatex -interaction=nonstopmode -halt-on-error -synctex=1 -output-directory=artifacts navigation.tex',
       },
     },
   })
@@ -218,6 +223,54 @@ local ok, failure = xpcall(function()
   assert(requests[2].pdf == vim.uv.fs_realpath(pdf) and requests[2].page == 1)
   assert(vim.deep_equal(requests[2].revision, expected.revision), 'PDF revision differs from native metadata')
   assert(not vim.uv.fs_stat(directory .. '/artifacts/navigation.synctex.gz'), 'opening PDF unexpectedly rebuilt TeX')
+  -- A missing SyncTeX sidecar must not prevent opening the existing PDF.
+  adapter.toggle_compile()
+  local navigation_notices = {}
+  vim.notify = function(message, level)
+    assert(not vim.in_fast_event(), 'navigation warning emitted from process callback')
+    navigation_notices[#navigation_notices + 1] = { message = message, level = level }
+  end
+  adapter.forward()
+  wait(function()
+    return #requests == 3
+  end)
+  assert(requests[3].pdf == vim.uv.fs_realpath(pdf) and requests[3].page == 1)
+  assert(#navigation_notices == 1 and navigation_notices[1].level == vim.log.levels.WARN)
+  -- Superseding an in-flight resolution must suppress its warning and fallback.
+  navigation_notices = {}
+  vim.fn.writefile({}, directory .. '/hold-resolution')
+  adapter.forward()
+  wait(function()
+    return vim.fn.filereadable(directory .. '/resolution-started') == 1
+  end)
+  adapter.open(linked_pdf)
+  wait(function()
+    return #requests == 4
+  end)
+  vim.wait(150, function()
+    return false
+  end, 10)
+  assert(#requests == 4 and #navigation_notices == 0, 'superseded resolution still opened or warned')
+  assert(vim.uv.fs_unlink(directory .. '/hold-resolution'))
+
+  -- Build failure is not a SyncTeX failure: do not open an old PDF.
+  adapter.toggle_compile()
+  navigation_notices = {}
+  vim.fn.writefile({}, directory .. '/fail-build')
+  adapter.forward()
+  wait(function()
+    for _, notice in ipairs(navigation_notices) do
+      if notice.level == vim.log.levels.ERROR then
+        return true
+      end
+    end
+    return false
+  end)
+  vim.wait(150, function()
+    return false
+  end, 10)
+  assert(#requests == 4, 'failed build opened stale output')
+  vim.notify = original_notify
   local inverse = assert(vim.uv.new_pipe(false))
   inverse:connect(config.editor.path, function(error)
     assert(not error, error)

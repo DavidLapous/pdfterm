@@ -423,6 +423,10 @@ graphics over SSH. This manual mode needs no client helper or socket forwarding.
 Public actions are `open(pdf)`, `forward()`, `build()`, `set_main(file)`, and `toggle_compile()`.
 `open(pdf)` opens or selects a PDF at page one using the same local/SSH session;
 it needs neither TeX sources nor a SyncTeX sidecar.
+If `forward()` cannot resolve a SyncTeX location, it warns and opens the PDF at
+page one without source positioning. This also works when no viewer is running.
+A failed compile-before-forward build still stops navigation rather than opening
+stale output.
 Commands are `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
 `:PdfTermCompile`. `:PdfTermViewerCommand [pdf]` / `viewer_command(pdf)` print the
 paired viewer invocation. `forward_search(pdf, json_payload)` sends an already-resolved
@@ -431,7 +435,8 @@ at invocation; stale completions cannot navigate. Builds sharing a canonical
 working directory or an output PDF run serially, retaining only the newest
 pending build.
 Builds time out after 120 seconds; captured build/resolution output is capped
-at 1 MiB. Failures are reported rather than launching with stale coordinates.
+at 1 MiB. Resolution failures are reported and open without source positioning;
+build failures stop navigation. Neither path reuses stale coordinates.
 Build notifications show the last five output lines (at most 2,000 bytes), updating
 at most every 100 ms while compiling. They finish with `Compilation OK` or
 `Compilation failed`, retaining the log tail for five seconds. A notification
@@ -459,6 +464,14 @@ file in TeX buffers, `main_file` selects the current TeX file as the main docume
 and `compile` toggles compilation before forward search. Empty or omitted keys
 remain unmapped. Mappings appear after background configuration finishes.
 Restart Neovim after changing the configuration.
+
+### Forward-search precision
+
+Forward search currently uses the first complete SyncTeX result. For Beamer
+overlays (`\pause`, `\only`, `\uncover`, `\visible`), this may select a page where
+the target is hidden. Collected frame bodies can also make SyncTeX return a
+neighboring frame rather than the target frame. Correct overlay selection is
+not guaranteed; always selecting the last result would not fix `\only`.
 
 ### Inverse-search precision
 

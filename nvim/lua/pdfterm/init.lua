@@ -275,8 +275,7 @@ function M.forward_search(pdf, payload, source)
 end
 
 -- Open a standalone PDF at page one, without TeX or a SyncTeX sidecar.
-function M.open(pdf)
-  local id = intent()
+local function open_pdf(pdf, id)
   pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
   ready(function()
     if not alive(id) then
@@ -304,6 +303,10 @@ function M.open(pdf)
     })
     deliver(path, payload, id)
   end, true)
+end
+
+function M.open(pdf)
+  open_pdf(pdf, intent())
 end
 function M.set_main(file)
   file = file or vim.api.nvim_buf_get_name(0)
@@ -364,7 +367,12 @@ function M.forward()
           end
           cancel_resolution = nil
           if result.code ~= 0 then
-            notify(result.stderr)
+            vim.notify(
+              'pdfterm: SyncTeX failed; opening PDF at page 1 without source positioning.\n'
+                .. vim.trim(result.stderr):gsub('^pdfterm:%s*', ''),
+              vim.log.levels.WARN
+            )
+            open_pdf(p.pdf, id)
             return
           end
           deliver(p.pdf, result.stdout, id)
