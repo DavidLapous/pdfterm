@@ -8,6 +8,9 @@ end
 local case = vim.env.PDFTERM_SESSION_CASE
 if case then
   local directory = assert(vim.env.XDG_CONFIG_HOME)
+  if case == 'defaults' then
+    vim.opt.runtimepath:prepend(directory .. '/plugin')
+  end
   if case == 'make_stale' then
     local config = vim.json.decode(
       vim.system({ binary, '--session', 'shared', '--print-config' }, { text = true }):wait().stdout
@@ -94,7 +97,7 @@ if case then
   timer:start(1, 5, function()
     ticks = ticks + 1
   end)
-  local pdf = directory .. "/a document's.pdf"
+  local pdf = directory .. '/a document\'s.pdf'
   adapter.viewer_command(pdf)
   wait(function()
     return #messages > 0
@@ -150,6 +153,13 @@ if case then
 end
 
 local directory = assert(vim.uv.fs_mkdtemp(root .. '/.sessions-XXXXXX'))
+-- Exercise the real zero-options default without requiring a release build in
+-- the checkout. Only this disposable plugin root supplies the selected binary.
+vim.fn.mkdir(directory .. '/plugin/target/release', 'p')
+assert(vim.uv.fs_symlink(root .. '/lua', directory .. '/plugin/lua', { dir = true }))
+assert(
+  vim.uv.fs_symlink(vim.fn.fnamemodify(binary, ':p'), directory .. '/plugin/target/release/pdfterm')
+)
 vim.fn.writefile(
   { '#!/bin/sh', 'sleep .2', 'exec ' .. vim.fn.shellescape(binary) .. ' "$@"' },
   directory .. '/slow-viewer'
