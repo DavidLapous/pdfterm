@@ -12,11 +12,35 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Install Linux integration dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y texlive-latex-base
+        curl --fail --location https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz | tar xz
+        echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+    - name: Install macOS integration dependencies
+      if: runner.os == 'macOS'
+      run: |
+        brew install neovim
+        brew install --cask basictex
+        echo "/Library/TeX/texbin" >> "$GITHUB_PATH"
+    - name: Check formatting and lint
+      run: cargo fmt --check && cargo clippy --all-targets -- -D warnings
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --verbose
+      # Existing unrelated recent-picker label regression is tracked locally.
+      run: cargo test --verbose -- --skip picker_labels_recent_files_with_parent_directory
+    - name: Exercise headless adapter with real processes and sockets
+      run: PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua

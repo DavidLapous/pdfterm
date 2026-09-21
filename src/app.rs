@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo};
 use crossterm::event::{
@@ -28,13 +27,19 @@ use thiserror::Error;
 use crate::browser::{BrowserEntry, BrowserEntrySource, BrowserState};
 use crate::config::{Config, LinkPickerLayout, ViewerSettings};
 use crate::kitty::{self, Placement};
+use crate::navigation::{
+    Coordinator, ForwardStage, InverseStage, InverseTask, PendingFlash, PendingForward,
+    PendingInverse,
+};
 use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
     RenderKey, RenderRequest, RenderWorker, SearchPageMatch, WorkerMessage,
 };
-use crate::synctex::{ForwardRequest, PdfRevision, parse_forward_request};
+use crate::synctex::{ForwardRequest, PdfRevision};
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
+mod session;
+use session::{FileFingerprint, FileWatcher, PendingOpen, Session, Tab};
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
@@ -157,20 +162,16 @@ pub fn run(
                     document_id,
                     page,
                     request_id,
-                    pdf_x,
-                    pdf_y,
-                    page_height_pt,
-                    text,
+                    revision,
+                    result,
                 } => {
                     app.receive_page_point(
                         SynctexClick {
                             document_id,
                             page,
                             request_id,
-                            pdf_x,
-                            pdf_y,
-                            page_height_pt,
-                            text,
+                            revision,
+                            result,
                         },
                         &mut output,
                     )?;
@@ -230,6 +231,7 @@ pub fn run(
         app.poll_search_preview(&mut output)?;
         app.poll_forward_socket(&mut output)?;
         app.poll_pending_forward(&mut output)?;
+        app.poll_inverse_search(&mut output)?;
         app.poll_flash_expiry()?;
         app.poll_smooth_scroll(&mut output)?;
 
@@ -273,10 +275,7 @@ impl LinkPickerGeometry {
 
 struct App {
     worker: RenderWorker,
-    pending_open: Option<PendingOpen>,
-    tabs: Vec<Tab>,
-    active_tab: usize,
-    next_document_id: DocumentId,
+    session: Session,
     generation: u64,
     desired_key: Option<RenderKey>,
     pending: HashSet<RenderKey>,
@@ -298,14 +297,11 @@ struct App {
     next_search_request_id: u64,
     next_link_request_id: u64,
     link_mode: bool,
-    next_synctex_request_id: u64,
-    pending_synctex: Option<PendingSynctex>,
+    navigation: Coordinator,
     synctex_enabled: bool,
     editor: crate::editor::Editor,
     forward_socket: Option<String>,
-    forward_listener: Option<crate::ipc::Listener>,
-    pending_flash: Option<PendingFlash>,
-    pending_forward: Option<PendingForward>,
+    forward_listener: Option<crate::ipc::ForwardListener>,
     pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
     persistent_link_picker: bool,
@@ -367,29 +363,6 @@ impl From<&Config> for AppDefaults {
             theme_index,
         }
     }
-}
-
-struct Tab {
-    document_id: DocumentId,
-    path: PathBuf,
-    revision: PdfRevision,
-    watcher: FileWatcher,
-    page_count: u32,
-    page: u32,
-    fit: FitMode,
-    zoom: u16,
-    invert: bool,
-    dark_mode_style: DarkModeStyle,
-    search_highlight: [u8; 3],
-    link_highlight: [u8; 3],
-    scroll_x: u32,
-    scroll_y: u32,
-    outline: Arc<Vec<OutlineItem>>,
-    cache: HashMap<RenderKey, Arc<Frame>>,
-    search: SearchState,
-    link_history: Vec<ViewPosition>,
-    pending_destination: Option<LinkDestination>,
-    link_index: LinkIndexState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -732,31 +705,6 @@ enum Axis {
     Horizontal,
 }
 
-impl Tab {
-    fn render_key(
-        &self,
-        viewport: Viewport,
-        link_mode: bool,
-        selected_link_ordinal: Option<u32>,
-    ) -> RenderKey {
-        RenderKey {
-            document_id: self.document_id,
-            page: self.page,
-            width: viewport.pixel_width,
-            height: viewport.pixel_height,
-            zoom: self.zoom,
-            fit: self.fit,
-            invert: self.invert,
-            dark_mode_style: self.dark_mode_style,
-            search_request_id: self.search.highlight_request_id(self.page),
-            search_highlight: self.search_highlight,
-            link_mode,
-            link_highlight: self.link_highlight,
-            selected_link_ordinal,
-        }
-    }
-}
-
 fn terminal_color_rgb(color: crossterm::style::Color) -> [u8; 3] {
     match color {
         crossterm::style::Color::Rgb { r, g, b } => [r, g, b],
@@ -792,46 +740,12 @@ fn render_timing_status(
     format!("render {total_ms}ms")
 }
 
-struct PendingFlash {
-    document_id: DocumentId,
-    page: u32,
-    /// Y-down center of the flash box in points; consumed when its frame arrives.
-    center_pt: Option<f32>,
-    expires_at: Option<Instant>,
-}
-
-struct PendingForward {
-    request: ForwardRequest,
-    reply: crate::editor::ForwardReply,
-    deadline: Instant,
-    started: bool,
-}
-
-struct PendingSynctex {
-    document_id: DocumentId,
-    page: u32,
-    request_id: u64,
-}
-
 struct SynctexClick {
     document_id: DocumentId,
     page: u32,
     request_id: u64,
-    pdf_x: f32,
-    pdf_y: f32,
-    page_height_pt: f32,
-    text: Result<Option<(String, usize)>, String>,
-}
-
-enum PendingOpen {
-    Reload {
-        document_id: DocumentId,
-        fingerprint: FileFingerprint,
-    },
-    Selection {
-        document_id: DocumentId,
-        path: PathBuf,
-    },
+    revision: crate::synctex::DocumentRevision,
+    result: Result<crate::pdf::ResolvedClick, String>,
 }
 
 impl App {
@@ -849,31 +763,33 @@ impl App {
         let default_invert = defaults.invert;
         Self {
             worker,
-            pending_open: None,
-            tabs: vec![Tab {
-                document_id: INITIAL_DOCUMENT_ID,
-                path,
-                revision,
-                watcher,
-                page_count,
-                page,
-                fit: default_fit,
-                zoom: ZOOM_DEFAULT,
-                invert: default_invert,
-                dark_mode_style: defaults.dark_mode_style,
-                search_highlight: defaults.search_highlight,
-                link_highlight: defaults.link_highlight,
-                scroll_x: 0,
-                scroll_y: 0,
-                outline: Arc::new(outline),
-                cache: HashMap::new(),
-                search: SearchState::default(),
-                link_history: Vec::new(),
-                pending_destination: None,
-                link_index: LinkIndexState::new(page_count),
-            }],
-            active_tab: 0,
-            next_document_id: INITIAL_DOCUMENT_ID + 1,
+            session: Session {
+                pending_open: None,
+                tabs: vec![Tab {
+                    document_id: INITIAL_DOCUMENT_ID,
+                    path,
+                    revision,
+                    watcher,
+                    page_count,
+                    page,
+                    fit: default_fit,
+                    zoom: ZOOM_DEFAULT,
+                    invert: default_invert,
+                    dark_mode_style: defaults.dark_mode_style,
+                    search_highlight: defaults.search_highlight,
+                    link_highlight: defaults.link_highlight,
+                    scroll_x: 0,
+                    scroll_y: 0,
+                    outline: Arc::new(outline),
+                    cache: HashMap::new(),
+                    search: SearchState::default(),
+                    link_history: Vec::new(),
+                    pending_destination: None,
+                    link_index: LinkIndexState::new(page_count),
+                }],
+                active_tab: 0,
+                next_document_id: INITIAL_DOCUMENT_ID + 1,
+            },
             generation: 0,
             desired_key: None,
             pending: HashSet::new(),
@@ -894,14 +810,11 @@ impl App {
             next_search_request_id: 1,
             next_link_request_id: 1,
             link_mode: false,
-            next_synctex_request_id: 1,
-            pending_synctex: None,
+            navigation: Coordinator::new(),
             synctex_enabled: defaults.synctex_enabled,
             editor: defaults.editor,
             forward_socket: defaults.forward_socket,
             forward_listener: None,
-            pending_flash: None,
-            pending_forward: None,
             pending_link_picker_open: false,
             link_picker: None,
             persistent_link_picker: defaults.persistent_link_picker,
@@ -914,155 +827,8 @@ impl App {
         }
     }
 
-    fn poll_file_change(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
-            return Ok(());
-        }
-        let change = self.tabs.iter_mut().find_map(|tab| {
-            tab.watcher
-                .poll(&tab.path)
-                .map(|fingerprint| (tab.document_id, tab.path.clone(), fingerprint))
-        });
-        let Some((document_id, path, fingerprint)) = change else {
-            return Ok(());
-        };
-
-        self.worker
-            .open(document_id, path)
-            .map_err(AppError::Renderer)?;
-        self.pending_open = Some(PendingOpen::Reload {
-            document_id,
-            fingerprint,
-        });
-        if self.tab().document_id == document_id {
-            let viewport = self.prepare_viewport(output)?;
-            self.draw_status(output, viewport, "reloading")?;
-        }
-        Ok(())
-    }
-
-    fn finish_open(
-        &mut self,
-        document_id: DocumentId,
-        pages: u32,
-        outline: Vec<OutlineItem>,
-        revision: PdfRevision,
-        output: &mut impl Write,
-    ) -> Result<(), AppError> {
-        let Some(pending) = self.pending_open.take() else {
-            return Ok(());
-        };
-        match pending {
-            PendingOpen::Reload {
-                document_id: expected,
-                fingerprint,
-            } if expected == document_id => {
-                let Some(index) = self.tab_index(document_id) else {
-                    return Ok(());
-                };
-                let tab = &mut self.tabs[index];
-                tab.watcher.accept(fingerprint);
-                tab.revision = revision;
-                tab.page_count = pages;
-                tab.page = tab.page.min(pages - 1);
-                tab.scroll_x = 0;
-                tab.scroll_y = 0;
-                tab.outline = Arc::new(outline);
-                tab.cache.clear();
-                tab.search = SearchState::default();
-                tab.link_history.clear();
-                tab.pending_destination = None;
-                tab.link_index = LinkIndexState::new(pages);
-                if index == self.active_tab {
-                    self.search_picker = None;
-                    self.reset_render_state();
-                    self.ensure_link_index();
-                    self.request_current(output)?;
-                }
-            }
-            PendingOpen::Selection {
-                document_id: expected,
-                path,
-            } if expected == document_id => {
-                crate::recent::record(&path);
-                let watcher = FileWatcher::new(&path)?;
-                self.tabs.push(Tab {
-                    document_id,
-                    path,
-                    revision,
-                    watcher,
-                    page_count: pages,
-                    page: 0,
-                    fit: self.default_fit,
-                    zoom: ZOOM_DEFAULT,
-                    invert: self.default_invert,
-                    dark_mode_style: DarkModeStyle::new(
-                        self.theme.document.background,
-                        self.theme.document.foreground,
-                    ),
-                    search_highlight: terminal_color_rgb(self.theme.yellow),
-                    link_highlight: terminal_color_rgb(self.theme.cyan),
-                    scroll_x: 0,
-                    scroll_y: 0,
-                    outline: Arc::new(outline),
-                    cache: HashMap::new(),
-                    search: SearchState::default(),
-                    link_history: Vec::new(),
-                    pending_destination: None,
-                    link_index: LinkIndexState::new(pages),
-                });
-                self.active_tab = self.tabs.len() - 1;
-                self.reset_render_state();
-                self.ensure_link_index();
-                self.request_current(output)?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn fail_open(
-        &mut self,
-        document_id: DocumentId,
-        error: &str,
-        output: &mut impl Write,
-    ) -> Result<(), AppError> {
-        self.finish_forward(Some(format!("document open failed: {error}")));
-        let state = match self.pending_open.take() {
-            Some(PendingOpen::Reload {
-                document_id: expected,
-                ..
-            }) if expected == document_id => {
-                if let Some(index) = self.tab_index(document_id) {
-                    self.tabs[index].watcher.defer(RELOAD_RETRY_DELAY);
-                }
-                format!("reload failed: {error}; retrying")
-            }
-            Some(PendingOpen::Selection {
-                document_id: expected,
-                ..
-            }) if expected == document_id => format!("open failed: {error}"),
-            _ => return Ok(()),
-        };
-        self.request_current(output)?;
-        self.draw_status(output, self.viewport()?, &state)?;
-        Ok(())
-    }
-
-    fn begin_open(&mut self, path: PathBuf, output: &mut impl Write) -> Result<(), AppError> {
-        let document_id = self.next_document_id;
-        self.next_document_id = self.next_document_id.wrapping_add(1).max(1);
-        self.worker
-            .open(document_id, path.clone())
-            .map_err(AppError::Renderer)?;
-        self.pending_open = Some(PendingOpen::Selection { document_id, path });
-        let viewport = self.prepare_viewport(output)?;
-        self.draw_status(output, viewport, "opening")?;
-        Ok(())
-    }
-
     fn open_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.clear_viewer(output)?;
@@ -1075,8 +841,8 @@ impl App {
         match pick_pdf(directory, output, self.theme)? {
             Some(path) => {
                 let path = path.canonicalize()?;
-                if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
-                    self.active_tab = index;
+                if let Some(index) = self.session.tabs.iter().position(|tab| tab.path == path) {
+                    self.session.active_tab = index;
                     self.reset_render_state();
                     self.request_current(output)?;
                 } else {
@@ -1089,7 +855,7 @@ impl App {
     }
 
     fn open_outline(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         let outline = Arc::clone(&self.tab().outline);
@@ -1111,7 +877,7 @@ impl App {
     }
 
     fn open_theme_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.clear_viewer(output)?;
@@ -1125,7 +891,7 @@ impl App {
     }
 
     fn open_help(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.clear_viewer(output)?;
@@ -1145,7 +911,7 @@ impl App {
         let style = DarkModeStyle::new(theme.document.background, theme.document.foreground);
         let search_highlight = terminal_color_rgb(theme.yellow);
         let link_highlight = terminal_color_rgb(theme.cyan);
-        for tab in &mut self.tabs {
+        for tab in &mut self.session.tabs {
             tab.dark_mode_style = style;
             tab.search_highlight = search_highlight;
             tab.link_highlight = link_highlight;
@@ -1154,7 +920,7 @@ impl App {
     }
 
     fn begin_goto(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.goto_input = Some(String::new());
@@ -1227,7 +993,7 @@ impl App {
     }
 
     fn begin_search(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.search_input = Some(String::new());
@@ -1333,15 +1099,15 @@ impl App {
         let Some(index) = self.tab_index(document_id) else {
             return Ok(());
         };
-        if self.tabs[index].search.request_id != update.request_id {
+        if self.session.tabs[index].search.request_id != update.request_id {
             return Ok(());
         }
-        let search = &mut self.tabs[index].search;
+        let search = &mut self.session.tabs[index].search;
         search.scanned = update.scanned;
         search.total_pages = update.total;
         search.matches = update.matches;
         search.total_occurrences = update.total_occurrences;
-        if index == self.active_tab {
+        if index == self.session.active_tab {
             if self.search_picker.is_some() {
                 self.redraw_search_picker(output)?;
             }
@@ -1361,31 +1127,31 @@ impl App {
         let Some(index) = self.tab_index(document_id) else {
             return Ok(());
         };
-        if self.tabs[index].search.request_id != request_id {
+        if self.session.tabs[index].search.request_id != request_id {
             return Ok(());
         }
-        let current_page = self.tabs[index].page;
+        let current_page = self.session.tabs[index].page;
         let target_page = matches
             .iter()
             .find(|result| result.page >= current_page)
             .or_else(|| matches.first())
             .map(|result| result.page);
-        let search = &mut self.tabs[index].search;
+        let search = &mut self.session.tabs[index].search;
         search.matches = matches;
         search.total_occurrences = total_occurrences;
         search.scanned = search.total_pages;
         search.searching = false;
 
-        if index != self.active_tab {
+        if index != self.session.active_tab {
             return Ok(());
         }
         if let Some(state) = &mut self.search_picker {
-            state.sync(current_page, &self.tabs[index].search.matches);
+            state.sync(current_page, &self.session.tabs[index].search.matches);
         }
         if let Some(page) = target_page {
-            self.tabs[index].page = page;
-            self.tabs[index].scroll_x = 0;
-            self.tabs[index].scroll_y = 0;
+            self.session.tabs[index].page = page;
+            self.session.tabs[index].scroll_x = 0;
+            self.session.tabs[index].scroll_y = 0;
             self.request_current(output)?;
         } else {
             self.draw_status(output, self.viewport()?, "")?;
@@ -1402,7 +1168,7 @@ impl App {
         let Some(index) = self.tab_index(document_id) else {
             return Ok(());
         };
-        let link_index = &mut self.tabs[index].link_index;
+        let link_index = &mut self.session.tabs[index].link_index;
         if link_index.request_id != update.request_id {
             return Ok(());
         }
@@ -1411,7 +1177,7 @@ impl App {
         link_index.total_pages = update.total;
         link_index.indexing = !update.complete;
 
-        if index == self.active_tab && self.link_picker.is_some() {
+        if index == self.session.active_tab && self.link_picker.is_some() {
             self.redraw_link_picker(output)?;
         }
         Ok(())
@@ -1453,7 +1219,7 @@ impl App {
     }
 
     fn toggle_link_mode(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.set_link_mode(!self.link_mode, output)
@@ -1508,7 +1274,7 @@ impl App {
     }
 
     fn poll_link_preview(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         let Some(pending) = self
@@ -1569,95 +1335,53 @@ impl App {
         });
     }
 
-    /// Reads a request through EOF, bounded to 100ms for incomplete clients.
-    /// macOS rejects SO_RCVTIMEO after the peer closes, so use nonblocking
-    /// reads and a deadline instead of configuring a socket read timeout.
-    fn read_forward_payload(stream: &mut UnixStream) -> io::Result<String> {
-        use std::io::Read;
-        stream.set_nonblocking(true)?;
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let mut payload = Vec::new();
-        let mut buffer = [0; 256];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    if payload.len() + size > 4096 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "forward request exceeds 4096 bytes",
-                        ));
-                    }
-                    payload.extend_from_slice(&buffer[..size]);
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "forward request did not reach EOF within 100ms",
-                ));
-            }
-        }
-        String::from_utf8(payload)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-    }
-
     fn poll_forward_socket(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let Some(path) = self.forward_socket.clone() else {
             return Ok(());
         };
         if self.forward_listener.is_none() {
-            self.forward_listener = Some(crate::ipc::Listener::bind(Path::new(&path))?);
+            self.forward_listener = Some(crate::ipc::ForwardListener::bind(Path::new(&path))?);
         }
-        let Some(listener) = self.forward_listener.as_ref() else {
-            return Ok(());
-        };
-        // Accept is nonblocking: WouldBlock means no client is waiting.
-        let mut stream = match listener.socket.accept() {
-            Ok((stream, _)) => stream,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let result = Self::read_forward_payload(&mut stream)
-            .and_then(|payload| parse_forward_request(&payload));
-        let mut reply = crate::editor::ForwardReply::new(stream);
-        match result {
-            Ok(request) => {
-                self.cancel_forward("forward search superseded by a newer request")?;
-                self.pending_forward = Some(PendingForward {
-                    request,
-                    reply,
-                    deadline: Instant::now() + crate::editor::FORWARD_TIMEOUT,
-                    started: false,
-                });
-            }
-            Err(error) => {
-                reply.finish(Some(error.to_string()));
-                self.draw_status(
-                    output,
-                    self.viewport()?,
-                    &format!("forward search: {error}"),
-                )?;
+        let ready = self
+            .forward_listener
+            .as_mut()
+            .expect("listener bound")
+            .poll()?;
+        for (result, mut reply) in ready {
+            match result {
+                Ok(request) => {
+                    self.cancel_forward("forward search superseded by a newer request")?;
+                    self.navigation.inverse.take();
+                    self.navigation.forward = Some(PendingForward {
+                        request,
+                        reply,
+                        deadline: Instant::now() + crate::ipc::FORWARD_TIMEOUT,
+                        stage: ForwardStage::AwaitingDocument,
+                    });
+                }
+                Err(error) => {
+                    reply.finish(Some(error.to_string()));
+                    self.draw_status(
+                        output,
+                        self.viewport()?,
+                        &format!("forward search: {error}"),
+                    )?;
+                }
             }
         }
         Ok(())
     }
 
     fn finish_forward(&mut self, error: Option<String>) {
-        if let Some(mut pending) = self.pending_forward.take() {
+        if let Some(mut pending) = self.navigation.forward.take() {
             pending.reply.finish(error);
         }
     }
 
     fn cancel_forward(&mut self, reason: &str) -> Result<(), AppError> {
-        if self.pending_forward.is_some() {
+        if self.navigation.forward.is_some() {
             self.finish_forward(Some(reason.into()));
-            if let Some(flash) = self.pending_flash.as_mut() {
+            if let Some(flash) = self.navigation.flash.as_mut() {
                 flash.expires_at = Some(Instant::now());
             }
             self.poll_flash_expiry()?;
@@ -1667,7 +1391,7 @@ impl App {
 
     fn poll_pending_forward(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let result = (|| -> Result<(), AppError> {
-            let Some(pending) = self.pending_forward.as_ref() else {
+            let Some(pending) = self.navigation.forward.as_ref() else {
                 return Ok(());
             };
             if pending.reply.disconnected()? {
@@ -1681,21 +1405,22 @@ impl App {
                 .into());
             }
             pending.request.revision.check(&pending.request.pdf)?;
-            if pending.started || self.pending_open.is_some() {
+            if pending.stage == ForwardStage::AwaitingFrame || self.session.pending_open.is_some() {
                 return Ok(());
             }
             let pdf = fs::canonicalize(&pending.request.pdf)?;
-            let Some(index) = self.tabs.iter().position(|tab| tab.path == pdf) else {
+            let Some(index) = self.session.tabs.iter().position(|tab| tab.path == pdf) else {
                 self.begin_open(pdf, output)?;
                 return Ok(());
             };
-            if self.tabs[index].revision != pending.request.revision {
-                let document_id = self.tabs[index].document_id;
+            if self.session.tabs[index].revision != pending.request.revision {
+                let document_id = self.session.tabs[index].document_id;
                 let fingerprint = FileFingerprint::read(&pdf)?;
+                self.navigation.inverse.take();
                 self.worker
                     .open(document_id, pdf)
                     .map_err(AppError::Renderer)?;
-                self.pending_open = Some(PendingOpen::Reload {
+                self.session.pending_open = Some(PendingOpen::Reload {
                     document_id,
                     fingerprint,
                 });
@@ -1703,11 +1428,11 @@ impl App {
             }
             // Take the connection while positioning so internal tab/scroll transitions
             // cannot acknowledge an older cached frame.
-            let mut pending = self.pending_forward.take().unwrap();
+            let mut pending = self.navigation.forward.take().unwrap();
             match self.apply_forward_request(&pending.request, output) {
                 Ok(()) => {
-                    pending.started = true;
-                    self.pending_forward = Some(pending);
+                    pending.stage = ForwardStage::AwaitingFrame;
+                    self.navigation.forward = Some(pending);
                 }
                 Err(error) => {
                     return {
@@ -1734,28 +1459,29 @@ impl App {
         request: &ForwardRequest,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Err(io::Error::other("viewer is still opening a document").into());
         }
         let pdf = fs::canonicalize(&request.pdf)?;
         let index = self
+            .session
             .tabs
             .iter()
             .position(|tab| fs::canonicalize(&tab.path).ok().as_ref() == Some(&pdf))
             .ok_or_else(|| {
                 io::Error::other(format!("PDF is not open in this viewer: {}", pdf.display()))
             })?;
-        if request.page > self.tabs[index].page_count {
+        if request.page > self.session.tabs[index].page_count {
             return Err(io::Error::other("forward page is outside the document").into());
         }
         let rect = request.rect();
         self.select_tab(index, output)?;
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
-        if let Some(previous) = self.pending_flash.take() {
+        if let Some(previous) = self.navigation.flash.take() {
             self.worker.clear_flash(previous.document_id);
             if let Some(index) = self.tab_index(previous.document_id) {
-                self.tabs[index]
+                self.session.tabs[index]
                     .cache
                     .retain(|key, _| key.page != previous.page);
             }
@@ -1768,7 +1494,7 @@ impl App {
             tab.scroll_x = 0;
             tab.scroll_y = 0;
         }
-        self.pending_flash = Some(PendingFlash {
+        self.navigation.flash = Some(PendingFlash {
             document_id,
             page,
             center_pt: Some(if self.viewer.center_forward_search {
@@ -1799,17 +1525,17 @@ impl App {
     }
 
     fn poll_flash_expiry(&mut self) -> Result<(), AppError> {
-        if !self.pending_flash.as_ref().is_some_and(|flash| {
+        if !self.navigation.flash.as_ref().is_some_and(|flash| {
             flash
                 .expires_at
                 .is_some_and(|deadline| Instant::now() >= deadline)
         }) {
             return Ok(());
         }
-        let flash = self.pending_flash.take().unwrap();
+        let flash = self.navigation.flash.take().unwrap();
         self.worker.clear_flash(flash.document_id);
         if let Some(index) = self.tab_index(flash.document_id) {
-            self.tabs[index]
+            self.session.tabs[index]
                 .cache
                 .retain(|key, _| key.page != flash.page);
         }
@@ -1835,7 +1561,7 @@ impl App {
     }
 
     fn poll_search_preview(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         let Some(pending) = self
@@ -1913,7 +1639,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         let scroll = match mouse.kind {
@@ -2023,7 +1749,7 @@ impl App {
     }
 
     fn open_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.start_link_index();
@@ -2058,7 +1784,7 @@ impl App {
         if !self.pending_link_picker_open
             || !self.link_mode
             || self.link_picker.is_some()
-            || self.pending_open.is_some()
+            || self.session.pending_open.is_some()
         {
             return Ok(());
         }
@@ -2185,7 +1911,7 @@ impl App {
     }
 
     fn open_search_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         self.retain_primary_image(output)?;
@@ -2862,7 +2588,7 @@ impl App {
     }
 
     fn request_copy(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.pending_open.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         let (document_id, page) = {
@@ -2986,7 +2712,7 @@ impl App {
             return Ok(());
         }
         if frame.flash_page_height_pt > 0.0
-            && !self.pending_flash.as_ref().is_some_and(|flash| {
+            && !self.navigation.flash.as_ref().is_some_and(|flash| {
                 flash.document_id == frame.key.document_id && flash.page == frame.key.page
             })
         {
@@ -3007,7 +2733,7 @@ impl App {
         let Some(index) = self.tab_index(key.document_id) else {
             return Ok(());
         };
-        let current_page = self.tabs[index].page;
+        let current_page = self.session.tabs[index].page;
         // Keep one on-demand neighbor even with prefetch disabled: continuous
         // scrolling may need its dimensions before it becomes visible.
         let cache_radius = (self.viewer.prefetch_pages as u32).max(1);
@@ -3018,8 +2744,10 @@ impl App {
             .map_or(current_page, |page| page.frame.key.page)
             .max(current_page)
             .saturating_add(cache_radius);
-        self.tabs[index].cache.insert(key, Arc::clone(&frame));
-        self.tabs[index].cache.retain(|cached, _| {
+        self.session.tabs[index]
+            .cache
+            .insert(key, Arc::clone(&frame));
+        self.session.tabs[index].cache.retain(|cached, _| {
             cached.width == key.width
                 && cached.height == key.height
                 && cached.zoom == key.zoom
@@ -3034,7 +2762,7 @@ impl App {
 
         // Center the highlighted region using continuous scrolling, including
         // the preceding page when the target is near the top of this one.
-        let flash_scroll = match self.pending_flash.as_mut() {
+        let flash_scroll = match self.navigation.flash.as_mut() {
             Some(flash)
                 if flash.document_id == key.document_id
                     && flash.page == key.page
@@ -3097,7 +2825,7 @@ impl App {
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        if let Some(pending) = self.pending_forward.as_ref()
+        if let Some(pending) = self.navigation.forward.as_ref()
             && let Err(error) = pending.request.revision.check(&pending.request.pdf)
         {
             self.cancel_forward(&error.to_string())?;
@@ -3106,7 +2834,7 @@ impl App {
         synchronized_output(output, |output| {
             self.draw_frame_unsynchronized(frame, viewport, output)
         })?;
-        let submitted = self.pending_flash.as_ref().is_some_and(|flash| {
+        let submitted = self.navigation.flash.as_ref().is_some_and(|flash| {
             let matches = |rendered: &Frame| {
                 rendered.key.document_id == flash.document_id
                     && rendered.key.page == flash.page
@@ -3124,19 +2852,21 @@ impl App {
                 }
         });
         if submitted {
-            let flash = self.pending_flash.as_mut().unwrap();
+            let flash = self.navigation.flash.as_mut().unwrap();
             flash.expires_at.get_or_insert_with(|| {
                 Instant::now() + Duration::from_millis(self.viewer.flash_duration_ms)
             });
             let error = self
-                .pending_forward
+                .navigation
+                .forward
                 .as_ref()
                 .and_then(|pending| pending.request.revision.check(&pending.request.pdf).err())
                 .map(|error| error.to_string());
             if self
-                .pending_forward
+                .navigation
+                .forward
                 .as_ref()
-                .is_some_and(|pending| pending.started)
+                .is_some_and(|pending| pending.stage == ForwardStage::AwaitingFrame)
             {
                 self.finish_forward(error);
             }
@@ -3529,43 +3259,6 @@ impl App {
         }
     }
 
-    fn switch_tab(&mut self, direction: i32, output: &mut impl Write) -> Result<(), AppError> {
-        if self.tabs.len() < 2 || self.pending_open.is_some() {
-            return Ok(());
-        }
-        let index = cycled_tab_index(self.active_tab, self.tabs.len(), direction);
-        self.select_tab(index, output)
-    }
-
-    fn select_tab(&mut self, index: usize, output: &mut impl Write) -> Result<(), AppError> {
-        if index >= self.tabs.len() || index == self.active_tab || self.pending_open.is_some() {
-            return Ok(());
-        }
-        self.active_tab = index;
-        self.clear_viewer(output)?;
-        self.reset_render_state();
-        self.ensure_link_index();
-        self.request_current(output)
-    }
-
-    fn close_current(&mut self, output: &mut impl Write) -> Result<bool, AppError> {
-        if self.pending_open.is_some() {
-            return Ok(false);
-        }
-        if self.tabs.len() == 1 {
-            return Ok(true);
-        }
-        let removed = self.tabs.remove(self.active_tab);
-        self.worker.close(removed.document_id);
-        if self.active_tab == self.tabs.len() {
-            self.active_tab -= 1;
-        }
-        self.clear_viewer(output)?;
-        self.reset_render_state();
-        self.request_current(output)?;
-        Ok(false)
-    }
-
     fn clear_viewer(&mut self, output: &mut impl Write) -> io::Result<()> {
         let theme = self.theme;
         kitty::delete_all(output)?;
@@ -3602,7 +3295,7 @@ impl App {
     }
 
     fn draw_tab_bar(&self, output: &mut impl Write) -> io::Result<()> {
-        if self.tabs.len() < 2 {
+        if self.session.tabs.len() < 2 {
             return Ok(());
         }
         let theme = self.theme;
@@ -3615,7 +3308,7 @@ impl App {
             Clear(ClearType::CurrentLine)
         )?;
         let mut used = 0;
-        for (index, tab) in self.tabs.iter().enumerate() {
+        for (index, tab) in self.session.tabs.iter().enumerate() {
             let name = tab
                 .path
                 .file_name()
@@ -3626,7 +3319,7 @@ impl App {
             if label.is_empty() {
                 break;
             }
-            if index == self.active_tab {
+            if index == self.session.active_tab {
                 execute!(
                     output,
                     SetBackgroundColor(theme.blue),
@@ -3661,7 +3354,7 @@ impl App {
     }
 
     fn viewport(&self) -> io::Result<Viewport> {
-        Viewport::detect(u16::from(self.tabs.len() > 1))
+        Viewport::detect(u16::from(self.session.tabs.len() > 1))
     }
 
     fn render_key(&self, viewport: Viewport) -> RenderKey {
@@ -3674,26 +3367,12 @@ impl App {
             .render_key(viewport, self.link_mode, selected_link_ordinal)
     }
 
-    fn tab(&self) -> &Tab {
-        &self.tabs[self.active_tab]
-    }
-
-    fn tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab]
-    }
-
-    fn tab_index(&self, document_id: DocumentId) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.document_id == document_id)
-    }
-
     fn begin_inverse_search(
         &mut self,
         mouse: MouseEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        if self.pending_open.is_some() || self.pending_synctex.is_some() {
+        if self.session.pending_open.is_some() {
             return Ok(());
         }
         let viewport = self.viewport()?;
@@ -3701,6 +3380,7 @@ impl App {
             return Ok(());
         };
         let key = frame.key;
+        let revision = frame.revision;
         let Some(local_column) = mouse.column.checked_sub(placement.left) else {
             return Ok(());
         };
@@ -3729,15 +3409,18 @@ impl App {
         let pixel_x = (cell_x0 + cell_x1) / 2;
         let pixel_y = (cell_y0 + cell_y1) / 2;
         let (document_id, page) = (key.document_id, key.page);
-        let request_id = self.next_synctex_request_id;
-        self.next_synctex_request_id = request_id.wrapping_add(1);
-        self.pending_synctex = Some(PendingSynctex {
+        let request_id = self.navigation.next_request_id;
+        self.navigation.next_request_id = request_id.wrapping_add(1);
+        self.navigation.inverse = Some(PendingInverse {
+            revision,
+            operation: crate::process::Operation::default(),
+            stage: InverseStage::HitTest,
             document_id,
             page,
             request_id,
         });
         self.worker
-            .page_point(document_id, page, request_id, pixel_x, pixel_y, key);
+            .page_point(revision, request_id, pixel_x, pixel_y, key);
         self.draw_status(output, viewport, "inverse search: resolving location...")?;
         Ok(())
     }
@@ -3747,83 +3430,104 @@ impl App {
         click: SynctexClick,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let Some(pending) = self.pending_synctex.take() else {
+        let Some(mut pending) = self.navigation.inverse.take() else {
             return Ok(());
         };
         if pending.document_id != click.document_id
             || pending.page != click.page
             || pending.request_id != click.request_id
         {
-            // Stale reply for an older request: restore the in-flight request.
-            self.pending_synctex = Some(pending);
+            self.navigation.inverse = Some(pending);
             return Ok(());
         }
-        if click.pdf_x < 0.0 || click.pdf_y < 0.0 {
+        let result = (|| -> io::Result<()> {
+            pending.operation.check()?;
+            if pending.revision != click.revision {
+                return Err(io::Error::other("stale hit-test revision"));
+            }
+            let resolved = click.result.map_err(io::Error::other)?;
+            let index = self
+                .tab_index(click.document_id)
+                .ok_or_else(|| io::Error::other("clicked document closed"))?;
+            self.navigation.worker.submit(InverseTask {
+                request_id: pending.request_id,
+                path: self.session.tabs[index].path.clone(),
+                revision: pending.revision,
+                page: pending.page,
+                click: resolved,
+                word_precision: self.viewer.word_precision,
+                radius: self.viewer.source_context_lines as u32,
+                editor: self.editor.clone(),
+                operation: pending.operation.clone(),
+            })
+        })();
+        match result {
+            Ok(()) => {
+                pending.stage = InverseStage::Resolving;
+                self.navigation.inverse = Some(pending);
+            }
+            Err(error) => self.draw_status(
+                output,
+                self.viewport()?,
+                &format!("inverse search: {error}"),
+            )?,
+        }
+        Ok(())
+    }
+
+    fn poll_inverse_search(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        while let Ok(reply) = self.navigation.worker.replies.try_recv() {
+            if !self
+                .navigation
+                .inverse
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == reply.request_id)
+            {
+                continue;
+            }
+            self.navigation.inverse.take();
             let viewport = self.viewport()?;
-            self.draw_status(output, viewport, "inverse search: click outside page")?;
-            return Ok(());
-        }
-        let Some(index) = self.tab_index(click.document_id) else {
-            return Ok(());
-        };
-        let viewport = self.viewport()?;
-        let word = if self.viewer.word_precision {
-            match &click.text {
-                Ok(word) => word
-                    .as_ref()
-                    .map(|(context, offset)| (context.as_str(), *offset)),
+            match reply.result {
                 Err(error) => {
+                    self.draw_status(output, viewport, &format!("inverse search: {error}"))?
+                }
+                Ok(result) => {
+                    let target = result.location;
+                    write_clipboard_osc52(
+                        output,
+                        &format!("{}:{}:{}", target.file, target.line, target.byte_column),
+                    )?;
+                    let shown = target.file.rsplit('/').next().unwrap_or(&target.file);
+                    let detail = result.warning.as_deref().unwrap_or(if target.precise {
+                        "word, copied"
+                    } else {
+                        "line only, copied"
+                    });
                     self.draw_status(
                         output,
                         viewport,
-                        &format!("inverse search: PDF text: {error}"),
+                        &format!(
+                            "inverse search: {shown}:{}:{} ({detail})",
+                            target.line,
+                            target.byte_column + 1
+                        ),
                     )?;
-                    return Ok(());
                 }
             }
-        } else {
-            None
-        };
-        let target = match crate::synctex::resolve_inverse(
-            &self.tabs[index].path,
-            click.page + 1,
-            click.pdf_x,
-            click.page_height_pt - click.pdf_y,
-            word,
-            self.viewer.source_context_lines as u32,
-        ) {
-            Ok(target) => target,
-            Err(error) => {
-                self.draw_status(output, viewport, &format!("inverse search: {error}"))?;
-                return Ok(());
-            }
-        };
-        let handoff = format!("{}:{}:{}", target.file, target.line, target.byte_column);
-        if let Err(error) = self.editor.deliver(&target) {
+        }
+        if let Some(error) = self
+            .navigation
+            .inverse
+            .as_ref()
+            .and_then(|p| p.operation.check().err())
+        {
+            self.navigation.inverse.take();
             self.draw_status(
                 output,
-                viewport,
-                &format!("inverse search: editor handoff: {error}"),
+                self.viewport()?,
+                &format!("inverse search: {error}"),
             )?;
-            return Ok(());
         }
-        write_clipboard_osc52(output, &handoff)?;
-        let shown = target.file.rsplit('/').next().unwrap_or(&target.file);
-        self.draw_status(
-            output,
-            viewport,
-            &format!(
-                "inverse search: {}:{}:{} ({})",
-                shown,
-                target.line,
-                target.byte_column + 1,
-                if target.precise {
-                    "word, copied"
-                } else {
-                    "line only, copied"
-                }
-            ),
-        )?;
         Ok(())
     }
 }
@@ -6482,93 +6186,10 @@ impl From<Palette> for PickerTheme {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileFingerprint {
-    length: u64,
-    modified: SystemTime,
-}
-
-impl FileFingerprint {
-    fn read(path: &Path) -> io::Result<Self> {
-        let metadata = fs::metadata(path)?;
-        Ok(Self {
-            length: metadata.len(),
-            modified: metadata.modified()?,
-        })
-    }
-}
-
-struct FileWatcher {
-    accepted: FileFingerprint,
-    candidate: Option<(FileFingerprint, Instant)>,
-    next_poll: Instant,
-}
-
-impl FileWatcher {
-    fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            accepted: FileFingerprint::read(path)?,
-            candidate: None,
-            next_poll: Instant::now() + FILE_POLL_INTERVAL,
-        })
-    }
-
-    fn poll(&mut self, path: &Path) -> Option<FileFingerprint> {
-        let now = Instant::now();
-        if now < self.next_poll {
-            return None;
-        }
-        self.next_poll = now + FILE_POLL_INTERVAL;
-
-        let fingerprint = match FileFingerprint::read(path) {
-            Ok(fingerprint) => fingerprint,
-            Err(_) => {
-                self.candidate = None;
-                return None;
-            }
-        };
-        self.observe(fingerprint, now)
-    }
-
-    fn observe(&mut self, fingerprint: FileFingerprint, now: Instant) -> Option<FileFingerprint> {
-        if fingerprint == self.accepted {
-            self.candidate = None;
-            return None;
-        }
-
-        match self.candidate {
-            Some((candidate, since))
-                if candidate == fingerprint && now.duration_since(since) >= FILE_STABLE_FOR =>
-            {
-                Some(fingerprint)
-            }
-            Some((candidate, _)) if candidate == fingerprint => None,
-            _ => {
-                self.candidate = Some((fingerprint, now));
-                None
-            }
-        }
-    }
-
-    fn accept(&mut self, fingerprint: FileFingerprint) {
-        self.accepted = fingerprint;
-        if self
-            .candidate
-            .is_some_and(|(candidate, _)| candidate == fingerprint)
-        {
-            self.candidate = None;
-        }
-    }
-
-    fn defer(&mut self, duration: Duration) {
-        self.next_poll = Instant::now() + duration;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
+        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
         PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState, ZOOM_DEFAULT,
         ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, clear_image_canvas, clear_picker,
@@ -6594,8 +6215,7 @@ mod tests {
     use ratatui::layout::Rect;
     use std::fs;
     use std::io::{self, Write};
-    use std::os::unix::net::UnixStream;
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::Instant;
 
     #[test]
     fn synchronized_output_closes_successful_and_failed_updates() {
@@ -6798,14 +6418,13 @@ mod tests {
 
     #[test]
     fn file_changes_must_stabilize_before_reload() {
-        let initial = FileFingerprint {
-            length: 10,
-            modified: SystemTime::UNIX_EPOCH,
-        };
-        let changed = FileFingerprint {
-            length: 20,
-            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        };
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("document.pdf");
+        fs::write(&pdf, "unchanged PDF").unwrap();
+        let initial = FileFingerprint::read(&pdf).unwrap();
+        fs::write(pdf.with_extension("synctex"), "new companion").unwrap();
+        let changed = FileFingerprint::read(&pdf).unwrap();
+        assert_ne!(initial, changed);
         let started = Instant::now();
         let mut watcher = FileWatcher {
             accepted: initial,
@@ -7908,52 +7527,5 @@ mod tests {
         let floating_output = String::from_utf8(floating_output).expect("terminal output");
         assert!(!floating_output.contains("a=p"));
         assert!(!floating_output.contains("a=T"));
-    }
-
-    #[test]
-    fn forward_payload_rejects_incomplete_requests() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        client
-            .write_all(b"3:133.768356:136.701797:343.711060:8.855677")
-            .unwrap();
-        client.flush().unwrap();
-        let started = Instant::now();
-        // An incomplete client cannot apply a valid-looking partial request.
-        assert_eq!(
-            App::read_forward_payload(&mut server).unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
-        assert!(started.elapsed() < Duration::from_millis(500));
-    }
-
-    #[test]
-    fn forward_payload_rejects_oversized_requests() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        client.write_all(&[b'1'; 4097]).unwrap();
-        assert_eq!(
-            App::read_forward_payload(&mut server).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
-    fn forward_payload_read_returns_payload_on_eof() {
-        use std::net::Shutdown;
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        client.write_all(b"3:1.0:2.0:3.0:4.0").unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
-        let payload = App::read_forward_payload(&mut server).unwrap();
-        assert_eq!(payload, "3:1.0:2.0:3.0:4.0");
-    }
-
-    #[test]
-    fn forward_payload_read_survives_peer_closed_before_accept() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        client.write_all(b"3:1.0:2.0:3.0:4.0").unwrap();
-        drop(client);
-        assert_eq!(
-            App::read_forward_payload(&mut server).unwrap(),
-            "3:1.0:2.0:3.0:4.0"
-        );
     }
 }

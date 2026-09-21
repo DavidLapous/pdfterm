@@ -1,10 +1,8 @@
-use crate::synctex::{ForwardRequest, SourceLocation};
+use crate::process::Operation;
+use crate::synctex::SourceLocation;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
+use std::io;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 /// Editor selection is trusted configuration. Document paths are arguments, never shell code.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -56,14 +54,13 @@ impl Editor {
         }
     }
 
-    pub fn deliver(&self, location: &SourceLocation) -> io::Result<()> {
+    pub fn deliver(&self, location: &SourceLocation, operation: &Operation) -> io::Result<()> {
+        operation.check()?;
         match self {
             Self::None => Ok(()),
             Self::Socket { path } => {
-                let mut stream = UnixStream::connect(path)?;
-                stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-                serde_json::to_writer(&mut stream, location)?;
-                stream.shutdown(Shutdown::Write)
+                let mut stream = crate::ipc::connect(path, operation)?;
+                crate::ipc::send(&mut stream, &serde_json::to_vec(location)?, operation)
             }
             Self::Command { argv } => {
                 self.validate()?;
@@ -71,7 +68,8 @@ impl Editor {
                     .iter()
                     .map(|argument| expand(argument, location))
                     .collect::<io::Result<Vec<_>>>()?;
-                let output = Command::new(&argv[0]).args(arguments).output()?;
+                let output =
+                    crate::process::output(Command::new(&argv[0]).args(arguments), operation)?;
                 if output.status.success() {
                     Ok(())
                 } else {
@@ -115,174 +113,9 @@ fn expand(template: &str, location: &SourceLocation) -> io::Result<String> {
     Ok(result)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Reply {
-    pub ok: bool,
-    pub error: Option<String>,
-}
-
-pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// One terminal reply per connection, including unwinding/normal viewer shutdown.
-pub(crate) struct ForwardReply(Option<UnixStream>);
-
-impl ForwardReply {
-    pub fn new(stream: UnixStream) -> Self {
-        Self(Some(stream))
-    }
-
-    pub fn disconnected(&self) -> io::Result<bool> {
-        use std::os::fd::AsRawFd;
-        let Some(stream) = self.0.as_ref() else {
-            return Ok(true);
-        };
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // Poll the WRITE side: on macOS, a read-side HUP also occurs for the
-        // normal request half-close, and events=0 does not report peer closure.
-        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0)
-    }
-
-    pub fn finish(&mut self, error: Option<String>) {
-        let Some(mut stream) = self.0.take() else {
-            return;
-        };
-        let error = error.map(|message| {
-            if message.len() <= 512 {
-                message
-            } else {
-                format!("{}…", message.chars().take(512).collect::<String>())
-            }
-        });
-        let reply = Reply {
-            ok: error.is_none(),
-            error,
-        };
-        let result = (|| -> io::Result<()> {
-            let bytes = serde_json::to_vec(&reply)?;
-            let deadline = Instant::now() + Duration::from_millis(100);
-            let mut remaining = bytes.as_slice();
-            while !remaining.is_empty() {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "forward reply write timed out",
-                    ));
-                }
-                match stream.write(remaining) {
-                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                    Ok(count) => remaining = &remaining[count..],
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1))
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            stream.shutdown(Shutdown::Write)
-        })();
-        if let Err(error) = result {
-            eprintln!("pdfterm: forward reply failed: {error}");
-        }
-    }
-}
-
-impl Drop for ForwardReply {
-    fn drop(&mut self) {
-        self.finish(Some(
-            "viewer stopped before forward frame submission".into(),
-        ));
-    }
-}
-
-pub fn forward(path: &str, request: &ForwardRequest) -> io::Result<()> {
-    request.validate()?;
-    let mut stream = UnixStream::connect(path)?;
-    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-    stream.set_read_timeout(Some(FORWARD_TIMEOUT + Duration::from_secs(1)))?;
-    serde_json::to_writer(&mut stream, request)?;
-    stream.shutdown(Shutdown::Write)?;
-    let mut response = String::new();
-    stream.take(4097).read_to_string(&mut response)?;
-    if response.len() > 4096 {
-        return Err(io::Error::other("forward reply exceeds 4096 bytes"));
-    }
-    let reply: Reply = serde_json::from_str(&response)?;
-    if reply.ok {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            reply
-                .error
-                .unwrap_or_else(|| "forward request rejected".into()),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn forward_reply_waits_for_submission_and_survives_request_half_close() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
-        client.set_nonblocking(true).unwrap();
-        server.set_nonblocking(true).unwrap();
-        let mut reply = ForwardReply::new(server);
-        assert!(!reply.disconnected().unwrap());
-        let mut byte = [0];
-        assert_eq!(
-            client.read(&mut byte).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        reply.finish(None);
-        drop(reply);
-        client.set_nonblocking(false).unwrap();
-        let mut payload = String::new();
-        client.read_to_string(&mut payload).unwrap();
-        let response: Reply = serde_json::from_str(&payload).unwrap();
-        assert!(response.ok);
-        assert!(response.error.is_none());
-    }
-
-    #[test]
-    fn abandoned_forward_reply_reports_failure_and_detects_disconnection() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        server.set_nonblocking(true).unwrap();
-        drop(ForwardReply::new(server));
-        let mut payload = String::new();
-        client.read_to_string(&mut payload).unwrap();
-        let response: Reply = serde_json::from_str(&payload).unwrap();
-        assert!(!response.ok);
-        assert!(response.error.is_some());
-
-        let (client, server) = UnixStream::pair().unwrap();
-        let reply = ForwardReply::new(server);
-        drop(client);
-        assert!(reply.disconnected().unwrap());
-    }
-
-    #[test]
-    fn escaped_forward_errors_fit_the_reply_limit() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        server.set_nonblocking(true).unwrap();
-        ForwardReply::new(server).finish(Some("\0".repeat(2048)));
-        let mut payload = String::new();
-        client.read_to_string(&mut payload).unwrap();
-        assert!(payload.len() <= 4096);
-        let response: Reply = serde_json::from_str(&payload).unwrap();
-        assert!(!response.ok);
-        assert!(response.error.unwrap().starts_with('\0'));
-    }
 
     #[test]
     fn command_delivers_literal_filename_and_explicit_columns() {
@@ -306,7 +139,7 @@ mod tests {
             column_char: 3,
             precise: true,
         };
-        editor.deliver(&location).unwrap();
+        editor.deliver(&location, &Operation::default()).unwrap();
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
             format!("{}\n7:4:3:5:6\n", location.file)
@@ -315,7 +148,7 @@ mod tests {
             Editor::Command {
                 argv: vec!["false".into()]
             }
-            .deliver(&location)
+            .deliver(&location, &Operation::default())
             .is_err()
         );
         assert!(

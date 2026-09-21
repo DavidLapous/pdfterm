@@ -39,8 +39,9 @@ source_context_lines = 4           # Source radius outside Beamer frames, 0–10
 
 [nvim]
 compile = false                    # Run latexmk before forward search
+attach_only = false                # true: require an existing viewer; never launch a terminal
 focus_on_inverse = false           # Opt in to focusing the source terminal after inverse search
-executable = ""                    # Empty: target/release/pdfterm beside bundled plugin; or absolute path
+executable = ""                    # Runtime override; setup({executable=...}) also selects config loader
 
 [nvim.keys]
 # Empty keys disable mappings. Choose bindings in your local config.

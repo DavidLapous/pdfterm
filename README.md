@@ -255,8 +255,12 @@ argv = ["code", "--reuse-window", "--goto", "{file}:{line}:{column}"]
 ```
 
 Commands run as an argument vector, without an implicit shell, expansion, or
-reparsing of substituted filenames. The command must return promptly; nonzero
-exit status is an error. Placeholders: `{file}` is an absolute source path,
+reparsing of substituted filenames. SyncTeX and editor delivery run on a separate
+bounded navigation worker, not the event loop or PDFium worker. An inverse request
+has a ten-second deadline; a new click, reload, tab change, or shutdown cancels it.
+Helpers have a 1 MiB output limit per stream; timeout/cancellation kills their
+process group. Commands must hand off to an editor, not remain attached to it.
+Nonzero exit status is an error. Placeholders: `{file}` is an absolute source path,
 `{line}` is one-based, `{column}` is one-based UTF-16, `{column_char}` is
 one-based Unicode scalar, `{byte_column}` is zero-based UTF-8, and
 `{column_byte}` is one-based UTF-8. Unknown placeholders are rejected.
@@ -323,9 +327,47 @@ rejected. Send the complete request and half-close within 100 ms after connectin
 
 ### Bundled Neovim adapter
 
-Add the repository's `nvim` directory to Neovim's runtime path and call
-`require("pdfterm").setup()`. The adapter reads the shared configuration through
-`pdfterm --print-config`.
+Requires Neovim 0.10 or newer. Add the repository's `nvim` directory to its runtime
+path. Select the executable **before** loading configuration:
+
+```lua
+require("pdfterm").setup({
+  executable = "/path/to/pdfterm",
+  session = "paper",       -- optional; use the same --session when starting the viewer
+  attach_only = true,     -- never launch a terminal; focus remains separately opt-in
+})
+```
+
+Without `executable`, the bundled adapter uses `target/release/pdfterm` beside
+the plugin. It reads the shared configuration with `--print-config`.
+Forward search first tries the socket, without detecting or controlling a
+terminal. If unavailable and `attach_only` is false (default), the Kitty/Ghostty
+adapter may launch a viewer. Focus control is independently opt-in.
+
+Public actions are `forward()`, `build()`, `set_main(file)`, and `toggle_compile()`;
+commands are `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
+`:PdfTermCompile`. `forward_search(pdf, json_payload)` sends an already-resolved
+request. Builds and resolution are asynchronous. Navigation generations start
+at invocation; stale completions cannot navigate. Builds sharing a canonical
+working directory or an output PDF run serially, retaining only the newest
+pending build.
+Builds time out after 120 seconds; captured build/resolution output is capped
+at 1 MiB. Failures are reported rather than launching with stale coordinates.
+
+For output directories or a different engine, add a minimal project descriptor
+to `setup()`:
+
+```lua
+project = {
+  main = "main.tex",
+  cwd = "/project",
+  pdf = "build/main.pdf", -- relative paths resolve against cwd
+  build = { "latexmk", "-lualatex", "-synctex=1", "-outdir=build", "main.tex" },
+}
+```
+
+Without a descriptor, the selected/current TeX file, its directory, adjacent
+PDF, and `latexmk -pdf -interaction=nonstopmode -synctex=1` are used.
 
 No editor keybindings are installed by default. Set your own bindings under
 `[nvim.keys]`: `forward` saves and forward-searches, `build` builds the main TeX
@@ -358,14 +400,27 @@ nearest-word fallback. Reordered scripts and complex notation can also prevent
 an unambiguous match. Native PDF glyph hit-testing can select an adjacent glyph
 when characters are small or overlap; refinement uses the glyph actually selected.
 
+Each displayed frame records the PDF and companion SyncTeX filesystem revision.
+Clicks carry that revision through hit-testing and check it before resolution
+and again before editor delivery. Replaced files invalidate the click; repeat it
+after reload. The watcher follows companion-only replacements as well.
+Metadata equality is not proof that PDF and SyncTeX came from the same build:
+publish the completed pair together and avoid concurrent builds of one output.
+
+PDF text extraction and source refinement are optional. Read/encoding errors or
+sources larger than 2 MiB preserve the valid SyncTeX line with an explicit warning.
+Failed SyncTeX resolution and editor delivery remain errors.
+
 Source matching uses the saved file, so save and rebuild after edits.
 With `transport = "none"`, the target is shown in the status bar and copied to the
 clipboard (OSC 52). Configured transport failures are reported.
 
-Each configuration supports one viewer socket and one editor adapter socket.
-The viewer may contain several document tabs. Use separate `XDG_CONFIG_HOME`
-directories for independent sessions. A second listener fails explicitly rather
-than stealing an endpoint.
+Each session supports one viewer socket and one editor adapter socket, with
+multiple document tabs. `pdfterm --session paper ...` and
+`setup({ session = "paper" })` select distinct endpoints while sharing config.
+Names contain 1–24 ASCII letters, digits, `_`, or `-`; socket path limits still
+apply. The unnamed session retains existing endpoint names. A second listener
+fails explicitly rather than stealing an endpoint.
 
 ## Security and licensing
 

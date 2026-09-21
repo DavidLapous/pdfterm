@@ -40,6 +40,10 @@ struct Cli {
     /// One-based Unicode character column in the source.
     #[arg(long, default_value_t = 1)]
     column: u32,
+
+    /// Named viewer/editor session sharing the same configuration.
+    #[arg(long)]
+    session: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -56,13 +60,19 @@ fn main() -> ExitCode {
             }
         };
     }
-    let config = match pdfterm::config::Config::load() {
+    let mut config = match pdfterm::config::Config::load() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("pdfterm: {error}");
             return ExitCode::FAILURE;
         }
     };
+    if let Some(name) = cli.session.as_deref()
+        && let Err(error) = config.select_session(name)
+    {
+        eprintln!("pdfterm: {error}");
+        return ExitCode::FAILURE;
+    }
     if cli.print_config {
         match serde_json::to_string(&config) {
             Ok(json) => {
@@ -85,7 +95,7 @@ fn main() -> ExitCode {
             if cli.synctex_view.is_some() {
                 println!("{}", serde_json::to_string(&request)?);
             } else {
-                pdfterm::editor::forward(
+                pdfterm::ipc::forward(
                     config
                         .forward_socket()
                         .ok_or("forward_socket is disabled")?,

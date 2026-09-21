@@ -1,6 +1,7 @@
 mod math;
 
 use crate::pdf::SearchRect;
+use crate::process::Operation;
 use serde::{Deserialize, Serialize};
 use std::{fs, io, os::unix::fs::MetadataExt, path::Path, process::Command};
 
@@ -53,6 +54,45 @@ impl PdfRevision {
         }
         Ok(())
     }
+}
+
+/// Metadata identity of both files observed when PDFium opens a document.
+/// Stability does not prove a common build; producers must publish a completed
+/// PDF/SyncTeX pair before requesting navigation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentRevision {
+    pub pdf: PdfRevision,
+    companion: Option<(bool, PdfRevision)>,
+}
+impl DocumentRevision {
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let pdf = PdfRevision::read(path)?;
+        let mut companion = None;
+        for (extension, compressed) in [("synctex.gz", true), ("synctex", false)] {
+            match PdfRevision::read(&path.with_extension(extension)) {
+                Ok(revision) => {
+                    companion = Some((compressed, revision));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Self { pdf, companion })
+    }
+    pub fn check(self, path: &Path) -> io::Result<()> {
+        if Self::read(path)? != self {
+            return Err(io::Error::other(
+                "displayed PDF/SyncTeX revision changed; wait for reload and click again",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct InverseResolution {
+    pub location: SourceLocation,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -125,14 +165,17 @@ pub fn resolve_forward(
         file.to_str()
             .ok_or_else(|| io::Error::other("source path is not UTF-8"))?
     );
-    let stdout = run(&[
-        "view",
-        "-i",
-        &spec,
-        "-o",
-        pdf.to_str()
-            .ok_or_else(|| io::Error::other("PDF path is not UTF-8"))?,
-    ])?;
+    let stdout = run(
+        &Operation::default(),
+        &[
+            "view",
+            "-i",
+            &spec,
+            "-o",
+            pdf.to_str()
+                .ok_or_else(|| io::Error::other("PDF path is not UTF-8"))?,
+        ],
+    )?;
     let (mut page, mut h, mut v, mut width, mut height) = (None, None, None, None, None);
     for row in stdout.lines() {
         if let Some((key, value)) = row.split_once(':') {
@@ -171,8 +214,8 @@ pub fn resolve_forward(
     Err(io::Error::other("synctex view returned no complete match"))
 }
 
-fn run(args: &[&str]) -> io::Result<String> {
-    let output = Command::new("synctex").args(args).output()?;
+fn run(operation: &Operation, args: &[&str]) -> io::Result<String> {
+    let output = crate::process::output(Command::new("synctex").args(args), operation)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "synctex failed: {}",
@@ -190,9 +233,11 @@ pub fn resolve_inverse(
     y_from_top: f32,
     word: Option<(&str, usize)>,
     radius: u32,
-) -> io::Result<SourceLocation> {
+    operation: &Operation,
+) -> io::Result<InverseResolution> {
+    let pdf = std::path::absolute(pdf)?;
     let spec = format!("{page}:{x:.2}:{y_from_top:.2}:{}", pdf.display());
-    let stdout = run(&["edit", "-o", &spec])?;
+    let stdout = run(operation, &["edit", "-o", &spec])?;
     let mut target = parse_synctex_edit(&stdout)
         .ok_or_else(|| io::Error::other("synctex edit returned no match"))?;
     let path = Path::new(&target.file);
@@ -201,14 +246,31 @@ pub fn resolve_inverse(
     } else {
         pdf.parent().unwrap_or(Path::new(".")).join(path)
     };
-    target.file = fs::canonicalize(absolute)?
+    let mut warning = None;
+    let resolved = match fs::canonicalize(&absolute) {
+        Ok(path) => path,
+        Err(error) => {
+            warning = Some(format!(
+                "line-only navigation: source path unavailable: {error}"
+            ));
+            absolute
+        }
+    };
+    target.file = resolved
         .into_os_string()
         .into_string()
         .map_err(|_| io::Error::other("source path is not UTF-8"))?;
     if let Some((context, offset)) = word {
-        let source = fs::read_to_string(&target.file)?;
-        if let Some((line, byte)) =
-            source_word_location(&source, target.line, context, offset, radius)
+        operation.check()?;
+        let source = read_source(Path::new(&target.file));
+        if let Err(error) = &source {
+            warning = Some(format!(
+                "line-only navigation: source refinement unavailable: {error}"
+            ));
+        }
+        if let Ok(source) = source
+            && let Some((line, byte)) =
+                source_word_location(&source, target.line, context, offset, radius)
         {
             let text = source
                 .lines()
@@ -224,7 +286,31 @@ pub fn resolve_inverse(
             target.precise = true;
         }
     }
-    Ok(target)
+    operation.check()?;
+    Ok(InverseResolution {
+        location: target,
+        warning,
+    })
+}
+
+fn read_source(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut bytes = Vec::new();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "source refinement requires a regular file",
+        ));
+    }
+    file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err(io::Error::other("source exceeds 2 MiB refinement limit"));
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub(crate) fn parse_synctex_edit(stdout: &str) -> Option<SourceLocation> {

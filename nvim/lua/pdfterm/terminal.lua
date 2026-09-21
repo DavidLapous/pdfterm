@@ -11,12 +11,9 @@ local function remote(arguments, callback)
   return vim.system(command, { text = true, timeout = 3000 }, callback)
 end
 
-function kitty.capture()
-  return vim.env.KITTY_WINDOW_ID
-end
 
-function kitty.launch(source, executable, pdf, callback)
-  return remote({
+function kitty.launch(source, executable, pdf, callback, session)
+  local arguments = {
     'launch',
     '--match',
     'window_id:' .. source.id,
@@ -31,7 +28,9 @@ function kitty.launch(source, executable, pdf, callback)
     'XDG_CONFIG_HOME=' .. (vim.env.XDG_CONFIG_HOME or ''),
     executable,
     pdf,
-  }, callback)
+  }
+  if session then vim.list_extend(arguments, { '--session', session }) end
+  return remote(arguments, callback)
 end
 
 function kitty.focus(source, callback)
@@ -51,13 +50,6 @@ function kitty.close(split)
   end
 end
 
-function ghostty.capture()
-  local result = platform.applescript('tell application "Ghostty" to get id of focused terminal of selected tab of front window'):wait()
-  if result.code ~= 0 or vim.trim(result.stdout) == '' then
-    error('pdfterm: could not identify source Ghostty terminal: ' .. (result.stderr or ''))
-  end
-  return vim.trim(result.stdout)
-end
 
 local split_script = [[
 on run argv
@@ -74,8 +66,9 @@ on run argv
 end run
 ]]
 
-function ghostty.launch(source, executable, pdf, callback)
+function ghostty.launch(source, executable, pdf, callback, session)
   local command = vim.fn.shellescape(executable) .. ' ' .. vim.fn.shellescape(pdf)
+  if session then command = command .. ' --session ' .. vim.fn.shellescape(session) end
   return platform.applescript(split_script, { command, source.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' }, callback)
 end
 
@@ -126,22 +119,27 @@ local function adapter(handle)
   return result
 end
 
-function M.capture_source()
-  platform.check_supported()
+function M.capture_source(callback)
   local kind = vim.env.KITTY_WINDOW_ID and 'kitty' or vim.env.TERM_PROGRAM == 'ghostty' and 'ghostty'
-  if not kind then
-    error 'pdfterm: terminal integration requires Kitty or Ghostty'
-  end
-  return { kind = kind, id = adapters[kind].capture() }
+  if not kind then callback('terminal launch/focus requires Kitty or Ghostty'); return end
+  if kind == 'kitty' then callback(nil, { kind = kind, id = vim.env.KITTY_WINDOW_ID }); return end
+  local ok, error = pcall(platform.applescript,
+    'tell application "Ghostty" to get id of focused terminal of selected tab of front window',
+    nil, vim.schedule_wrap(function(result)
+      local id = vim.trim(result.stdout or '')
+      if result.code ~= 0 or id == '' then callback('could not identify source Ghostty terminal: ' .. (result.stderr or ''))
+      else callback(nil, { kind = kind, id = id }) end
+    end))
+  if not ok then callback(tostring(error)) end
 end
 
 -- Callback runs before scheduling editor work so VimLeavePre can retain ownership
 -- even when it is waiting for an in-flight launch to finish.
-function M.launch_split(source, executable, pdf, callback)
+function M.launch_split(source, executable, pdf, callback, session)
   return adapter(source).launch(source, executable, pdf, function(result)
     local id = vim.trim(result.stdout)
     callback(result, result.code == 0 and id ~= '' and { kind = source.kind, id = id } or nil)
-  end)
+  end, session)
 end
 
 function M.focus(source, callback)

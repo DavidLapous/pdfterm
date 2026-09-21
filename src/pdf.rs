@@ -13,7 +13,7 @@ use pdfium_render::prelude::{
     PdfRect, PdfRenderConfig, Pdfium,
 };
 
-use crate::synctex::PdfRevision;
+use crate::synctex::{DocumentRevision, PdfRevision};
 
 const LOW_CHROMA_THRESHOLD: u8 = 10;
 const MAX_DARK_MODE_WORKERS: usize = 8;
@@ -138,6 +138,7 @@ pub struct RenderRequest {
 #[derive(Debug)]
 pub struct Frame {
     pub key: RenderKey,
+    pub revision: DocumentRevision,
     pub width: u32,
     pub height: u32,
     pub compressed_rgba: Vec<u8>,
@@ -186,6 +187,14 @@ pub struct DocumentLink {
 }
 
 #[derive(Debug)]
+pub struct ResolvedClick {
+    pub pdf_x: f32,
+    pub pdf_y: f32,
+    pub page_height_pt: f32,
+    pub text: Result<Option<(String, usize)>, String>,
+}
+
+#[derive(Debug)]
 pub enum WorkerMessage {
     Ready {
         pages: u32,
@@ -202,10 +211,8 @@ pub enum WorkerMessage {
         document_id: DocumentId,
         page: u32,
         request_id: u64,
-        pdf_x: f32,
-        pdf_y: f32,
-        page_height_pt: f32,
-        text: Result<Option<(String, usize)>, String>,
+        revision: DocumentRevision,
+        result: Result<ResolvedClick, String>,
     },
     OpenError {
         document_id: DocumentId,
@@ -268,6 +275,7 @@ enum WorkerCommand {
         x: u32,
         y: u32,
         key: RenderKey,
+        revision: DocumentRevision,
     },
     Flash {
         document_id: DocumentId,
@@ -300,6 +308,7 @@ enum WorkerTask {
         x: u32,
         y: u32,
         key: RenderKey,
+        revision: DocumentRevision,
     },
     StartSearch {
         document_id: DocumentId,
@@ -476,16 +485,16 @@ impl RenderWorker {
 
     pub fn page_point(
         &self,
-        document_id: DocumentId,
-        page: u32,
+        revision: DocumentRevision,
         request_id: u64,
         x: u32,
         y: u32,
         key: RenderKey,
     ) {
         let _ = self.command_tx.send(WorkerCommand::PagePoint {
-            document_id,
-            page,
+            document_id: key.document_id,
+            page: key.page,
+            revision,
             request_id,
             x,
             y,
@@ -549,7 +558,7 @@ fn run_worker(
     } = channels;
     let result = (|| -> Result<(), String> {
         let pdfium = load_pdfium(pdfium_library)?;
-        let revision = PdfRevision::read(&path).map_err(|error| error.to_string())?;
+        let revision = DocumentRevision::read(&path).map_err(|error| error.to_string())?;
         let document = pdfium
             .load_pdf_from_file(&path, None)
             .map_err(|error| format!("could not open {}: {error}", path.display()))?;
@@ -564,10 +573,11 @@ fn run_worker(
             .send(WorkerMessage::Ready {
                 pages,
                 outline,
-                revision,
+                revision: revision.pdf,
             })
             .map_err(|_| "viewer stopped".to_string())?;
         let mut documents = HashMap::from([(initial_document_id, document)]);
+        let mut revisions = HashMap::from([(initial_document_id, revision)]);
         let mut text_cache: HashMap<DocumentId, Vec<Option<CachedPageText>>> =
             HashMap::from([(initial_document_id, empty_text_cache(pages))]);
         let mut search_jobs = VecDeque::new();
@@ -620,7 +630,7 @@ fn run_worker(
                 } => {
                     let opened = (|| {
                         let revision =
-                            PdfRevision::read(&new_path).map_err(|error| error.to_string())?;
+                            DocumentRevision::read(&new_path).map_err(|error| error.to_string())?;
                         let document = pdfium
                             .load_pdf_from_file(&new_path, None)
                             .map_err(|error| error.to_string())?;
@@ -645,6 +655,7 @@ fn run_worker(
                             } else {
                                 let outline = extract_outline(&replacement);
                                 documents.insert(document_id, replacement);
+                                revisions.insert(document_id, revision);
                                 text_cache.insert(document_id, empty_text_cache(pages));
                                 search_jobs.retain(|job| job.document_id != document_id);
                                 link_index_jobs.retain(|job| job.document_id != document_id);
@@ -655,7 +666,7 @@ fn run_worker(
                                         document_id,
                                         pages,
                                         outline,
-                                        revision,
+                                        revision: revision.pdf,
                                     })
                                     .map_err(|_| "viewer stopped".to_string())?;
                             }
@@ -676,6 +687,7 @@ fn run_worker(
                 }
                 WorkerTask::Close(document_id) => {
                     documents.remove(&document_id);
+                    revisions.remove(&document_id);
                     text_cache.remove(&document_id);
                     search_jobs.retain(|job| job.document_id != document_id);
                     link_index_jobs.retain(|job| job.document_id != document_id);
@@ -707,11 +719,20 @@ fn run_worker(
                     x,
                     y,
                     key,
+                    revision,
                 } => {
-                    if let Some(document) = documents.get(&document_id)
-                        && let Ok(page_index) = i32::try_from(page)
-                        && let Ok(rendered) = document.pages().get(page_index)
-                    {
+                    let result = (|| -> Result<ResolvedClick, String> {
+                        if revisions.get(&document_id) != Some(&revision) {
+                            return Err("hit-test document revision is no longer loaded".into());
+                        }
+                        let document = documents
+                            .get(&document_id)
+                            .ok_or("hit-test document is closed")?;
+                        let page_index = i32::try_from(page).map_err(|e| e.to_string())?;
+                        let rendered = document
+                            .pages()
+                            .get(page_index)
+                            .map_err(|e| e.to_string())?;
                         let zoom = i32::from(key.zoom.max(1));
                         let target_width = (i32::from(key.width) * zoom / 100).max(1);
                         let target_height = (i32::from(key.height) * zoom / 100).max(1);
@@ -722,26 +743,25 @@ fn run_worker(
                             .use_print_quality(false);
                         let config =
                             build_fit_config(base_config, key.fit, target_width, target_height);
-                        let page_height_pt = rendered.height().value;
-                        let (pdf_x, pdf_y) =
-                            match rendered.pixels_to_points(x as i32, y as i32, &config) {
-                                Ok((pdf_x, pdf_y)) => (pdf_x.value, pdf_y.value),
-                                // Unresolvable click: report back so the app can
-                                // clear its pending request instead of wedging.
-                                Err(_) => (-1.0, -1.0),
-                            };
-                        message_tx
-                            .send(WorkerMessage::PagePoint {
-                                document_id,
-                                page,
-                                request_id,
-                                pdf_x,
-                                pdf_y,
-                                page_height_pt,
-                                text: clicked_text(&rendered, pdf_x, pdf_y),
-                            })
-                            .map_err(|_| "viewer stopped".to_string())?;
-                    }
+                        let (pdf_x, pdf_y) = rendered
+                            .pixels_to_points(x as i32, y as i32, &config)
+                            .map_err(|e| e.to_string())?;
+                        Ok(ResolvedClick {
+                            pdf_x: pdf_x.value,
+                            pdf_y: pdf_y.value,
+                            page_height_pt: rendered.height().value,
+                            text: clicked_text(&rendered, pdf_x.value, pdf_y.value),
+                        })
+                    })();
+                    message_tx
+                        .send(WorkerMessage::PagePoint {
+                            document_id,
+                            page,
+                            request_id,
+                            revision,
+                            result,
+                        })
+                        .map_err(|_| "viewer stopped".to_string())?;
                     continue;
                 }
                 WorkerTask::Flash {
@@ -1097,6 +1117,7 @@ fn run_worker(
             message_tx
                 .send(WorkerMessage::Frame(Frame {
                     key: request.key,
+                    revision: revisions[&request.key.document_id],
                     width,
                     height,
                     compressed_rgba,
@@ -1584,6 +1605,7 @@ impl From<WorkerCommand> for WorkerTask {
                 x,
                 y,
                 key,
+                revision,
             } => Self::PagePoint {
                 document_id,
                 page,
@@ -1591,6 +1613,7 @@ impl From<WorkerCommand> for WorkerTask {
                 x,
                 y,
                 key,
+                revision,
             },
             WorkerCommand::IndexLinks {
                 document_id,

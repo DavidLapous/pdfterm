@@ -120,6 +120,47 @@ impl Config {
         Ok(config)
     }
 
+    /// Select private endpoints without duplicating the configuration directory.
+    pub fn select_session(&mut self, name: &str) -> io::Result<()> {
+        if name.is_empty()
+            || name.len() > 24
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(io::Error::other(
+                "session must contain 1..24 ASCII letters, digits, '-' or '_'",
+            ));
+        }
+        let mut endpoints = Vec::new();
+        for value in [self.editor.socket_mut(), self.forward_socket.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if value.is_empty() {
+                continue;
+            }
+            let path = Path::new(value);
+            let file = path
+                .file_name()
+                .ok_or_else(|| io::Error::other("socket path has no filename"))?;
+            let selected = path.with_file_name(format!("{name}-{}", file.to_string_lossy()));
+            if selected.as_os_str().as_encoded_bytes().len() > 103 {
+                return Err(io::Error::other(
+                    "named session socket path exceeds 103 bytes",
+                ));
+            }
+            endpoints.push((value, selected));
+        }
+        for (value, selected) in endpoints {
+            *value = selected
+                .into_os_string()
+                .into_string()
+                .map_err(|_| io::Error::other("socket path is not UTF-8"))?;
+        }
+        Ok(())
+    }
+
     pub fn fit_mode(&self) -> FitMode {
         match self.fit_mode {
             FitModeSetting::Page => FitMode::Page,
@@ -242,6 +283,7 @@ pub struct NvimSettings {
     pub compile: bool,
     pub focus_on_inverse: bool,
     pub executable: String,
+    pub attach_only: bool,
     pub keys: NvimKeys,
 }
 
@@ -364,6 +406,28 @@ mod tests {
         for pages in ["-1", "9", "18446744073709551615"] {
             fs::write(&path, format!("[viewer]\nprefetch_pages = {pages}\n")).unwrap();
             assert!(Config::load_path(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn session_names_validate_before_changing_either_endpoint() {
+        let mut config = Config {
+            editor: crate::editor::Editor::Socket {
+                path: "/private/editor.sock".into(),
+            },
+            forward_socket: Some(format!("/private/{}/forward.sock", "x".repeat(80))),
+            ..Config::default()
+        };
+        assert!(config.select_session("paper").is_err());
+        assert_eq!(config.editor.socket_mut().unwrap(), "/private/editor.sock");
+        for invalid in [
+            "",
+            "../other",
+            "with space",
+            "é",
+            "abcdefghijklmnopqrstuvwxy",
+        ] {
+            assert!(config.select_session(invalid).is_err());
         }
     }
 }
