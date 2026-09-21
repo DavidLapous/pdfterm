@@ -333,21 +333,42 @@ path. Select the executable **before** loading configuration:
 ```lua
 require("pdfterm").setup({
   executable = "/path/to/pdfterm",
-  session = "paper",       -- optional; use the same --session when starting the viewer
-  attach_only = true,     -- never launch a terminal; focus remains separately opt-in
+  -- session = "paper",   -- optional explicit pairing; otherwise unique per editor
+  -- attach_only = true, -- optional locally; SSH never launches local terminals
 })
 ```
 
 Without `executable`, the bundled adapter uses `target/release/pdfterm` beside
-the plugin. It reads the shared configuration with `--print-config`.
+the plugin. Configuration loads asynchronously with `--print-config`, allowing
+TOML keybindings to become available without blocking startup. Configuration and
+listener errors are notifications, not exceptions through the editor's startup.
+The inverse listener opens only on the first navigation or viewer-command action.
+Each editor gets a unique session unless `session` is explicitly supplied.
+
 Forward search first tries the socket, without detecting or controlling a
-terminal. If unavailable and `attach_only` is false (default), the Kitty/Ghostty
-adapter may launch a viewer. Focus control is independently opt-in.
+terminal. Locally, if unavailable and `attach_only` is false (default), the
+Kitty/Ghostty adapter may launch a matching viewer. Focus control is independently
+opt-in. Under SSH (`SSH_CONNECTION` or `SSH_TTY`), launch and focus automation are
+disabled even if terminal identifiers were forwarded.
+
+For SSH, run Neovim and the viewer on the same remote machine. In Neovim, use:
+
+```vim
+:PdfTermViewerCommand
+```
+
+This activates the inverse listener and prints a shell-quoted command with the
+matching session and PDF. Run that command in a second SSH terminal connected to
+the same machine. Use `:PdfTermViewerCommand /path/to/document.pdf` to select a PDF
+directly. Activate this command **before** inverse-clicking a separately started
+viewer; no forward search is required. The local terminal must support Kitty
+graphics over SSH. No local window-control helper or socket forwarding is needed.
 
 Public actions are `forward()`, `build()`, `set_main(file)`, and `toggle_compile()`;
 commands are `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
-`:PdfTermCompile`. `forward_search(pdf, json_payload)` sends an already-resolved
-request. Builds and resolution are asynchronous. Navigation generations start
+`:PdfTermCompile`. `:PdfTermViewerCommand [pdf]` / `viewer_command(pdf)` print the
+paired viewer invocation. `forward_search(pdf, json_payload)` sends an already-resolved
+request. Builds, configuration, and resolution are asynchronous. Navigation generations start
 at invocation; stale completions cannot navigate. Builds sharing a canonical
 working directory or an output PDF run serially, retaining only the newest
 pending build.
@@ -373,7 +394,8 @@ No editor keybindings are installed by default. Set your own bindings under
 `[nvim.keys]`: `forward` saves and forward-searches, `build` builds the main TeX
 file in TeX buffers, `main_file` selects the current TeX file as the main document,
 and `compile` toggles compilation before forward search. Empty or omitted keys
-remain unmapped. Restart Neovim after changing the configuration.
+remain unmapped. Mappings appear after background configuration finishes.
+Restart Neovim after changing the configuration.
 
 ### Inverse-search precision
 
@@ -419,8 +441,11 @@ Each session supports one viewer socket and one editor adapter socket, with
 multiple document tabs. `pdfterm --session paper ...` and
 `setup({ session = "paper" })` select distinct endpoints while sharing config.
 Names contain 1–24 ASCII letters, digits, `_`, or `-`; socket path limits still
-apply. The unnamed session retains existing endpoint names. A second listener
-fails explicitly rather than stealing an endpoint.
+apply. The standalone CLI's unnamed session retains existing endpoint names;
+the Neovim adapter defaults to an automatically generated session instead.
+A second editor using the same explicit session fails only its navigation
+action, with a live-listener or stale-socket diagnostic. It never steals or
+automatically removes an endpoint. Stop its owner before removing a stale socket.
 
 ## Security and licensing
 

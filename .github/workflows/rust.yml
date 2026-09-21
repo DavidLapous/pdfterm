@@ -43,4 +43,6 @@ jobs:
       # Existing unrelated recent-picker label regression is tracked locally.
       run: cargo test --verbose -- --skip picker_labels_recent_files_with_parent_directory
     - name: Exercise headless adapter with real processes and sockets
-      run: PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua
+      run: |
+        PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua
+        PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim_sessions.lua
