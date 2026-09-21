@@ -404,6 +404,12 @@ tries the viewer socket. A capture failure does not prevent socket-only attachme
 If no viewer is available and `attach_only` is false, the Kitty/Ghostty backend
 may launch one using that captured identity. Inverse focus is enabled by default;
 set `focus_on_inverse = false` to keep focus in the viewer.
+Local Ghostty capture and focus share one lazily started JavaScript-for-Automation
+worker per Neovim process. It queries the current front terminal for every capture;
+terminal identities are never cached. Requests have a three-second deadline.
+A timeout or broken protocol stops the worker and fails its pending requests
+explicitly; restart Neovim to retry terminal control. Normal editor exit stops the
+worker. Viewer launch/close, Kitty, and SSH bridge control retain their existing paths.
 Plain SSH sessions do not control client windows just because terminal identifiers
 were forwarded.
 

@@ -1,6 +1,7 @@
 -- Terminal control, not graphics: Kitty and Ghostty both render Kitty protocol.
 -- Handles identify exact surfaces; closing a handle gracefully quits its reader.
 local platform = require 'pdfterm.platform'
+local ghostty_control = require 'pdfterm.ghostty'
 local M = {}
 local kitty, ghostty = {}, {}
 local adapters = { kitty = kitty, ghostty = ghostty, ssh = require 'pdfterm.ssh' }
@@ -73,18 +74,7 @@ function ghostty.launch(source, executable, pdf, callback, session)
 end
 
 function ghostty.focus(source, callback)
-  return platform.applescript(
-    [[
-on run argv
-  tell application "Ghostty"
-    activate
-    focus terminal id (item 1 of argv)
-  end tell
-end run
-]],
-    { source.id },
-    callback
-  )
+  return ghostty_control.request('focus', source.id, callback)
 end
 
 function ghostty.close(split)
@@ -127,9 +117,7 @@ function M.capture_source(callback)
   local kind = vim.env.KITTY_WINDOW_ID and 'kitty' or vim.env.TERM_PROGRAM == 'ghostty' and 'ghostty'
   if not kind then callback('terminal launch/focus requires Kitty or Ghostty'); return end
   if kind == 'kitty' then callback(nil, { kind = kind, id = vim.env.KITTY_WINDOW_ID }); return end
-  local ok, error = pcall(platform.applescript,
-    'tell application "Ghostty" to get id of focused terminal of selected tab of front window',
-    nil, vim.schedule_wrap(function(result)
+  local ok, error = pcall(ghostty_control.request, 'capture', nil, vim.schedule_wrap(function(result)
       local id = vim.trim(result.stdout or '')
       if result.code ~= 0 or id == '' then callback('could not identify source Ghostty terminal: ' .. (result.stderr or ''))
       else callback(nil, { kind = kind, id = id }) end
