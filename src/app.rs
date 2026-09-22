@@ -2782,7 +2782,10 @@ impl App {
         let current_page = self.session.tabs[index].page;
         // Keep one on-demand neighbor even with prefetch disabled: continuous
         // scrolling may need its dimensions before it becomes visible.
-        let cache_radius = (self.viewer.prefetch_pages as u32).max(1);
+        // Config validation bounds prefetch_pages at u32::MAX.
+        let cache_radius = u32::try_from(self.viewer.prefetch_pages)
+            .expect("validated prefetch_pages exceeds u32")
+            .max(1);
         let visible_end = self
             .visible_pages
             .last()
@@ -3317,7 +3320,8 @@ impl App {
 
     fn prefetch_neighbors(&mut self, key: RenderKey) {
         let page_count = self.tab().page_count;
-        for page in (1..=self.viewer.prefetch_pages as u32)
+        for page in (1..=u32::try_from(self.viewer.prefetch_pages)
+            .expect("validated prefetch_pages exceeds u32"))
             .flat_map(|distance| {
                 [
                     key.page.checked_sub(distance),

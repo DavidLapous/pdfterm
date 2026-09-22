@@ -71,7 +71,7 @@ impl Config {
             ("page_scroll_percent", viewer.page_scroll_percent, 1, 100),
             ("flash_duration_ms", viewer.flash_duration_ms, 1, 60000),
             ("source_context_lines", viewer.source_context_lines, 0, 100),
-            ("prefetch_pages", viewer.prefetch_pages, 0, 8),
+            ("prefetch_pages", viewer.prefetch_pages, 0, u32::MAX as u64),
         ] {
             if !(low..=high).contains(&value) {
                 return Err(format!("viewer.{name} must be in {low}..={high}").into());
@@ -264,7 +264,7 @@ impl Default for ViewerSettings {
     fn default() -> Self {
         Self {
             continuous_scroll: true,
-            prefetch_pages: 2,
+            prefetch_pages: 5,
             smooth_scroll: true,
             scroll_frame_ms: 16,
             scroll_ease_divisor: 4,
@@ -407,17 +407,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_prefetch_counts_outside_bounded_window() {
+    fn accepts_prefetch_counts_within_render_window() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
-        for pages in [0, 1, 2, 8] {
+        for pages in [0, 1, 2, 8, 50, u32::MAX as u64] {
             fs::write(&path, format!("[viewer]\nprefetch_pages = {pages}\n")).unwrap();
             assert_eq!(
                 Config::load_path(&path).unwrap().viewer.prefetch_pages,
                 pages
             );
         }
-        for pages in ["-1", "9", "18446744073709551615"] {
+        for pages in ["-1", "18446744073709551615", "notanumber"] {
             fs::write(&path, format!("[viewer]\nprefetch_pages = {pages}\n")).unwrap();
             assert!(Config::load_path(&path).is_err());
         }

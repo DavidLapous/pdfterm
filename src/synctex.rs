@@ -219,8 +219,11 @@ pub fn resolve_forward(
         .lines()
         .nth(line as usize - 1)
         .and_then(|text| ForwardWord::at(text, column));
+    // Beamer records frame bodies at the closing line; query that line so the
+    // resolver cannot pick an earlier frame's mapping.
+    let view_line = frame_closing_line(&source, line).unwrap_or(line);
     let spec = format!(
-        "{line}:{column}:{}",
+        "{view_line}:{column}:{}",
         file.to_str()
             .ok_or_else(|| io::Error::other("source path is not UTF-8"))?
     );
@@ -413,10 +416,9 @@ fn source_line_text(text: &str) -> &str {
     text
 }
 
-/// Find a literal frame environment enclosing the one-based SyncTeX line.
-/// Beamer often attributes every overlay's text to the closing frame line.
-fn source_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>> {
-    let anchor = line.checked_sub(1)? as usize;
+/// Beamer attributes frame bodies to the frame's last source line: forward
+/// search refines against the closing line, inverse search against the range.
+fn frame_bounds(source: &str, anchor: usize) -> Option<(usize, usize)> {
     let mut start = None;
     for (index, text) in source.lines().enumerate() {
         let mut text = source_line_text(text);
@@ -440,11 +442,12 @@ fn source_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>>
                 .and_then(|rest| rest.trim_start().strip_prefix("{frame}"))
             {
                 text = rest;
-                if let Some(start) = start.take()
-                    && start <= anchor
-                    && anchor <= index
-                {
-                    return Some(start..index + 1);
+                if let Some(begin) = start.take() {
+                    if begin <= anchor && anchor <= index {
+                        return Some((begin, index));
+                    }
+                } else if anchor <= index {
+                    return Some((index, index));
                 }
             }
         }
@@ -453,6 +456,17 @@ fn source_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>>
         }
     }
     None
+}
+
+/// Find the literal frame whose body closes at or after the one-based
+/// SyncTeX line. Beamer forwards map interior lines to the closing line.
+pub(crate) fn frame_closing_line(source: &str, line: u32) -> Option<u32> {
+    frame_bounds(source, line.checked_sub(1)? as usize).map(|(_, end)| end as u32 + 1)
+}
+
+/// Find a literal frame environment enclosing the one-based SyncTeX line.
+fn source_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>> {
+    frame_bounds(source, line.checked_sub(1)? as usize).map(|(start, end)| start..end + 1)
 }
 
 pub(crate) fn words(text: &str) -> Vec<(usize, &str)> {

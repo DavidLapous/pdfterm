@@ -210,3 +210,45 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
     };
     assert!(result.is_err());
 }
+
+/// Real Bonn deck: Beamer maps frame bodies to the closing line, so forward
+/// search from an interior line must select the frame's own pages, not the
+/// preceding frame's, and inverse clicks refine into the frame body.
+#[test]
+fn beamer_frame_body_navigates_to_own_frame() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tex = root.join("../Documents/stuff/talks/cours/bonn_hsm_2026/bonn_hsm_2026.tex");
+    let Ok(tex) = fs::canonicalize(&tex) else {
+        return; // Deck absent on other machines.
+    };
+    let pdf = tex.with_extension("pdf");
+    let operation = process::Operation::new(Duration::from_secs(30));
+
+    // Line 4713 sits inside the immunofluorescence frame (4708..4730); the raw
+    // sidecar maps it to the preceding multifiltration frame's pages.
+    let interior = synctex::resolve_forward(&pdf, &tex, 4713, 3).unwrap();
+    assert_eq!(interior.page, 196, "interior line must show its own frame");
+    assert!(interior.word.is_none(), "includegraphics line has no words");
+
+    // The closing line itself is unaffected.
+    let closing = synctex::resolve_forward(&pdf, &tex, 4730, 3).unwrap();
+    assert_eq!(closing.page, 196);
+
+    // Inverse: any interior point of page 196 refines into the frame body.
+    let inverse = synctex::resolve_inverse(
+        &pdf,
+        196,
+        160.0,
+        130.0,
+        Some(("Consider the two following image functions", 0)),
+        4,
+        &operation,
+    )
+    .unwrap();
+    assert_eq!(
+        inverse.location.line, 4709,
+        "prose context picks the body line"
+    );
+    assert!(inverse.location.precise);
+    assert!(inverse.warning.is_none());
+}

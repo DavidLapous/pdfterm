@@ -157,13 +157,13 @@ integer-millisecond timing and terminal scheduling do not guarantee exact 120 Hz
 `smooth_scroll = false` restores immediate steps.
 `continuous_scroll = false` retains single-page scrolling.
 
-`viewer.prefetch_pages = 2` renders and caches up to two pages before and after
-the current page in the background. Set it to `1` for a smaller cache, or `0` to
-disable speculative rendering; visible pages still render on demand. Values
-from `0` through `8` are accepted. More pages use more memory and background
-CPU, but avoid rendering those pages again when you navigate to them after
-prefetch finishes. Foreground requests take priority over queued prefetch work;
-an already-running PDFium render must finish first. Resize, zoom, color changes,
+`viewer.prefetch_pages = 5` renders and caches up to five pages before and after
+the current page in the background. Set it to `0` to disable speculative
+rendering; visible pages still render on demand. Values from `0` through
+`4294967295` are accepted. More pages use more memory and background CPU, but
+avoid rendering those pages again when you navigate to them after prefetch
+finishes. Foreground requests take priority over queued prefetch work; an
+already-running PDFium render must finish first. Resize, zoom, color changes,
 and PDF reloads can require fresh renders.
 
 Relative socket names resolve under the configuration directory's `run/`
