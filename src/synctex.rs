@@ -4,6 +4,7 @@ use crate::pdf::SearchRect;
 use crate::process::Operation;
 use serde::{Deserialize, Serialize};
 use std::{fs, io, os::unix::fs::MetadataExt, path::Path, process::Command};
+use unicode_normalization::char::is_combining_mark;
 
 /// Source coordinates: one-based line, zero-based UTF-8 byte offset;
 /// column is one-based UTF-16 (VS Code), column_char is one-based Unicode scalar.
@@ -95,6 +96,52 @@ pub struct InverseResolution {
     pub warning: Option<String>,
 }
 
+/// Literal source word and nearby prose tokens; not TeX macro expansion.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardWord {
+    pub words: Vec<String>,
+    pub selected: usize,
+}
+
+impl ForwardWord {
+    fn at(text: &str, column: u32) -> Option<Self> {
+        let text = source_line_text(text);
+        let byte = text.char_indices().nth(column.checked_sub(1)? as usize)?.0;
+        let words: Vec<_> = words(text)
+            .into_iter()
+            .filter(|(start, _)| *start == 0 || !text[..*start].ends_with('\\'))
+            .collect();
+        let selected = words
+            .iter()
+            .position(|(start, word)| *start <= byte && byte < start + word.len())?;
+        let start = selected.saturating_sub(3);
+        let end = (selected + 4).min(words.len());
+        if words[start..end].iter().any(|(_, word)| word.len() > 128) {
+            return None;
+        }
+        Some(Self {
+            words: words[start..end]
+                .iter()
+                .map(|(_, word)| (*word).to_owned())
+                .collect(),
+            selected: selected - start,
+        })
+    }
+
+    fn valid(&self) -> bool {
+        self.words.len() <= 7
+            && self.selected < self.words.len()
+            && self.words.iter().all(|word| {
+                word.len() <= 128
+                    && word.chars().next().is_some_and(char::is_alphanumeric)
+                    && word
+                        .chars()
+                        .all(|ch| ch.is_alphanumeric() || is_combining_mark(ch))
+            })
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardRequest {
@@ -105,6 +152,7 @@ pub struct ForwardRequest {
     pub v: f32,
     pub width: f32,
     pub height: f32,
+    pub word: Option<ForwardWord>,
 }
 
 impl ForwardRequest {
@@ -118,6 +166,12 @@ impl ForwardRequest {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self.word.as_ref().is_some_and(|word| !word.valid()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid forward word context",
+            ));
+        }
         if !self.pdf.is_absolute()
             || self.page == 0
             || self.width < 0.0
@@ -160,6 +214,11 @@ pub fn resolve_forward(
     let pdf = fs::canonicalize(pdf)?;
     let file = fs::canonicalize(file)?;
     let revision = PdfRevision::read(&pdf)?;
+    let source = read_source(&file)?;
+    let word = source
+        .lines()
+        .nth(line as usize - 1)
+        .and_then(|text| ForwardWord::at(text, column));
     let spec = format!(
         "{line}:{column}:{}",
         file.to_str()
@@ -205,6 +264,7 @@ pub fn resolve_forward(
                 v,
                 width,
                 height,
+                word,
             };
             result.validate()?;
             revision.check(&result.pdf)?;
@@ -395,6 +455,22 @@ fn source_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>>
     None
 }
 
+pub(crate) fn words(text: &str) -> Vec<(usize, &str)> {
+    let mut result = Vec::new();
+    let mut start = None;
+    for (index, ch) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        if ch.is_alphanumeric() || start.is_some() && is_combining_mark(ch) {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            result.push((start, &text[start..index]));
+        }
+    }
+    result
+}
+
 /// Refine prose and mathematical atoms without expanding arbitrary TeX macros.
 fn source_word_location(
     source: &str,
@@ -421,21 +497,6 @@ fn source_prose_location(
     lines: std::ops::Range<usize>,
     within_frame: bool,
 ) -> Option<(u32, usize)> {
-    fn words(text: &str) -> Vec<(usize, &str)> {
-        let mut result = Vec::new();
-        let mut start = None;
-        for (index, ch) in text
-            .char_indices()
-            .chain(std::iter::once((text.len(), ' ')))
-        {
-            if ch.is_alphanumeric() {
-                start.get_or_insert(index);
-            } else if let Some(start) = start.take() {
-                result.push((start, &text[start..index]));
-            }
-        }
-        result
-    }
     fn normalized(word: &str) -> String {
         word.to_lowercase()
             .replace('ﬁ', "fi")
@@ -650,6 +711,25 @@ mod tests {
     }
 
     #[test]
+    fn forward_word_uses_scalar_columns_and_rejects_commands_and_comments() {
+        let line = "école \\emph{naïve} word % hidden";
+        let hint = ForwardWord::at(line, 13).unwrap();
+        assert_eq!(hint.words[hint.selected], "naïve");
+        for column in [0, 6, 8, 24, 26, u32::MAX] {
+            assert!(ForwardWord::at(line, column).is_none(), "column {column}");
+        }
+        let mut hint = hint;
+        hint.selected = hint.words.len();
+        assert!(!hint.valid());
+        let decomposed = "e\u{301}cole";
+        for column in 1..=decomposed.chars().count() as u32 {
+            let hint = ForwardWord::at(decomposed, column).unwrap();
+            assert_eq!(hint.words[hint.selected], decomposed);
+            assert!(hint.valid());
+        }
+    }
+
+    #[test]
     fn forward_geometry_preserves_top_down_coordinates_and_rejects_overflow() {
         let revision = PdfRevision::read(Path::new(file!())).unwrap();
         let payload = format!(
@@ -678,6 +758,15 @@ mod tests {
             payload.replace("\"h\":72", "\"h\":1e100"),
             payload.replace("\"h\":72", "\"h\":72,\"h\":73"),
             payload.replace("\"h\":72", "\"h\":72,\"unexpected\":0"),
+            payload.replace("\"h\":72", r#""h":72,"word":{"words":[],"selected":0}"#),
+            payload.replace(
+                "\"h\":72",
+                r#""h":72,"word":{"words":["text"],"selected":1}"#,
+            ),
+            payload.replace(
+                "\"h\":72",
+                r#""h":72,"word":{"words":["two words"],"selected":0}"#,
+            ),
         ] {
             assert!(parse_forward_request(&invalid).is_err(), "{invalid}");
         }

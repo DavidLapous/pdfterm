@@ -311,6 +311,22 @@ checked before and after SyncTeX resolution. This is local filesystem identity,
 not a cryptographic content digest. Geometry is in points, with `h` the left edge
 and `v` the bottom edge measured down from the page top.
 
+The resolver also sends optional `word` context, for example
+`{"words":["a","navigation","anchor"],"selected":1}` (`selected` is zero-based).
+It uses the saved UTF-8 source, bounded to a regular file of at most 2 MiB;
+unreadable or unsupported source files fail resolution explicitly. Command names,
+comments, and positions outside a literal word supply no word hint.
+Hints contain at most seven words of at most 128 UTF-8 bytes each. Letters,
+numbers, and attached Unicode combining marks form words.
+
+Within the selected SyncTeX region, the viewer matches complete PDF words using
+case/compatibility normalization and neighboring-word context. A unique best match
+flashes only that word and positions scrolling using its actual bounds. Ties,
+missing words, and unsupported PDF glyph mappings retain the original region,
+with an explicit status message rather than guessing the nearest word. This does
+not expand TeX macros or select a different page or Beamer overlay. PDF text
+extraction errors fail the request explicitly.
+
 The viewer reloads a different revision **before** validating page count, positions
 the target, and replies `{"ok":true,"error":null}` only after submitting the
 matching rendered frame to the terminal and flushing output. This does not wait

@@ -45,7 +45,7 @@ pub(crate) struct PendingForward {
 pub(crate) struct PendingFlash {
     pub document_id: DocumentId,
     pub page: u32,
-    pub center_pt: Option<f32>,
+    pub positioning_pending: bool,
     pub expires_at: Option<std::time::Instant>,
 }
 

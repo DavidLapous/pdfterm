@@ -69,6 +69,7 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
         .unwrap();
     assert_eq!(inverse.location.byte_column, expected);
     fs::write(&source, [0xff]).unwrap();
+    assert!(synctex::resolve_forward(&pdf, &source, 6, 1).is_err());
     let coarse = synctex::resolve_inverse(
         &pdf,
         request.page,
@@ -96,6 +97,7 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
             let name = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         }
+        assert!(synctex::resolve_forward(&pdf, &source, 6, 1).is_err());
         let result = synctex::resolve_inverse(
             &pdf,
             request.page,
@@ -112,6 +114,7 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
     }
     fs::remove_file(&source).unwrap();
     fs::write(&source, include_str!("fixtures/navigation.tex")).unwrap();
+    let word_request = synctex::resolve_forward(&pdf, &source, 6, expected as u32 + 1).unwrap();
 
     // One PDFium lifetime in this process, including both reload revisions.
     let worker = RenderWorker::spawn(1, pdf.clone(), None);
@@ -132,12 +135,32 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
         selected_link_ordinal: None,
     };
     worker.begin_generation(1);
+    worker.flash(
+        1,
+        word_request.page - 1,
+        word_request.rect(),
+        word_request.word,
+    );
     worker.render(RenderRequest { key, generation: 1 }).unwrap();
     let WorkerMessage::Frame(frame) = message(&worker) else {
         panic!("expected displayed frame")
     };
     let displayed = frame.revision;
     assert_eq!(displayed, DocumentRevision::read(&pdf).unwrap());
+    let highlight = frame.flash.as_ref().unwrap();
+    assert!(highlight.error.is_none());
+    assert!(highlight.word_precise);
+    assert!(highlight.rect.right - highlight.rect.left < request.width / 2.0);
+    assert!(highlight.rect.left > request.h);
+    worker.flash(1, request.page - 1, request.rect(), None);
+    worker.render(RenderRequest { key, generation: 1 }).unwrap();
+    let WorkerMessage::Frame(coarse) = message(&worker) else {
+        panic!("expected coarse forward frame")
+    };
+    let coarse = coarse.flash.as_ref().unwrap();
+    assert!(!coarse.word_precise);
+    assert!(coarse.error.is_none());
+    assert!((coarse.rect.right - coarse.rect.left - request.width).abs() < 0.001);
     for (id, bad_key, success) in [
         (1, RenderKey { page: 99, ..key }, false),
         (

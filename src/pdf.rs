@@ -13,7 +13,8 @@ use pdfium_render::prelude::{
     PdfRect, PdfRenderConfig, Pdfium,
 };
 
-use crate::synctex::{DocumentRevision, PdfRevision};
+use crate::synctex::{DocumentRevision, ForwardWord, PdfRevision, words};
+use unicode_normalization::UnicodeNormalization;
 
 const LOW_CHROMA_THRESHOLD: u8 = 10;
 const MAX_DARK_MODE_WORKERS: usize = 8;
@@ -148,10 +149,16 @@ pub struct Frame {
     pub compression_elapsed: Duration,
     pub generation: u64,
     pub links: Vec<PageLink>,
-    /// Page height in points, set when the frame carries a forward-search
-    /// flash; 0.0 otherwise. The app needs it to turn the flash rect into a
-    /// scroll ratio.
-    pub flash_page_height_pt: f32,
+    pub flash: Option<ForwardHighlight>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ForwardHighlight {
+    pub rect: SearchRect,
+    pub page_height_pt: f32,
+    pub word_precise: bool,
+    /// Refinement errors fail this forward request, not the renderer.
+    pub error: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -281,6 +288,7 @@ enum WorkerCommand {
         document_id: DocumentId,
         page: u32,
         rect: SearchRect,
+        word: Option<ForwardWord>,
     },
     ClearFlash {
         document_id: DocumentId,
@@ -327,6 +335,7 @@ enum WorkerTask {
         document_id: DocumentId,
         page: u32,
         rect: SearchRect,
+        word: Option<ForwardWord>,
     },
     ClearFlash {
         document_id: DocumentId,
@@ -502,11 +511,18 @@ impl RenderWorker {
         });
     }
 
-    pub fn flash(&self, document_id: DocumentId, page: u32, rect: SearchRect) {
+    pub fn flash(
+        &self,
+        document_id: DocumentId,
+        page: u32,
+        rect: SearchRect,
+        word: Option<ForwardWord>,
+    ) {
         let _ = self.command_tx.send(WorkerCommand::Flash {
             document_id,
             page,
             rect,
+            word,
         });
     }
 
@@ -583,7 +599,7 @@ fn run_worker(
         let mut search_jobs = VecDeque::new();
         let mut link_index_jobs = VecDeque::new();
         let mut search_highlights: HashMap<DocumentId, SearchHighlights> = HashMap::new();
-        let mut flash_highlights: HashMap<DocumentId, (u32, SearchRect, f32)> = HashMap::new();
+        let mut flash_highlights: HashMap<DocumentId, (u32, ForwardHighlight)> = HashMap::new();
 
         loop {
             let task = match command_rx.try_recv() {
@@ -768,28 +784,51 @@ fn run_worker(
                     document_id,
                     page,
                     rect,
+                    word,
                 } => {
                     // Forward-search flash state: the app re-issues the render
                     // (and the clear) around this store, so nothing else to do.
                     // The wire rect is y-down from the page top (synctex v);
                     // flip to pdfium bottom-up so points_to_pixels lands right.
-                    let page_height = {
-                        let Some(document) = documents.get(&document_id) else {
-                            continue;
-                        };
-                        document
-                            .pages()
-                            .get(page as i32)
-                            .map(|target| target.height().value)
-                            .unwrap_or_default()
+                    let Some(document) = documents.get(&document_id) else {
+                        continue;
                     };
+                    let target = document
+                        .pages()
+                        .get(page as i32)
+                        .map_err(|e| e.to_string())?;
+                    let page_height = target.height().value;
                     let flipped = SearchRect {
                         left: rect.left,
                         right: rect.right,
                         top: page_height - rect.bottom,
                         bottom: page_height - rect.top,
                     };
-                    flash_highlights.insert(document_id, (page, flipped, page_height));
+                    let refined = (|| -> Result<Option<SearchRect>, String> {
+                        let Some(word) = word else { return Ok(None) };
+                        let cache = text_cache
+                            .get_mut(&document_id)
+                            .ok_or("missing PDF text cache")?;
+                        let cached = cached_page_text(document, page, cache)
+                            .ok_or("could not extract PDF text for word highlighting")?;
+                        forward_word_rect(&target, cached, &word, flipped)
+                    })();
+                    let (refined, error) = match refined {
+                        Ok(rect) => (rect, None),
+                        Err(error) => (None, Some(Arc::<str>::from(error))),
+                    };
+                    flash_highlights.insert(
+                        document_id,
+                        (
+                            page,
+                            ForwardHighlight {
+                                rect: refined.unwrap_or(flipped),
+                                page_height_pt: page_height,
+                                word_precise: refined.is_some(),
+                                error,
+                            },
+                        ),
+                    );
                     continue;
                 }
                 WorkerTask::ClearFlash { document_id } => {
@@ -1040,10 +1079,9 @@ fn run_worker(
             };
             let flash = flash_highlights
                 .get(&request.key.document_id)
-                .filter(|(page, _, _)| *page == request.key.page)
-                .map(|(_, rect, page_height)| (rect, *page_height));
-            let flash_rectangle = flash.as_ref().map(|(rect, _)| *rect);
-            let flash_page_height_pt = flash.map(|(_, page_height)| page_height).unwrap_or(0.0);
+                .filter(|(page, _)| *page == request.key.page)
+                .map(|(_, highlight)| highlight);
+            let flash_rectangle = flash.map(|highlight| &highlight.rect);
             let highlight_elapsed = (search_rectangles.is_some()
                 || (request.key.link_mode && !links.is_empty())
                 || !selected_link_rectangles.is_empty()
@@ -1127,7 +1165,7 @@ fn run_worker(
                     compression_elapsed,
                     generation: request.generation,
                     links,
-                    flash_page_height_pt,
+                    flash: flash.cloned(),
                 }))
                 .map_err(|_| "viewer stopped".to_string())?;
         }
@@ -1626,10 +1664,12 @@ impl From<WorkerCommand> for WorkerTask {
                 document_id,
                 page,
                 rect,
+                word,
             } => Self::Flash {
                 document_id,
                 page,
                 rect,
+                word,
             },
             WorkerCommand::ClearFlash { document_id } => Self::ClearFlash { document_id },
         }
@@ -1783,6 +1823,88 @@ fn push_normalized_character(
 ) {
     normalized.push(character);
     source_index_by_byte.extend(std::iter::repeat_n(source_index, character.len_utf8()));
+}
+
+/// Match complete PDF words inside the SyncTeX region, never an arbitrary nearest
+/// glyph. Equal context scores are ambiguous and retain the coarse region.
+fn forward_word_rect(
+    page: &PdfPage,
+    cached: &CachedPageText,
+    hint: &ForwardWord,
+    region: SearchRect,
+) -> Result<Option<SearchRect>, String> {
+    let same = |a: &str, b: &str| {
+        a.nfkc()
+            .flat_map(char::to_lowercase)
+            .eq(b.nfkc().flat_map(char::to_lowercase))
+    };
+    let tokens = words(&cached.normalized);
+    let text = page.text().map_err(|e| e.to_string())?;
+    let mut best = None;
+    let mut tied = false;
+    for (index, &(start, word)) in tokens.iter().enumerate() {
+        if !same(word, &hint.words[hint.selected]) {
+            continue;
+        }
+        let end = start + word.len();
+        let first = cached.source_index_by_byte[start];
+        let last = cached.source_index_by_byte[end - 1];
+        // Reject omitted Unicode units and partial case-expanded glyphs.
+        if last - first + 1 != word.chars().count()
+            || start > 0 && cached.source_index_by_byte[start - 1] == first
+            || cached.source_index_by_byte.get(end) == Some(&last)
+        {
+            continue;
+        }
+        let segments = text.segments_subset(first, last - first + 1);
+        let mut rectangles = segments.iter();
+        let Some(segment) = rectangles.next() else {
+            continue;
+        };
+        if rectangles.next().is_some() {
+            continue;
+        }
+        let bounds = segment.bounds();
+        let x = (bounds.left().value + bounds.right().value) * 0.5;
+        let y = (bounds.bottom().value + bounds.top().value) * 0.5;
+        if x < region.left - 2.0
+            || x > region.right + 2.0
+            || y < region.top.min(region.bottom) - 2.0
+            || y > region.top.max(region.bottom) + 2.0
+        {
+            continue;
+        }
+        let mut score = 0;
+        for distance in 1..=3isize {
+            for direction in [-1, 1] {
+                let delta = direction * distance;
+                if let (Some(a), Some(b)) = (
+                    index.checked_add_signed(delta).and_then(|i| tokens.get(i)),
+                    hint.selected
+                        .checked_add_signed(delta)
+                        .and_then(|i| hint.words.get(i)),
+                ) && same(a.1, b)
+                {
+                    score += 4 - distance;
+                }
+            }
+        }
+        let rect = SearchRect {
+            left: bounds.left().value,
+            right: bounds.right().value,
+            top: bounds.top().value,
+            bottom: bounds.bottom().value,
+        };
+        match best {
+            Some((old, _)) if score < old => {}
+            Some((old, _)) if score == old => tied = true,
+            _ => {
+                best = Some((score, rect));
+                tied = false;
+            }
+        }
+    }
+    Ok(best.filter(|_| !tied).map(|(_, rect)| rect))
 }
 
 fn search_page(
@@ -2801,6 +2923,51 @@ mod tests {
         assert!(context.contains("Synthetic Needle"));
 
         let page = text_document.pages().get(0).expect("text page");
+        let cached = cached_page_text(&text_document, 0, &mut cache).unwrap();
+        let region = super::SearchRect {
+            left: 0.0,
+            right: 400.0,
+            top: 100.0,
+            bottom: 0.0,
+        };
+        let mut hint = crate::synctex::ForwardWord {
+            words: vec!["needle".into()],
+            selected: 0,
+        };
+        assert!(
+            super::forward_word_rect(&page, cached, &hint, region)
+                .unwrap()
+                .is_none()
+        );
+        hint.words = ["synthetic", "needle", "synthetic", "needle"]
+            .map(String::from)
+            .into();
+        let mut previous = 0.0;
+        for selected in 0..4 {
+            hint.selected = selected;
+            let rect = super::forward_word_rect(&page, cached, &hint, region)
+                .unwrap()
+                .unwrap();
+            assert!(rect.left > previous);
+            assert!(rect.right - rect.left < 80.0, "word, not the complete line");
+            previous = rect.left;
+        }
+        hint.words = vec!["needle".into()];
+        hint.selected = 0;
+        let right_half = super::SearchRect {
+            left: 200.0,
+            ..region
+        };
+        let rect = super::forward_word_rect(&page, cached, &hint, right_half)
+            .unwrap()
+            .unwrap();
+        assert!(rect.left > 200.0);
+        hint.words[0] = "need".into();
+        assert!(
+            super::forward_word_rect(&page, cached, &hint, region)
+                .unwrap()
+                .is_none()
+        );
         let config = PdfRenderConfig::new()
             .set_reverse_byte_order(true)
             .set_target_width(400);

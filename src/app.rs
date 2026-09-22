@@ -1507,14 +1507,11 @@ impl App {
         self.navigation.flash = Some(PendingFlash {
             document_id,
             page,
-            center_pt: Some(if self.viewer.center_forward_search {
-                (rect.top + rect.bottom) * 0.5
-            } else {
-                rect.top
-            }),
+            positioning_pending: true,
             expires_at: None,
         });
-        self.worker.flash(document_id, page, rect);
+        self.worker
+            .flash(document_id, page, rect, request.word.clone());
         self.generation += 1;
         self.worker.begin_generation(self.generation);
         // A cached unhighlighted target is not a submitted forward-search frame.
@@ -2721,7 +2718,7 @@ impl App {
         if frame.generation != self.generation {
             return Ok(());
         }
-        if frame.flash_page_height_pt > 0.0
+        if frame.flash.is_some()
             && !self.navigation.flash.as_ref().is_some_and(|flash| {
                 flash.document_id == frame.key.document_id && flash.page == frame.key.page
             })
@@ -2776,16 +2773,25 @@ impl App {
             Some(flash)
                 if flash.document_id == key.document_id
                     && flash.page == key.page
-                    && frame.flash_page_height_pt > 0.0 =>
+                    && frame.flash.is_some() =>
             {
-                flash.center_pt.take()
+                std::mem::take(&mut flash.positioning_pending).then(|| {
+                    let highlight = frame.flash.as_ref().unwrap();
+                    let position = if self.viewer.center_forward_search {
+                        (highlight.rect.top + highlight.rect.bottom) * 0.5
+                    } else {
+                        highlight.rect.top.max(highlight.rect.bottom)
+                    };
+                    highlight.page_height_pt - position
+                })
             }
             _ => None,
         };
         if let Some(center_pt) = flash_scroll {
             let viewport = self.viewport()?;
-            let center =
-                (center_pt / frame.flash_page_height_pt * frame.height as f32).round() as i64;
+            let center = (center_pt / frame.flash.as_ref().unwrap().page_height_pt
+                * frame.height as f32)
+                .round() as i64;
             self.tab_mut().pending_destination = None;
             self.tab_mut().scroll_y = 0;
             let target = center
@@ -2844,24 +2850,28 @@ impl App {
         synchronized_output(output, |output| {
             self.draw_frame_unsynchronized(frame, viewport, output)
         })?;
-        let submitted = self.navigation.flash.as_ref().is_some_and(|flash| {
+        let submitted = self.navigation.flash.as_ref().and_then(|flash| {
             let matches = |rendered: &Frame| {
                 rendered.key.document_id == flash.document_id
                     && rendered.key.page == flash.page
-                    && rendered.flash_page_height_pt > 0.0
+                    && rendered.flash.is_some()
             };
-            flash.center_pt.is_none()
-                && self.pending_vertical_scroll == 0
-                && if self.viewer.continuous_scroll
-                    && self.link_picker.is_none()
-                    && self.search_picker.is_none()
-                {
-                    self.visible_pages.iter().any(|page| matches(&page.frame))
-                } else {
-                    matches(frame)
-                }
+            if flash.positioning_pending || self.pending_vertical_scroll != 0 {
+                return None;
+            }
+            if self.viewer.continuous_scroll
+                && self.link_picker.is_none()
+                && self.search_picker.is_none()
+            {
+                self.visible_pages
+                    .iter()
+                    .find(|page| matches(&page.frame))
+                    .and_then(|page| page.frame.flash.clone())
+            } else {
+                matches(frame).then(|| frame.flash.clone()).flatten()
+            }
         });
-        if submitted {
+        if let Some(highlight) = submitted {
             let flash = self.navigation.flash.as_mut().unwrap();
             flash.expires_at.get_or_insert_with(|| {
                 Instant::now() + Duration::from_millis(self.viewer.flash_duration_ms)
@@ -2871,13 +2881,26 @@ impl App {
                 .forward
                 .as_ref()
                 .and_then(|pending| pending.request.revision.check(&pending.request.pdf).err())
-                .map(|error| error.to_string());
+                .map(|error| error.to_string())
+                .or_else(|| {
+                    highlight
+                        .error
+                        .as_ref()
+                        .map(|error| format!("word highlight failed: {error}"))
+                });
             if self
                 .navigation
                 .forward
                 .as_ref()
                 .is_some_and(|pending| pending.stage == ForwardStage::AwaitingFrame)
             {
+                if error.is_none() && !highlight.word_precise {
+                    self.draw_status(
+                        output,
+                        viewport,
+                        "forward search: SyncTeX region; no unique source word",
+                    )?;
+                }
                 self.finish_forward(error);
             }
         }
