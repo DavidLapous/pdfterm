@@ -40,11 +40,12 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      # Existing unrelated recent-picker label regression is tracked locally.
-      run: cargo test --verbose -- --skip picker_labels_recent_files_with_parent_directory
+      run: cargo test --verbose
     - name: Exercise headless adapter with real processes and sockets
       run: |
         PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua
         PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim_sessions.lua
+    - name: Exercise persistent Ghostty control with a fake worker
+      run: nvim --headless -u NONE -l tests/nvim_ghostty.lua
     - name: Exercise bounded SSH launcher protocol
       run: python3 tests/ssh_launcher.py
