@@ -173,6 +173,8 @@ fn regions(source: &str) -> Vec<Range<usize>> {
 /// line for every word. Restrict refinement to that complete literal argument.
 pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
     let mut i = 0;
+    let mut counted_to = 0;
+    let mut counted_lines = 0;
     while i < source.len() {
         let ch = source[i..].chars().next()?;
         if ch == '%' {
@@ -185,8 +187,18 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
                     i += 1;
                 }
                 if let Some((body, end)) = group(source, i) {
-                    let first = source[..body.start].bytes().filter(|c| *c == b'\n').count();
-                    let last = source[..end].bytes().filter(|c| *c == b'\n').count();
+                    let first = counted_lines
+                        + source[counted_to..body.start]
+                            .bytes()
+                            .filter(|c| *c == b'\n')
+                            .count();
+                    let last = first
+                        + source[body.start..end]
+                            .bytes()
+                            .filter(|c| *c == b'\n')
+                            .count();
+                    counted_to = end;
+                    counted_lines = last;
                     if (first..=last).contains(&(line.checked_sub(1)? as usize)) {
                         return Some(first..last + 1);
                     }
@@ -481,6 +493,15 @@ pub(super) fn source_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_scopes_preserve_lines_after_skipped_captions() {
+        let source = "prefix\n% ignored\n\\caption{\nfirst\n}\ntext\n\\caption*\n{\nsecond\n}";
+        assert_eq!(caption_lines(source, 4), Some(2..5));
+        assert_eq!(caption_lines(source, 9), Some(7..10));
+        assert_eq!(caption_lines(source, 6), None);
+        assert_eq!(caption_lines(source, 0), None);
+    }
 
     #[test]
     fn math_regions_respect_tex_delimiters_and_comments() {
