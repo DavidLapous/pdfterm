@@ -147,8 +147,15 @@ ranges, and file-access errors stop startup with the configuration path.
 
 Restart the viewer after editing its configuration. `?` shows controls and the
 active configuration path.
-Scrolling eases over terminal rows; `smooth_scroll = false` restores immediate
-steps. `continuous_scroll = false` retains single-page scrolling.
+Scrolling eases in image pixels, including across page boundaries; it does not
+snap to terminal rows. Cached pages use retained Kitty image placements rather
+than rerendering or retransmitting their pixels on each tick.
+Unchanged canvas and status content is not repainted. Frame commands are buffered
+and flushed at the end of each synchronized update. Active animation waits until
+the next `viewer.scroll_frame_ms` deadline rather than a fixed input-poll interval;
+integer-millisecond timing and terminal scheduling do not guarantee exact 120 Hz.
+`smooth_scroll = false` restores immediate steps.
+`continuous_scroll = false` retains single-page scrolling.
 
 `viewer.prefetch_pages = 2` renders and caches up to two pages before and after
 the current page in the background. Set it to `1` for a smaller cache, or `0` to

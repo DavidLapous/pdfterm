@@ -54,9 +54,26 @@ const PAGE_IMAGE_Z_INDEX: i32 = i32::MIN / 2 - 2;
 const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
 const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 
+/// Defer inner flushes until synchronized_output has closed the frame.
+struct FrameOutput<'a, W>(&'a mut W);
+
+impl<W: Write> Write for FrameOutput<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0.write_all(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn synchronized_output<W, T, E>(
     output: &mut W,
-    operation: impl FnOnce(&mut W) -> Result<T, E>,
+    operation: impl FnOnce(&mut FrameOutput<'_, W>) -> Result<T, E>,
 ) -> Result<T, E>
 where
     W: Write,
@@ -65,7 +82,7 @@ where
     output
         .write_all(BEGIN_SYNCHRONIZED_UPDATE)
         .map_err(E::from)?;
-    let operation_result = operation(output);
+    let operation_result = operation(&mut FrameOutput(output));
     let finish_result = output
         .write_all(END_SYNCHRONIZED_UPDATE)
         .and_then(|()| output.flush());
@@ -113,7 +130,7 @@ pub fn run(
         return Err(AppError::NotInteractive);
     }
 
-    let mut output = io::stdout();
+    let mut output = io::BufWriter::new(io::stdout().lock());
     let defaults = AppDefaults::from(config);
     let theme = defaults.theme;
     let _terminal = TerminalGuard::enter(&mut output, theme)?;
@@ -235,7 +252,7 @@ pub fn run(
         app.poll_flash_expiry()?;
         app.poll_smooth_scroll(&mut output)?;
 
-        if event::poll(Duration::from_millis(10))? {
+        if event::poll(app.input_wait())? {
             match read_event()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.cancel_forward("forward search cancelled by keyboard input")?;
@@ -281,6 +298,7 @@ struct App {
     pending: HashSet<RenderKey>,
     visible_image_id: Option<u32>,
     visible_pages: Vec<VisiblePage>,
+    canvas_viewport: Option<Viewport>,
     pending_vertical_scroll: i64,
     smooth_scroll_remaining: i64,
     smooth_scroll_tick: Instant,
@@ -288,6 +306,8 @@ struct App {
     viewer: ViewerSettings,
     next_image_id: u32,
     last_status_row: Option<u16>,
+    status_line: Vec<u8>,
+    status_buffer: Vec<u8>,
     performance_snapshot: Option<PerformanceSnapshot>,
     default_fit: FitMode,
     default_invert: bool,
@@ -795,12 +815,15 @@ impl App {
             pending: HashSet::new(),
             visible_image_id: None,
             visible_pages: Vec::new(),
+            canvas_viewport: None,
             pending_vertical_scroll: 0,
             smooth_scroll_remaining: 0,
             smooth_scroll_tick: Instant::now(),
             title_document: None,
             next_image_id: 1,
             last_status_row: None,
+            status_line: Vec::new(),
+            status_buffer: Vec::new(),
             performance_snapshot: None,
             default_fit,
             default_invert,
@@ -971,7 +994,8 @@ impl App {
         Ok(())
     }
 
-    fn draw_goto(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+    fn draw_goto(&mut self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+        self.status_line.clear();
         let theme = self.theme;
         let input = self.goto_input.as_deref().unwrap_or_default();
         let hint = format!(
@@ -1052,7 +1076,8 @@ impl App {
         Ok(())
     }
 
-    fn draw_search(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+    fn draw_search(&mut self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+        self.status_line.clear();
         let theme = self.theme;
         let input = self.search_input.as_deref().unwrap_or_default();
         execute!(
@@ -2392,13 +2417,12 @@ impl App {
             && self.link_picker.is_none()
             && self.search_picker.is_none()
         {
-            let cell = (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1);
             let pixels = if large {
                 u32::from(viewport.pixel_height) * self.viewer.page_scroll_percent as u32 / 100
             } else {
                 u32::from(viewport.pixel_height) * self.viewer.scroll_step_percent as u32 / 100
             };
-            let step = i64::from(pixels.max(1).div_ceil(cell) * cell);
+            let step = i64::from(pixels.max(1));
             self.smooth_scroll_remaining += if forward { step } else { -step };
             if !self.viewer.smooth_scroll {
                 self.pending_vertical_scroll += std::mem::take(&mut self.smooth_scroll_remaining);
@@ -2465,6 +2489,16 @@ impl App {
         self.redraw_current(output)
     }
 
+    fn input_wait(&self) -> Duration {
+        let background_wait = Duration::from_millis(10);
+        if self.smooth_scroll_remaining == 0 || self.pending_vertical_scroll != 0 {
+            return background_wait;
+        }
+        Duration::from_millis(self.viewer.scroll_frame_ms)
+            .saturating_sub(self.smooth_scroll_tick.elapsed())
+            .min(background_wait)
+    }
+
     fn poll_smooth_scroll(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         if self.link_picker.is_some()
             || self.search_picker.is_some()
@@ -2484,23 +2518,27 @@ impl App {
         }
         self.smooth_scroll_tick = now;
         let viewport = self.viewport()?;
-        let cell = u64::from((u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1));
         // Ease toward the accumulated wheel/key target without queuing animations.
         let remaining = self.smooth_scroll_remaining;
-        let step = (remaining
+        let step = remaining
             .unsigned_abs()
-            .div_ceil(self.viewer.scroll_ease_divisor)
-            .max(cell)
-            .div_ceil(cell)
-            * cell)
-            .min(remaining.unsigned_abs()) as i64
+            .div_ceil(self.viewer.scroll_ease_divisor) as i64
             * remaining.signum();
         self.smooth_scroll_remaining -= step;
         self.pending_vertical_scroll = step;
         if self.apply_vertical_scroll(viewport)? {
-            let rest = self.smooth_scroll_remaining;
-            self.request_current(output)?;
-            self.smooth_scroll_remaining = rest;
+            let key = self.render_key(viewport);
+            if self.desired_key == Some(key)
+                && let Some(frame) = self.tab().cache.get(&key).cloned()
+            {
+                // An offset-only tick needs placement, not a new render generation
+                // or another scan of the prefetch window.
+                self.draw_frame(&frame, viewport, output)?;
+            } else {
+                let rest = self.smooth_scroll_remaining;
+                self.request_current(output)?;
+                self.smooth_scroll_remaining = rest;
+            }
         }
         Ok(())
     }
@@ -2546,7 +2584,7 @@ impl App {
                     )) as u32;
                     self.pending_vertical_scroll = 0;
                 } else {
-                    let span = i64::from((frame.height.div_ceil(cell) + 1) * cell);
+                    let span = i64::from(frame.height) + i64::from(cell);
                     if offset + delta < span {
                         self.tab_mut().scroll_y = (offset + delta) as u32;
                         self.pending_vertical_scroll = 0;
@@ -2565,7 +2603,7 @@ impl App {
                     self.request_visible_page(previous)?;
                     return Ok(false);
                 };
-                let span = (previous.height.div_ceil(cell) + 1) * cell;
+                let span = previous.height + cell;
                 self.pending_vertical_scroll += offset;
                 self.tab_mut().page -= 1;
                 self.tab_mut().scroll_y = span;
@@ -2675,6 +2713,7 @@ impl App {
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
+        self.status_line.clear();
         if self.viewer.set_window_title && self.title_document != Some(self.tab().document_id) {
             let title: String = self
                 .tab()
@@ -2943,6 +2982,7 @@ impl App {
                 image_id,
                 columns: placement.columns,
                 rows: placement.rows,
+                offset_y: 0,
                 z_index: PAGE_IMAGE_Z_INDEX,
                 crop: placement.crop,
             },
@@ -3044,48 +3084,42 @@ impl App {
                 .height
                 .saturating_sub(u32::from(viewport.pixel_height))
         } else {
-            frame.height.div_ceil(cell) * cell
+            // The inter-page gap belongs to this page; the next page starts at
+            // height + cell. This is the inclusive clamp for that half-open span.
+            frame.height + cell - 1
         };
-        self.tab_mut().scroll_y = self.tab().scroll_y.min(max_y) / cell * cell;
+        self.tab_mut().scroll_y = self.tab().scroll_y.min(max_y);
         let old_pages = std::mem::take(&mut self.visible_pages);
         if old_pages.is_empty()
             && let Some(id) = self.visible_image_id.take()
         {
             kitty::delete_image(output, id)?;
         }
-        self.prepare_image_canvas(output, viewport)?;
+        // Kitty (image id, p=1) replaces the old placement, including its crop.
+        // Only text/UI or geometry changes require clearing the canvas.
+        if old_pages.is_empty() || self.canvas_viewport != Some(viewport) {
+            self.prepare_image_canvas(output, viewport)?;
+        }
         let started = Instant::now();
         let mut page = self.tab().page;
-        let mut row = 0;
-        while row < viewport.rows && page < self.tab().page_count {
+        let mut y = -i64::from(self.tab().scroll_y);
+        while y < i64::from(viewport.pixel_height) && page < self.tab().page_count {
             let key = self.page_key(page, viewport);
             let Some(rendered) = self.tab().cache.get(&key).cloned() else {
                 self.request_visible_page(key)?;
                 break;
             };
-            let offset = if page == self.tab().page {
-                self.tab().scroll_y
-            } else {
-                0
-            };
-            let page_rows = rendered.height.div_ceil(cell);
-            let rows = page_rows
-                .saturating_sub(offset / cell)
-                .min(u32::from(viewport.rows - row)) as u16;
-            if rows > 0 {
-                let mut placement =
-                    viewport.place(rendered.width, rendered.height, self.tab().scroll_x, 0);
-                placement.rows = rows;
-                placement.scroll_y = offset;
-                placement.crop = Some(kitty::Crop {
-                    x: placement.scroll_x,
-                    y: offset,
-                    width: rendered.width.min(u32::from(viewport.pixel_width)),
-                    height: rendered
-                        .height
-                        .saturating_sub(offset)
-                        .min(u32::from(rows) * cell),
-                });
+            let offset = (-y).max(0) as u32;
+            let top = y.max(0) as u32;
+            let span = i64::from(rendered.height) + i64::from(cell);
+            if let Some(placement) = viewport.place_continuous(
+                rendered.width,
+                rendered.height,
+                self.tab().scroll_x,
+                offset,
+                top,
+            ) {
+                let row = (top / cell) as u16;
                 let retained = old_pages
                     .iter()
                     .find(|old| Arc::ptr_eq(&old.frame, &rendered));
@@ -3098,8 +3132,9 @@ impl App {
                 };
                 let kitty_placement = Placement {
                     image_id,
-                    columns: placement.columns,
-                    rows,
+                    columns: 0,
+                    rows: 0,
+                    offset_y: placement.offset_y,
                     z_index: PAGE_IMAGE_Z_INDEX,
                     crop: placement.crop,
                 };
@@ -3122,7 +3157,7 @@ impl App {
                     image_id,
                 });
             }
-            row += rows + 1; // A single terminal row separates neighboring pages.
+            y += span; // Keep a one-cell-high gap, without rounding page heights.
             page += 1;
         }
         for old in old_pages {
@@ -3165,10 +3200,11 @@ impl App {
                 .visible_pages
                 .iter()
                 .find(|page| {
-                    mouse.row >= page.top
-                        && mouse.row < page.top + page.placement.rows
-                        && mouse.column >= page.placement.left
-                        && mouse.column < page.placement.left + page.placement.columns
+                    mouse.row.checked_sub(page.top).is_some_and(|row| {
+                        page.placement
+                            .source_cell(mouse.column, row, page.frame.width, page.frame.height)
+                            .is_some()
+                    })
                 })
                 .map(|page| (Arc::clone(&page.frame), page.placement, page.top));
         }
@@ -3201,12 +3237,19 @@ impl App {
         ))
     }
 
-    fn prepare_image_canvas(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
-        clear_image_canvas(output, viewport)
+    fn prepare_image_canvas(
+        &mut self,
+        output: &mut impl Write,
+        viewport: Viewport,
+    ) -> io::Result<()> {
+        clear_image_canvas(output, viewport)?;
+        self.canvas_viewport = Some(viewport);
+        self.status_line.clear();
+        Ok(())
     }
 
     fn draw_status(
-        &self,
+        &mut self,
         output: &mut impl Write,
         viewport: Viewport,
         state: &str,
@@ -3234,19 +3277,22 @@ impl App {
         }
         let search_status = tab.search.status_label(tab.page);
         let link_status = self.link_mode.then_some("  click/enter: open  esc: close");
+        let page = tab.page + 1;
+        let page_count = tab.page_count;
+        self.status_buffer.clear();
         execute!(
-            output,
+            self.status_buffer,
             MoveTo(0, viewport.status_row),
             SetBackgroundColor(theme.bg_dark),
             SetForegroundColor(theme.fg),
             Clear(ClearType::CurrentLine),
             Print(" "),
             SetForegroundColor(theme.blue),
-            Print(tab.page + 1),
+            Print(page),
             SetForegroundColor(theme.fg_dark),
             Print("/"),
             SetForegroundColor(theme.magenta),
-            Print(tab.page_count),
+            Print(page_count),
             Print("  "),
             SetForegroundColor(theme.yellow),
             Print(&mode),
@@ -3261,7 +3307,12 @@ impl App {
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;
-        output.flush()
+        if self.status_buffer != self.status_line {
+            output.write_all(&self.status_buffer)?;
+            output.flush()?;
+            std::mem::swap(&mut self.status_line, &mut self.status_buffer);
+        }
+        Ok(())
     }
 
     fn prefetch_neighbors(&mut self, key: RenderKey) {
@@ -3297,6 +3348,8 @@ impl App {
         kitty::delete_all(output)?;
         self.visible_image_id = None;
         self.visible_pages.clear();
+        self.canvas_viewport = None;
+        self.status_line.clear();
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
         self.last_status_row = None;
@@ -3414,33 +3467,15 @@ impl App {
         };
         let key = frame.key;
         let revision = frame.revision;
-        let Some(local_column) = mouse.column.checked_sub(placement.left) else {
+        let Some(cell) = mouse
+            .row
+            .checked_sub(image_top)
+            .and_then(|row| placement.source_cell(mouse.column, row, frame.width, frame.height))
+        else {
             return Ok(());
         };
-        let Some(local_row) = mouse.row.checked_sub(image_top) else {
-            return Ok(());
-        };
-        if local_column >= placement.columns || local_row >= placement.rows {
-            return Ok(());
-        }
-        let (source_x, source_y, visible_width, visible_height) = placement
-            .crop
-            .map_or((0, 0, frame.width, frame.height), |crop| {
-                (crop.x, crop.y, crop.width, crop.height)
-            });
-        let cell_x0 =
-            source_x + scaled_cell_boundary(local_column, placement.columns, visible_width);
-        let cell_x1 = source_x
-            + scaled_cell_boundary(
-                local_column.saturating_add(1),
-                placement.columns,
-                visible_width,
-            );
-        let cell_y0 = source_y + scaled_cell_boundary(local_row, placement.rows, visible_height);
-        let cell_y1 = source_y
-            + scaled_cell_boundary(local_row.saturating_add(1), placement.rows, visible_height);
-        let pixel_x = (cell_x0 + cell_x1) / 2;
-        let pixel_y = (cell_y0 + cell_y1) / 2;
+        let pixel_x = cell.x + cell.width / 2;
+        let pixel_y = cell.y + cell.height / 2;
         let (document_id, page) = (key.document_id, key.page);
         let request_id = self.navigation.next_request_id;
         self.navigation.next_request_id = request_id.wrapping_add(1);
@@ -3583,26 +3618,13 @@ fn link_at_cell(
     column: u16,
     row: u16,
 ) -> Option<LinkTarget> {
-    let local_column = column.checked_sub(placement.left)?;
-    let local_row = row.checked_sub(viewport_top)?;
-    if local_column >= placement.columns || local_row >= placement.rows {
-        return None;
-    }
-    let (source_x, source_y, visible_width, visible_height) = placement
-        .crop
-        .map_or((0, 0, image_width, image_height), |crop| {
-            (crop.x, crop.y, crop.width, crop.height)
-        });
-    let x0 = source_x + scaled_cell_boundary(local_column, placement.columns, visible_width);
-    let x1 = source_x
-        + scaled_cell_boundary(
-            local_column.saturating_add(1),
-            placement.columns,
-            visible_width,
-        );
-    let y0 = source_y + scaled_cell_boundary(local_row, placement.rows, visible_height);
-    let y1 = source_y
-        + scaled_cell_boundary(local_row.saturating_add(1), placement.rows, visible_height);
+    let cell = placement.source_cell(
+        column,
+        row.checked_sub(viewport_top)?,
+        image_width,
+        image_height,
+    )?;
+    let (x0, x1, y0, y1) = (cell.x, cell.x + cell.width, cell.y, cell.y + cell.height);
     let cell_center_x = u64::from(x0) + u64::from(x1);
     let cell_center_y = u64::from(y0) + u64::from(y1);
 
@@ -3623,10 +3645,6 @@ fn link_at_cell(
                 .saturating_add(cell_center_y.abs_diff(link_center_y).saturating_pow(2))
         })
         .map(|link| link.target.clone())
-}
-
-fn scaled_cell_boundary(cell: u16, cells: u16, pixels: u32) -> u32 {
-    ((u64::from(cell) * u64::from(pixels)) / u64::from(cells.max(1))) as u32
 }
 
 fn stale_status_row(previous: Option<u16>, current: u16) -> Option<u16> {
@@ -4017,6 +4035,7 @@ impl LinkPickerImage {
                     image_id,
                     columns: placement.columns,
                     rows: placement.rows,
+                    offset_y: 0,
                     z_index: PAGE_IMAGE_Z_INDEX,
                     crop: placement.crop,
                 },
@@ -4047,6 +4066,7 @@ impl LinkPickerImage {
                 image_id: self.image_id,
                 columns,
                 rows,
+                offset_y: 0,
                 z_index: PAGE_IMAGE_Z_INDEX,
                 crop: self.crop,
             },
@@ -6290,6 +6310,56 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_output_batches_flushes_and_reports_submission_errors() {
+        #[derive(Default)]
+        struct Sink {
+            bytes: Vec<u8>,
+            writes: usize,
+            flushes: usize,
+            fail_flush: bool,
+        }
+
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.fail_flush {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed terminal"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        for fail_flush in [false, true] {
+            let mut output = io::BufWriter::new(Sink {
+                fail_flush,
+                ..Sink::default()
+            });
+            let result: io::Result<()> = synchronized_output(&mut output, |frame| {
+                frame.write_all(b"first")?;
+                frame.flush()?;
+                frame.write_all(b"second")?;
+                frame.flush()
+            });
+            if fail_flush {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            } else {
+                result.unwrap();
+            }
+            let sink = output.get_ref();
+            assert_eq!(sink.bytes, b"\x1b[?2026hfirstsecond\x1b[?2026l");
+            assert_eq!(sink.writes, 1);
+            assert_eq!(sink.flushes, 1);
+        }
+    }
+
+    #[test]
     fn render_timings_are_compact_by_default_and_expand_on_demand() {
         assert_eq!(
             render_timing_status(15, Some(12), Some(0), 27, 17, false),
@@ -6544,6 +6614,8 @@ mod tests {
             crop: None,
             scroll_x: 0,
             scroll_y: 0,
+            native_cell: None,
+            offset_y: 0,
         };
 
         assert_eq!(
@@ -7536,6 +7608,7 @@ mod tests {
                     image_id: 12,
                     columns: 60,
                     rows: 30,
+                    offset_y: 0,
                     z_index: super::PAGE_IMAGE_Z_INDEX,
                     crop: None,
                 },
