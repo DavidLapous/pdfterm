@@ -110,11 +110,19 @@ function M.launch_split(source, executable, pdf, callback, session)
   if session then
     vim.list_extend(argv, { '--session', session })
   end
-  local done, reply = false, nil
+  local done, reply, callback_failure = false, nil, nil
   adapter(source).launch(source, argv, function(result)
+    local ok, failure = xpcall(function()
+      local id = vim.trim(result.stdout)
+      callback(result, result.code == 0 and id ~= '' and { kind = source.kind, id = id } or nil)
+    end, debug.traceback)
     done, reply = true, result
-    local id = vim.trim(result.stdout)
-    callback(result, result.code == 0 and id ~= '' and { kind = source.kind, id = id } or nil)
+    if not ok then
+      -- wait() must not report transport success when ownership recording failed.
+      -- Rethrow as well: the SSH backend owns rollback of the offered handle.
+      callback_failure = failure
+      error(failure)
+    end
   end)
   return {
     wait = function(_, timeout)
@@ -122,6 +130,9 @@ function M.launch_split(source, executable, pdf, callback, session)
         return done
       end, 10) then
         error('pdfterm: terminal launch timed out')
+      end
+      if callback_failure then
+        error(callback_failure)
       end
       return reply
     end,
