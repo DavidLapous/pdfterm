@@ -231,7 +231,7 @@ local function deliver(pdf, payload, id, source, source_error)
     return
   end
   M._source_terminal = source
-  local launched, attempts = false, 0
+  local launched, retry_deadline = false, nil
   local attempt
   attempt = function()
     if not alive(id) then
@@ -268,15 +268,15 @@ local function deliver(pdf, payload, id, source, source_error)
             if launch_error then
               notify(launch_error)
             else
+              retry_deadline = vim.uv.hrtime() + 5e9
               attempt()
             end
           end)
         else
-          attempts = attempts + 1
-          if attempts >= 25 then
+          if vim.uv.hrtime() >= retry_deadline then
             notify('viewer did not open its forward socket')
           else
-            vim.defer_fn(attempt, 200)
+            vim.defer_fn(attempt, 20)
           end
         end
       end
