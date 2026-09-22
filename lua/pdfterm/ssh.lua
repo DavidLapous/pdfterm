@@ -2,26 +2,58 @@
 local socket = require('pdfterm.socket')
 local M = {}
 
-local function request(payload, callback)
+local function request(payload, callback, timeout)
   local done, result = false, nil
+  local callback_failure
   local cancel = socket.request(
     vim.env.PDFTERM_LAUNCH_SOCKET,
     vim.json.encode(payload),
-    function(error, _, reply)
-      result = { code = error and 1 or 0, stdout = reply and reply.id or '', stderr = error or '' }
-      done = true
-      callback(result)
+    function(transport_error, _, reply)
+      local function complete(problem)
+        result =
+          { code = problem and 1 or 0, stdout = reply and reply.id or '', stderr = problem or '' }
+        local ok, failure = xpcall(function()
+          callback(result)
+        end, debug.traceback)
+        if not ok then
+          if payload.action == 'launch' and reply and reply.id then
+            local cleaned, closed = pcall(function()
+              return request({ action = 'close', id = reply.id }, function() end, 2000):wait(2500)
+            end)
+            if not cleaned or closed.code ~= 0 then
+              failure = failure .. '; cleanup: ' .. (cleaned and closed.stderr or tostring(closed))
+            end
+          end
+          callback_failure = failure
+          result = { code = 1, stdout = '', stderr = failure }
+          done = true
+          error(failure)
+        end
+        done = true
+      end
+      if transport_error and payload.action == 'launch' and reply and reply.id then
+        -- Confirmation may be lost after the bridge accepted the receipt.
+        -- Close the exact offered handle before reporting failed ownership.
+        request({ action = 'close', id = reply.id }, function(closed)
+          complete(transport_error .. (closed.code ~= 0 and ('; cleanup: ' .. closed.stderr) or ''))
+        end, 2000)
+      else
+        complete(transport_error)
+      end
     end,
-    6000,
+    timeout or 6000,
     payload.action == 'launch'
   )
   return {
     wait = function(_, timeout)
-      if not vim.wait(timeout or 6500, function()
+      if not vim.wait(timeout or 8500, function()
         return done
       end, 10) then
         cancel()
         error('pdfterm: client terminal control timed out')
+      end
+      if callback_failure then
+        error(callback_failure)
       end
       return result
     end,

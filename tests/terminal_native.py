@@ -89,7 +89,7 @@ if action == 'capture' then
     finish({code=error and 1 or 0,stderr=error,stdout=handle and handle.id})
   end)
 elseif action == 'launch' then
-  terminal.launch_split(source,arg[3],arg[4],finish,arg[5]):wait(6500)
+  terminal.launch_split(source,arg[3],arg[4],finish,arg[5]):wait()
   assert(done,'launch wait returned before ownership callback')
 elseif action == 'focus' then
   terminal.focus(source,finish)

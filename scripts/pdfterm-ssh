@@ -285,9 +285,13 @@ class Bridge:
                     client.settimeout(min(0.5, deadline - time.monotonic()))
                     client.sendall(json.dumps(reply).encode() + b'\n')
                     if provisional:
-                        client.settimeout(min(0.5, max(0.001, deadline - time.monotonic())))
+                        client.settimeout(max(0.001, deadline - time.monotonic()))
                         if client.recv(1) != b'\x06':
                             raise ConnectionError('launch ownership was not acknowledged')
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('launch ownership deadline exceeded')
+                        client.settimeout(max(0.001, deadline - time.monotonic()))
+                        client.sendall(json.dumps({**reply, 'confirmed': True}).encode() + b'\n')
                         provisional = None
                 except (ValueError, RecursionError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                     try:

@@ -81,6 +81,13 @@ class LauncherTests(unittest.TestCase):
             reply = json.loads(chunks)
             if launching and reply['ok']:
                 client.sendall(b'\x06')
+                chunks = bytearray()
+                while chunk := client.recv(4096):
+                    chunks.extend(chunk)
+                    if b'\n' in chunks:
+                        break
+                reply = json.loads(chunks)
+                self.assertTrue(reply.get('confirmed'), reply)
             return reply
 
     def nvim(self, code):
@@ -122,6 +129,86 @@ vim.cmd('qa!')
 """)
         self.assertEqual(self.windows.serial, 1)
         self.assertFalse(self.windows.live)
+
+    def test_delayed_editor_receipt_keeps_viewer_and_reports_confirmed_ownership(self):
+        self.nvim("""
+local schedule, delayed = vim.schedule, false
+vim.schedule = function(callback)
+  schedule(function()
+    if not delayed then
+      delayed = true
+      vim.uv.sleep(750)
+    end
+    callback()
+  end)
+end
+local terminal = require('pdfterm.terminal')
+local owned
+local process = terminal.launch_split({ kind = 'ssh', id = 'source' }, 'viewer', 'paper.pdf',
+  function(result, split)
+    assert(result.code == 0, result.stderr)
+    owned = assert(split)
+  end)
+assert(process:wait().code == 0)
+local focused
+terminal.focus(owned, function(result)
+  assert(result.code == 0, result.stderr)
+  focused = true
+end)
+assert(vim.wait(1000, function() return focused end))
+terminal.close(owned)
+vim.cmd('qa!')
+""")
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+
+    def test_failed_confirmation_never_reports_success_and_closes_offered_viewer(self):
+        sendall = socket.socket.sendall
+
+        def reject_confirmation(client, data, *args):
+            if b'"confirmed": true' in data:
+                raise BrokenPipeError('confirmation delivery failed')
+            return sendall(client, data, *args)
+
+        with patch.object(socket.socket, 'sendall', reject_confirmation):
+            self.nvim("""
+local called = 0
+local process = require('pdfterm.terminal').launch_split(
+  { kind = 'ssh', id = 'source' }, 'viewer', 'paper.pdf',
+  function(result, split)
+    called = called + 1
+    assert(result.code ~= 0 and not split)
+    assert(result.stderr:find('confirmation delivery failed'), result.stderr)
+  end)
+assert(process:wait().code ~= 0)
+assert(called == 1)
+vim.cmd('qa!')
+""")
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+        self.assertFalse(self.bridge.owned)
+
+    def test_throwing_ownership_callback_closes_confirmed_viewer(self):
+        self.nvim("""
+local schedule, failure = vim.schedule, nil
+vim.schedule = function(callback)
+  schedule(function()
+    local ok, error = xpcall(callback, debug.traceback)
+    if not ok then failure = error end
+  end)
+end
+local process = require('pdfterm.ssh').launch(nil, { 'viewer', 'paper.pdf' }, function()
+  error('ownership callback failed')
+end)
+assert(vim.wait(4000, function() return failure end))
+assert(failure:find('ownership callback failed'), failure)
+local ok, error = pcall(process.wait, process, 50)
+assert(not ok and error:find('ownership callback failed'), error)
+vim.cmd('qa!')
+""")
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+        self.assertFalse(self.bridge.owned)
 
     def test_editor_exit_waits_for_pending_launch_then_closes_viewer(self):
         root = Path(launcher['__file__']).resolve().parent.parent

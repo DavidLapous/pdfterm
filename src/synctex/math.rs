@@ -245,12 +245,12 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
     result
 }
 
-/// Opaque expressions cannot produce precise results, but their known atoms
-/// must still participate in ambiguity detection. Dropping an opaque duplicate
-/// would incorrectly make a different, supported expression look unique.
+/// An opaque expression can render glyphs absent from its lexical atoms, or
+/// change their extraction order. It blocks precision throughout the scope.
 fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
     let mut result = Vec::new();
     let mut opaque = false;
+    let mut scripted = false;
     let mut i = range.start;
     while i < range.end {
         let start = i;
@@ -258,7 +258,13 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
         i += ch.len_utf8();
         match ch {
             '%' => i += source[i..range.end].find('\n').unwrap_or(range.end - i),
-            '{' | '}' | '_' | '^' | '&' => {}
+            '{' | '}' | '&' => {}
+            '_' | '^' => {
+                // A single script has a linear base/script order. Multiple
+                // scripts can be extracted in visual rather than source order.
+                opaque |= scripted;
+                scripted = true;
+            }
             '\\' => {
                 let (name, end) = command(source, start);
                 i = end;
@@ -399,9 +405,12 @@ pub(super) fn source_location(
         {
             continue;
         }
-        let Some((atoms, opaque)) = atoms(source, range.clone()) else {
-            continue;
-        };
+        let (atoms, opaque) = atoms(source, range.clone())?;
+        // Unknown macro arguments/expansions and reordered scripts can hide
+        // another occurrence, even when none of their known atoms match.
+        if opaque {
+            return None;
+        }
         let atoms = inline_context(source, &range, atoms);
         for (index, atom) in atoms.iter().enumerate() {
             if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
@@ -425,12 +434,6 @@ pub(super) fn source_location(
             {
                 continue;
             }
-            // An unknown expansion can change neighboring text and its PDF
-            // extraction order. A shorter known context is not evidence against
-            // this occurrence: do not let a supported duplicate outrank it.
-            if opaque {
-                return None;
-            }
             // Stop at the first mismatch and at this expression's boundary.
             // Context from a different formula must not break an ambiguity tie.
             let mut score = 0;
@@ -445,6 +448,11 @@ pub(super) fn source_location(
                         _ => break,
                     }
                 }
+            }
+            // A standalone punctuation match is not evidence that the clicked
+            // glyph belongs to this formula rather than nearby prose.
+            if !pdf[selected].value.is_alphanumeric() && score == 0 {
+                continue;
             }
             let location = (row as u32, atom.span.start - starts[row - 1]);
             let proximity = if within_frame {
@@ -540,10 +548,7 @@ mod tests {
         assert_eq!(source_location(source, 2, 0..2, true, "x⟼y", 1, None), None);
         assert_eq!(source_location(source, 2, 0..2, true, "x⟼h", 1, None), None);
         let source = "$\\alpha\\custom{z}$\n$\\beta$";
-        assert_eq!(
-            source_location(source, 2, 0..2, true, "β", 0, None),
-            Some((2, 1))
-        );
+        assert_eq!(source_location(source, 2, 0..2, true, "β", 0, None), None);
     }
 
     #[test]
@@ -568,6 +573,25 @@ mod tests {
         assert_eq!(
             source_location("$X+x$", 1, 0..1, false, "𝑋+𝑥", 0, None),
             Some((1, 1))
+        );
+    }
+
+    #[test]
+    fn unsupported_neighbors_and_unanchored_punctuation_remain_coarse() {
+        for (source, context, offset) in [
+            ("Hello.\n$x.y$", "Hello. x.y", 5),
+            ("$\\identity{\\alpha}$\n$\\alpha$", "α α", 0),
+            ("$\\alpha_a^b$\n$\\alpha_b^a$", "α\r\nba\r\nα\r\nab", 0),
+        ] {
+            assert_eq!(
+                source_location(source, 1, 0..2, false, context, offset, None),
+                None,
+                "{source}"
+            );
+        }
+        assert_eq!(
+            source_location("$x.y$", 1, 0..1, false, "x.y", 1, None),
+            Some((1, 2))
         );
     }
 }

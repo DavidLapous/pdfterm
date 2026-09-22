@@ -119,7 +119,7 @@ pub fn run(
     let _terminal = TerminalGuard::enter(&mut output, theme)?;
     let path = match path {
         Some(path) => path.canonicalize()?,
-        None => match pick_pdf(std::env::current_dir()?, &mut output, theme)? {
+        None => match pick_pdf(std::env::current_dir()?, &mut output, theme, || Ok(false))? {
             Some(path) => path,
             None => return Ok(()),
         },
@@ -838,7 +838,7 @@ impl App {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        match pick_pdf(directory, output, self.theme)? {
+        match pick_pdf(directory, output, self.theme, || self.forward_waiting())? {
             Some(path) => {
                 let path = path.canonicalize()?;
                 if let Some(index) = self.session.tabs.iter().position(|tab| tab.path == path) {
@@ -865,7 +865,9 @@ impl App {
             return Ok(());
         }
         self.clear_viewer(output)?;
-        let selection = pick_outline(&outline, self.tab().page, output, self.theme)?;
+        let selection = pick_outline(&outline, self.tab().page, output, self.theme, || {
+            self.forward_waiting()
+        })?;
         if let Some(page) = selection {
             let page = page.min(self.tab().page_count - 1);
             self.tab_mut().page = page;
@@ -881,7 +883,9 @@ impl App {
             return Ok(());
         }
         self.clear_viewer(output)?;
-        let selection = pick_theme(&self.themes, self.theme_index, output)?;
+        let selection = pick_theme(&self.themes, self.theme_index, output, || {
+            self.forward_waiting()
+        })?;
         if let Some(index) = selection {
             self.apply_theme(index);
         }
@@ -895,7 +899,7 @@ impl App {
             return Ok(());
         }
         self.clear_viewer(output)?;
-        show_help(output, self.theme)?;
+        show_help(output, self.theme, || self.forward_waiting())?;
         self.clear_viewer(output)?;
         self.reset_render_state();
         self.request_current(output)
@@ -1333,6 +1337,12 @@ impl App {
             page,
             ready_at: Instant::now() + LINK_PREVIEW_DELAY,
         });
+    }
+
+    fn forward_waiting(&self) -> io::Result<bool> {
+        self.forward_listener
+            .as_ref()
+            .map_or(Ok(false), crate::ipc::ForwardListener::has_pending)
     }
 
     fn poll_forward_socket(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -3635,6 +3645,7 @@ fn pick_pdf(
     directory: PathBuf,
     output: &mut impl Write,
     theme: Palette,
+    interrupt: impl Fn() -> io::Result<bool>,
 ) -> Result<Option<PathBuf>, AppError> {
     let mut browser = BrowserState::new(directory);
     browser.set_recents(crate::recent::load());
@@ -3646,6 +3657,9 @@ fn pick_pdf(
     let mut filtering = false;
 
     let selection = loop {
+        if interrupt()? {
+            break None;
+        }
         if browser.poll_recursive() {
             redraw = true;
         }
@@ -3724,12 +3738,19 @@ fn clear_picker(output: &mut impl Write, theme: Palette) -> io::Result<()> {
     output.flush()
 }
 
-fn show_help(output: &mut impl Write, theme: Palette) -> Result<(), AppError> {
+fn show_help(
+    output: &mut impl Write,
+    theme: Palette,
+    interrupt: impl Fn() -> io::Result<bool>,
+) -> Result<(), AppError> {
     let backend = CrosstermBackend::new(&mut *output);
     let mut terminal = Terminal::new(backend)?;
     let mut redraw = true;
 
     loop {
+        if interrupt()? {
+            break;
+        }
         if redraw {
             terminal.autoresize()?;
             terminal.draw(|frame| draw_help_menu(frame, theme))?;
@@ -3760,6 +3781,7 @@ fn pick_theme(
     themes: &[(String, Palette)],
     current: usize,
     output: &mut impl Write,
+    interrupt: impl Fn() -> io::Result<bool>,
 ) -> Result<Option<usize>, AppError> {
     let mut filter = String::new();
     let mut filtered = filter_theme_indices(themes, &filter);
@@ -3774,6 +3796,9 @@ fn pick_theme(
     let mut visible_height = 1;
 
     let selection = loop {
+        if interrupt()? {
+            break None;
+        }
         if redraw {
             terminal.autoresize()?;
             let area = terminal.size()?;
@@ -4259,6 +4284,7 @@ fn pick_outline(
     current_page: u32,
     output: &mut impl Write,
     theme: Palette,
+    interrupt: impl Fn() -> io::Result<bool>,
 ) -> Result<Option<u32>, AppError> {
     let mut filter = String::new();
     let mut filtered: Vec<usize> = (0..items.len()).collect();
@@ -4271,6 +4297,9 @@ fn pick_outline(
     let mut filtering = false;
 
     let selection = loop {
+        if interrupt()? {
+            break None;
+        }
         if redraw {
             terminal.autoresize()?;
             let area = terminal.size()?;

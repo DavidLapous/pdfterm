@@ -476,10 +476,13 @@ termination close its owned viewer windows and SSH master; cleanup errors are
 reported. SIGKILL or a client crash cannot guarantee cleanup. At most four control
 requests are admitted at once, each with a five-second queue/operation budget;
 Neovim allows six seconds for transport and reply. A launched viewer remains
-provisional until Neovim records its handle and acknowledges ownership. A missing
-receipt closes that viewer rather than leaving it for shell shutdown. Cleanup
-failure is reported and the bridge retains ownership. Update the client wrapper
-and remote adapter together, then restart the SSH session.
+provisional until Neovim sends an ownership receipt within the remaining operation
+budget. Success is reported only after the bridge confirms that receipt. Missing
+receipts roll back the launch; failed confirmation or an ownership callback error
+closes the offered handle. Exit waits allow 8.5 seconds, including a separate
+two-second cleanup request. Cleanup failures are reported and the bridge retains
+ownership. Update the client wrapper and remote adapter together, then restart
+the SSH session.
 Requests and helper output are bounded. The SSH server must permit reverse Unix-socket forwarding;
 refusal fails explicitly. There is no persistent daemon, TCP listener, or
 automatic change to SSH configuration. `attach_only = true` still forbids launch.
@@ -543,6 +546,9 @@ Restart Neovim after changing the configuration.
 
 ### Forward-search precision
 
+Forward navigation dismisses open Help, file, outline, and theme menus before
+positioning the document. The reply still waits for the highlighted frame.
+
 Forward search currently uses the first complete SyncTeX result. For Beamer
 overlays (`\pause`, `\only`, `\uncover`, `\visible`), this may select a page where
 the target is hidden. Collected frame bodies can also make SyncTeX return a
@@ -570,9 +576,12 @@ PDFium exposes their UTF-16 halves separately.
 
 This is lexical matching, not a TeX macro expander. Unsupported expressions,
 ambiguous matches, and font-private glyphs remain **line only**; there is no
-nearest-word fallback. Reordered scripts and complex notation can also prevent
-an unambiguous match. Native PDF glyph hit-testing can select an adjacent glyph
-when characters are small or overlap; refinement uses the glyph actually selected.
+nearest-word fallback. Punctuation needs matching neighboring context. Unknown
+macro expansion and expressions with multiple scripts block mathematical
+precision throughout the candidate scope: their rendered glyphs or extraction
+order cannot be established lexically. A single supported script can still use
+literal inline context. Native PDF glyph hit-testing can select an adjacent
+glyph when characters are small or overlap; refinement uses the glyph selected.
 
 Each displayed frame records the PDF and companion SyncTeX filesystem revision.
 Clicks carry that revision through hit-testing and check it before resolution

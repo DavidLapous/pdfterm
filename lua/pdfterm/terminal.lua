@@ -180,7 +180,7 @@ function M.launch_split(source, executable, pdf, callback, session)
   end)
   return {
     wait = function(_, timeout)
-      if not vim.wait(timeout or 6500, function()
+      if not vim.wait(timeout or 8500, function()
         return done
       end, 10) then
         error('pdfterm: terminal launch timed out')

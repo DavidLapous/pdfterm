@@ -301,6 +301,25 @@ impl ForwardListener {
             clients: Vec::new(),
         })
     }
+    /// Wake modal UI without consuming the request; the main loop owns delivery.
+    pub fn has_pending(&self) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        if !self.clients.is_empty() {
+            return Ok(true);
+        }
+        let mut descriptor = libc::pollfd {
+            fd: self.listener.socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other("forward listener is unavailable"));
+        }
+        Ok(descriptor.revents & libc::POLLIN != 0)
+    }
     pub fn poll(&mut self) -> io::Result<Vec<(io::Result<ForwardRequest>, ForwardReply)>> {
         // Bound acceptance and work even when local clients flood the socket.
         for _ in self.clients.len()..16 {

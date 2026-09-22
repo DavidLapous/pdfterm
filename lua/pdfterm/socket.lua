@@ -5,6 +5,7 @@ function M.request(path, payload, callback, timeout, acknowledge)
   local pipe = assert(vim.uv.new_pipe(false))
   local timer = assert(vim.uv.new_timer())
   local chunks, size, done = {}, 0, false
+  local offered
   local function finish(error, connection_error, reply)
     if done then
       return
@@ -12,44 +13,11 @@ function M.request(path, payload, callback, timeout, acknowledge)
     done = true
     timer:stop()
     timer:close()
-    if (error or not acknowledge) and not pipe:is_closing() then
+    if not pipe:is_closing() then
       pipe:close()
     end
     vim.schedule(function()
-      if error or not acknowledge then
-        callback(error, connection_error, reply)
-        return
-      end
-      -- The callback records the handle before the bridge releases provisional
-      -- ownership. Callback failure or editor exit without a receipt rolls back.
-      local ok, failure = xpcall(function()
-        callback(error, connection_error, reply)
-      end, debug.traceback)
-      if not ok then
-        if not pipe:is_closing() then
-          pipe:close()
-        end
-        assert(ok, failure)
-      end
-      if acknowledge and not error then
-        local function receipt_done(write_error)
-          if not pipe:is_closing() then
-            pipe:close()
-          end
-          if write_error then
-            vim.schedule(function()
-              vim.notify(
-                'pdfterm: launch ownership receipt failed: ' .. write_error,
-                vim.log.levels.ERROR
-              )
-            end)
-          end
-        end
-        local sent, write_error = pipe:write('\006', receipt_done)
-        if not sent then
-          receipt_done(write_error)
-        end
-      end
+      callback(error, connection_error, reply or offered)
     end)
   end
   local function response(data)
@@ -60,6 +28,29 @@ function M.request(path, payload, callback, timeout, acknowledge)
       )
     elseif acknowledge and (type(reply.id) ~= 'string' or reply.id == '') then
       finish('launch reply has no window ID')
+    elseif acknowledge and not offered then
+      if reply.confirmed then
+        finish('launch confirmation arrived before offer')
+        return
+      end
+      offered = reply
+      -- Keep the deadline active while waiting for the editor event loop.
+      -- Success is delivered only after the bridge confirms the receipt.
+      vim.schedule(function()
+        if done then
+          return
+        end
+        local sent, write_error = pipe:write('\006', function(error)
+          if error then
+            finish('launch ownership receipt failed: ' .. error)
+          end
+        end)
+        if not sent then
+          finish('launch ownership receipt failed: ' .. write_error)
+        end
+      end)
+    elseif acknowledge and (not reply.confirmed or reply.id ~= offered.id) then
+      finish('invalid launch ownership confirmation')
     else
       finish(nil, nil, reply)
     end
@@ -88,14 +79,24 @@ function M.request(path, payload, callback, timeout, acknowledge)
         else
           chunks[#chunks + 1] = chunk
           if acknowledge then
-            local line = table.concat(chunks):match('^(.-)\n')
-            if line then
+            local data = table.concat(chunks)
+            while not done do
+              local line, rest = data:match('^(.-)\n(.*)$')
+              if not line then
+                break
+              end
               response(line)
+              data = rest
             end
+            chunks = { data }
           end
         end
       else
-        response(table.concat(chunks))
+        if acknowledge then
+          finish('launcher closed before ownership confirmation')
+        else
+          response(table.concat(chunks))
+        end
       end
     end)
     pipe:write(payload .. (acknowledge and '\n' or ''), function(write_error)
