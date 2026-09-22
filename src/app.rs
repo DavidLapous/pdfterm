@@ -6251,9 +6251,8 @@ mod tests {
         link_picker_list_area, link_picker_navigation_index, link_picker_panes,
         link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
         outline_start_index, picker_color, picker_rect, render_timing_status,
-        restore_link_picker_split, search_target_page, shorten_path, show_link_picker_split,
-        stale_status_row, stepped_zoom, synchronized_output, update_link_number_selection,
-        write_clipboard_osc52,
+        restore_link_picker_split, search_target_page, show_link_picker_split, stale_status_row,
+        stepped_zoom, synchronized_output, update_link_number_selection, write_clipboard_osc52,
     };
     use crate::config::LinkPickerLayout;
     use crate::kitty::Placement;
@@ -7389,48 +7388,48 @@ mod tests {
     }
 
     #[test]
-    fn picker_labels_recent_files_with_parent_directory() {
+    fn picker_disambiguates_recent_files_with_long_parent_paths() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let recent = directory.path().join("recent.pdf");
-        let parent = shorten_path(&directory.path().display().to_string());
-        fs::write(&recent, b"synthetic").expect("PDF");
-        let mut browser = BrowserState::new(directory.path().to_path_buf());
-        browser.set_recents(vec![recent]);
+        let current = directory.path().join("working");
+        fs::create_dir(&current).unwrap();
+        let mut recents = Vec::new();
+        for name in ["alpha", "beta"] {
+            let parent = directory.path().join("long-prefix-".repeat(8)).join(name);
+            fs::create_dir_all(&parent).unwrap();
+            let file = parent.join("same.pdf");
+            fs::write(&file, b"synthetic").unwrap();
+            recents.push(file);
+        }
+        let mut browser = BrowserState::new(current);
+        browser.set_recents(recents);
         let area = Rect::new(0, 0, 80, 30);
-        let popup = picker_rect(area);
         let mut terminal =
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
-
-        terminal
-            .draw(|frame| draw_picker(frame, &browser, false, crate::theme::TOKYO_NIGHT_MOON))
-            .expect("draw picker");
-        let buffer = terminal.backend().buffer();
-        let rendered: String = (popup.y + 1..popup.y + popup.height - 1)
-            .flat_map(|y| {
-                (popup.x + 1..popup.x + popup.width - 1)
-                    .map(move |x| buffer[(x, y)].symbol().to_string())
-            })
-            .collect();
-
-        assert!(rendered.contains("Most Recent"));
-        assert!(rendered.contains(&parent));
-
-        browser.filter = "recent".into();
-        browser.rebuild_filter();
-        terminal
-            .draw(|frame| draw_picker(frame, &browser, true, crate::theme::TOKYO_NIGHT_MOON))
-            .expect("draw filtered picker");
-        let buffer = terminal.backend().buffer();
-        let rendered: String = (popup.y + 1..popup.y + popup.height - 1)
-            .flat_map(|y| {
-                (popup.x + 1..popup.x + popup.width - 1)
-                    .map(move |x| buffer[(x, y)].symbol().to_string())
-            })
-            .collect();
-
-        assert!(rendered.contains("recent.pdf"));
-        assert!(rendered.contains("RECENT"));
-        assert!(rendered.contains(&parent));
+        for filter in ["", "same"] {
+            browser.filter = filter.into();
+            browser.rebuild_filter();
+            terminal
+                .draw(|frame| {
+                    draw_picker(
+                        frame,
+                        &browser,
+                        !filter.is_empty(),
+                        crate::theme::TOKYO_NIGHT_MOON,
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            for parent in ["alpha", "beta"] {
+                assert!(
+                    rows.iter()
+                        .any(|row| row.contains("same.pdf") && row.contains(parent)),
+                    "identical filenames must retain their distinct parent: {rows:?}"
+                );
+            }
+        }
     }
 
     #[test]
