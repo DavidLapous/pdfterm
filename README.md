@@ -431,6 +431,8 @@ A timeout or broken protocol stops the worker and fails its pending requests
 explicitly; restart Neovim to retry terminal control. Normal editor exit stops the
 worker. Viewer launch/close retain one-shot helpers. Kitty captures its native
 window ID without a subprocess and uses the compiled `kitten` client for control.
+Its backend lives in `lua/pdfterm/kitty.lua`; `terminal.lua` owns shared launch
+and window-ownership policy.
 Plain SSH sessions do not control client windows just because terminal identifiers
 were forwarded.
 

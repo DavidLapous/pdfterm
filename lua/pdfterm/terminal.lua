@@ -3,66 +3,8 @@
 local platform = require('pdfterm.platform')
 local ghostty_control = require('pdfterm.ghostty')
 local M = {}
-local kitty, ghostty = {}, {}
-local adapters = { kitty = kitty, ghostty = ghostty, ssh = require('pdfterm.ssh') }
-
-local function remote(arguments, callback)
-  local command = { 'kitten', '@' }
-  vim.list_extend(command, arguments)
-  return vim.system(command, { text = true, timeout = 3000 }, callback)
-end
-
-function kitty.launch(source, argv, callback)
-  local arguments = {
-    'launch',
-    '--match',
-    'window_id:' .. source.id,
-    '--type=window',
-    '--location=vsplit',
-    '--keep-focus',
-    '--next-to',
-    'id:' .. source.id,
-    '--env',
-    'PATH=' .. vim.env.PATH,
-    '--env',
-    'XDG_CONFIG_HOME=' .. (vim.env.XDG_CONFIG_HOME or ''),
-  }
-  vim.list_extend(arguments, argv)
-  return remote(
-    { 'goto-layout', '--match', 'window_id:' .. source.id, 'splits' },
-    vim.schedule_wrap(function(result)
-      if result.code ~= 0 then
-        callback(result)
-        return
-      end
-      remote(arguments, callback)
-    end)
-  )
-end
-
-function kitty.focus(source, callback)
-  return remote({ 'focus-window', '--match', 'id:' .. source.id }, callback)
-end
-
-function kitty.close(split)
-  local found = remote({ 'ls' }):wait()
-  if found.code ~= 0 then
-    error('pdfterm: could not locate PDF split: ' .. (found.stderr or ''))
-  end
-  for _, os_window in ipairs(vim.json.decode(found.stdout)) do
-    for _, tab in ipairs(os_window.tabs) do
-      for _, window in ipairs(tab.windows) do
-        if tostring(window.id) == split.id then
-          local result = remote({ 'send-text', '--match', 'id:' .. split.id, '\003' }):wait()
-          if result.code ~= 0 then
-            error('pdfterm: could not quit owned PDF split: ' .. (result.stderr or ''))
-          end
-          return
-        end
-      end
-    end
-  end
-end
+local ghostty = {}
+local adapters = { kitty = require('pdfterm.kitty'), ghostty = ghostty, ssh = require('pdfterm.ssh') }
 
 local split_script = [[
 on run argv
@@ -122,10 +64,6 @@ local function adapter(handle)
     error('pdfterm: invalid terminal handle')
   end
   return result
-end
-
-function kitty.capture(callback)
-  callback(nil, vim.env.KITTY_WINDOW_ID)
 end
 
 function ghostty.capture(callback)
