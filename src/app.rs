@@ -298,6 +298,7 @@ struct App {
     pending: HashSet<RenderKey>,
     visible_image_id: Option<u32>,
     visible_pages: Vec<VisiblePage>,
+    missing_visible_page: Option<RenderKey>,
     canvas_viewport: Option<Viewport>,
     pending_vertical_scroll: i64,
     smooth_scroll_remaining: i64,
@@ -815,6 +816,7 @@ impl App {
             pending: HashSet::new(),
             visible_image_id: None,
             visible_pages: Vec::new(),
+            missing_visible_page: None,
             canvas_viewport: None,
             pending_vertical_scroll: 0,
             smooth_scroll_remaining: 0,
@@ -2733,6 +2735,7 @@ impl App {
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
+        self.missing_visible_page = None;
         self.status_line.clear();
         if self.viewer.set_window_title && self.title_document != Some(self.tab().document_id) {
             let title: String = self
@@ -2877,10 +2880,12 @@ impl App {
             }
             return Ok(());
         }
-        if self.link_picker.is_none()
+        if self.viewer.continuous_scroll
+            && self.link_picker.is_none()
             && self.search_picker.is_none()
-            && key.document_id == self.tab().document_id
-            && key.page > self.tab().page
+            && self.desired_key != Some(key)
+            && (self.missing_visible_page == Some(key)
+                || self.visible_pages.iter().any(|page| page.frame.key == key))
         {
             self.redraw_current(output)?;
         }
@@ -3124,11 +3129,13 @@ impl App {
             self.prepare_image_canvas(output, viewport)?;
         }
         let started = Instant::now();
+        self.missing_visible_page = None;
         let mut page = self.tab().page;
         let mut y = -i64::from(self.tab().scroll_y);
         while y < i64::from(viewport.pixel_height) && page < self.tab().page_count {
             let key = self.page_key(page, viewport);
             let Some(rendered) = self.tab().cache.get(&key).cloned() else {
+                self.missing_visible_page = Some(key);
                 self.request_visible_page(key)?;
                 break;
             };
@@ -3372,6 +3379,7 @@ impl App {
         kitty::delete_all(output)?;
         self.visible_image_id = None;
         self.visible_pages.clear();
+        self.missing_visible_page = None;
         self.canvas_viewport = None;
         self.status_line.clear();
         self.pending_vertical_scroll = 0;
