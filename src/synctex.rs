@@ -4,7 +4,7 @@ use crate::pdf::SearchRect;
 use crate::process::Operation;
 use serde::{Deserialize, Serialize};
 use std::{fs, io, os::unix::fs::MetadataExt, path::Path, process::Command};
-use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 /// Source coordinates: one-based line, zero-based UTF-8 byte offset;
 /// column is one-based UTF-16 (VS Code), column_char is one-based Unicode scalar.
@@ -373,22 +373,37 @@ pub fn resolve_inverse(
                 "line-only navigation: source refinement unavailable: {error}"
             ));
         }
-        if let Ok(source) = source
-            && let Some((line, byte)) =
-                source_word_location(&source, target.line, context, offset, radius)
-        {
-            let text = source
-                .lines()
-                .nth(line as usize - 1)
-                .ok_or_else(|| io::Error::other("source line is missing"))?;
-            let prefix = text
-                .get(..byte)
-                .ok_or_else(|| io::Error::other("source column is not a UTF-8 boundary"))?;
-            target.line = line;
-            target.byte_column = byte;
-            target.column = prefix.encode_utf16().count() + 1;
-            target.column_char = prefix.chars().count() + 1;
-            target.precise = true;
+        if let Ok(mut source) = source {
+            if let Some((file, original, anchor)) =
+                original_source_from_verbatim(&pdf, Path::new(&target.file), &source, target.line)
+            {
+                target.file = file;
+                target.line = anchor;
+                source = original;
+            }
+            let mut location = source_word_location(&source, target.line, context, offset, radius);
+            if let Some((file, original, line, byte, score)) =
+                document_metadata_word_location(&pdf, context, offset)
+                && (location.is_none() || score >= 6)
+            {
+                target.file = file;
+                source = original;
+                location = Some((line, byte));
+            }
+            if let Some((line, byte)) = location {
+                let text = source
+                    .lines()
+                    .nth(line as usize - 1)
+                    .ok_or_else(|| io::Error::other("source line is missing"))?;
+                let prefix = text
+                    .get(..byte)
+                    .ok_or_else(|| io::Error::other("source column is not a UTF-8 boundary"))?;
+                target.line = line;
+                target.byte_column = byte;
+                target.column = prefix.encode_utf16().count() + 1;
+                target.column_char = prefix.chars().count() + 1;
+                target.precise = true;
+            }
         }
     }
     operation.check()?;
@@ -416,6 +431,133 @@ fn read_source(path: &Path) -> io::Result<String> {
         return Err(io::Error::other("source exceeds 2 MiB refinement limit"));
     }
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// A Beamer fragile frame is copied to a `.vrb` file. SyncTeX may name that
+/// generated file. Map it back only when distinct source lines agree on one
+/// line offset; otherwise keep the original SyncTeX result.
+fn original_source_from_verbatim(
+    pdf: &Path,
+    generated: &Path,
+    contents: &str,
+    line: u32,
+) -> Option<(String, String, u32)> {
+    if generated.extension()? != "vrb" || generated.file_stem()? != pdf.file_stem()? {
+        return None;
+    }
+    let original = fs::canonicalize(pdf.with_extension("tex")).ok()?;
+    let original_path = original.to_str()?.to_owned();
+    let source = read_source(&original).ok()?;
+    let mut unique = std::collections::HashMap::new();
+    for (index, row) in source.lines().enumerate() {
+        let row = row.trim();
+        if row.len() >= 24 {
+            unique
+                .entry(row)
+                .and_modify(|position| *position = None)
+                .or_insert(Some(index));
+        }
+    }
+    let mut offsets = std::collections::HashMap::<isize, usize>::new();
+    for (index, row) in contents.lines().enumerate() {
+        if let Some(Some(position)) = unique.get(row.trim()) {
+            *offsets
+                .entry(*position as isize - index as isize)
+                .or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<_> = offsets.into_iter().collect();
+    ranked.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let (delta, count) = *ranked.first()?;
+    if count < 2 || ranked.get(1).is_some_and(|(_, next)| *next == count) {
+        return None;
+    }
+    let anchor = line.checked_add_signed(delta as i32)?;
+    if anchor == 0 || anchor as usize > source.lines().count() {
+        return None;
+    }
+    Some((original_path, source, anchor))
+}
+
+/// Title pages and running headers can be produced from declarations far
+/// outside SyncTeX's reported frame. Search only literal document metadata,
+/// including direct preamble inputs, and require neighboring PDF words.
+fn document_metadata_word_location(
+    pdf: &Path,
+    context: &str,
+    offset: usize,
+) -> Option<(String, String, u32, usize, isize)> {
+    let main = fs::canonicalize(pdf.with_extension("tex")).ok()?;
+    let main_source = read_source(&main).ok()?;
+    let mut files = vec![(main.clone(), main_source)];
+    let inputs: Vec<_> = files[0]
+        .1
+        .lines()
+        .take_while(|row| !source_line_text(row).contains("\\begin{document}"))
+        .filter_map(|row| {
+            source_line_text(row)
+                .trim()
+                .strip_prefix("\\input{")
+                .and_then(|rest| rest.split_once('}'))
+                .map(|(name, _)| name.to_owned())
+        })
+        .take(8)
+        .collect();
+    for name in inputs {
+        let mut path = main.parent()?.join(name);
+        if path.extension().is_none() {
+            path.set_extension("tex");
+        }
+        if let Ok(path) = fs::canonicalize(path)
+            && !files.iter().any(|(known, _)| *known == path)
+            && let Ok(source) = read_source(&path)
+        {
+            files.push((path, source));
+        }
+    }
+    let mut best = None;
+    let mut tied = false;
+    for (file_index, (_, source)) in files.iter().enumerate() {
+        let mut start = 0;
+        for row in source.lines() {
+            let visible = source_line_text(row);
+            for command in ["\\title", "\\subtitle", "\\author", "\\date", "\\institute"] {
+                let Some(at) = visible.find(command) else {
+                    continue;
+                };
+                let Some((body, end)) = math::group(source, start + at + command.len()) else {
+                    continue;
+                };
+                let first = source[..body.start]
+                    .bytes()
+                    .filter(|ch| *ch == b'\n')
+                    .count();
+                let last = source[..end].bytes().filter(|ch| *ch == b'\n').count();
+                let Some((line, byte, score)) =
+                    source_prose_scored_location(source, 1, context, offset, first..last + 1, true)
+                else {
+                    continue;
+                };
+                if score < 3 {
+                    continue;
+                }
+                match best {
+                    Some((old, _, _, _)) if score < old => {}
+                    Some((old, index, old_line, old_byte)) if score == old => {
+                        tied |= (file_index, line, byte) != (index, old_line, old_byte);
+                    }
+                    _ => {
+                        best = Some((score, file_index, line, byte));
+                        tied = false;
+                    }
+                }
+            }
+            start += row.len() + 1;
+        }
+    }
+    let (score, index, line, byte) = best.filter(|_| !tied)?;
+    let (path, source) = files.swap_remove(index);
+    Some((path.to_str()?.to_owned(), source, line, byte, score))
 }
 
 pub(crate) fn parse_synctex_edit(stdout: &str) -> Option<SourceLocation> {
@@ -527,6 +669,46 @@ pub(crate) fn words(text: &str) -> Vec<(usize, &str)> {
     result
 }
 
+fn normalized_word(word: &str) -> String {
+    word.nfkd()
+        .filter(|ch| !is_combining_mark(*ch))
+        .collect::<String>()
+        .to_lowercase()
+        .replace('ﬁ', "fi")
+        .replace('ﬂ', "fl")
+        .replace('ﬀ', "ff")
+        .replace('ﬃ', "ffi")
+        .replace('ﬄ', "ffl")
+}
+
+fn ordinary_word_source_start(
+    source: &str,
+    context: &str,
+    offset: usize,
+    line: u32,
+    byte: usize,
+) -> Option<usize> {
+    let Some((_, pdf_word)) = words(context)
+        .into_iter()
+        .find(|(start, word)| *start <= offset && offset < start + word.len())
+    else {
+        return Some(byte);
+    };
+    let pdf_word = normalized_word(pdf_word);
+    if pdf_word.len() < 2 || !pdf_word.bytes().all(|ch| ch.is_ascii_alphabetic()) {
+        return Some(byte);
+    }
+    source
+        .lines()
+        .nth(line as usize - 1)
+        .and_then(|text| {
+            words(text)
+                .into_iter()
+                .find(|(start, word)| *start <= byte && byte < start + word.len())
+        })
+        .and_then(|(start, word)| (normalized_word(word) == pdf_word).then_some(start))
+}
+
 /// Refine prose and mathematical atoms without expanding arbitrary TeX macros.
 fn source_word_location(
     source: &str,
@@ -541,37 +723,55 @@ fn source_word_location(
         line.saturating_sub(radius.saturating_add(1)) as usize
             ..(line as usize).saturating_add(radius as usize)
     });
-    let prose = source_prose_location(source, line, context, offset, lines.clone(), within_scope);
-    math::source_location(source, line, lines, within_scope, context, offset, prose)
+    let prose =
+        source_prose_scored_location(source, line, context, offset, lines.clone(), within_scope);
+    math::source_location(source, line, lines, within_scope, context, offset, prose).and_then(
+        |(row, byte)| {
+            ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
+        },
+    )
 }
 
-fn source_prose_location(
+fn source_prose_scored_location(
     source: &str,
     line: u32,
     context: &str,
     offset: usize,
     lines: std::ops::Range<usize>,
     within_frame: bool,
-) -> Option<(u32, usize)> {
-    fn normalized(word: &str) -> String {
-        word.to_lowercase()
-            .replace('ﬁ', "fi")
-            .replace('ﬂ', "fl")
-            .replace('ﬀ', "ff")
-            .replace('ﬃ', "ffi")
-            .replace('ﬄ', "ffl")
-    }
+) -> Option<(u32, usize, isize)> {
     let pdf = words(context);
     let selected = pdf
         .iter()
         .position(|(start, word)| *start <= offset && offset < start + word.len())?;
-    let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized(word)).collect();
+    let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized_word(word)).collect();
+    let frame_header = within_frame
+        && source
+            .lines()
+            .nth(lines.start)
+            .is_some_and(|row| source_line_text(row).contains("\\begin{frame}"));
     let mut candidates = Vec::new();
     for (index, text) in source.lines().enumerate().take(lines.end).skip(lines.start) {
         let text = source_line_text(text);
+        let graphics: Vec<_> = text
+            .match_indices("\\includegraphics")
+            .filter_map(|(start, _)| {
+                let mut end = start + "\\includegraphics".len();
+                end += text[end..].len() - text[end..].trim_start().len();
+                if text[end..].starts_with('*') {
+                    end += 1;
+                }
+                if text[end..].starts_with('[') {
+                    end += text[end..].find(']')? + 1;
+                }
+                math::group(text, end).map(|(_, end)| start..end)
+            })
+            .collect();
         for (byte, word) in words(text) {
-            if byte == 0 || !text[..byte].ends_with('\\') {
-                candidates.push((index as u32 + 1, byte, normalized(word)));
+            if (byte == 0 || !text[..byte].ends_with('\\'))
+                && !graphics.iter().any(|range| range.contains(&byte))
+            {
+                candidates.push((index as u32 + 1, byte, normalized_word(word)));
             }
         }
     }
@@ -596,9 +796,38 @@ fn source_prose_location(
                 }
             }
         }
+        // TeX math can insert source tokens that PDF text extraction omits.
+        // Use nearby longer words as a tie break for repeated prose.
+        let mut context_bonus = 0;
+        for direction in [-1isize, 1] {
+            for distance in 1..=8 {
+                let Some(neighbor) = selected
+                    .checked_add_signed(direction * distance)
+                    .and_then(|i| pdf.get(i))
+                else {
+                    break;
+                };
+                if neighbor.chars().count() < 4 {
+                    continue;
+                }
+                if (1..=10).any(|step| {
+                    index
+                        .checked_add_signed(direction * step)
+                        .and_then(|i| candidates.get(i))
+                        .is_some_and(|candidate| candidate.2 == *neighbor)
+                }) {
+                    context_bonus += 1;
+                }
+            }
+        }
         // A collected frame/caption boundary does not favor its last occurrence.
         let proximity = if within_frame { 0 } else { row.abs_diff(line) };
-        let rank = (score, std::cmp::Reverse(proximity));
+        let rank = (
+            score,
+            frame_header && *row as usize == lines.start + 1,
+            context_bonus,
+            std::cmp::Reverse(proximity),
+        );
         match best {
             Some((old, _, _)) if rank < old => {}
             Some((old, _, _)) if rank == old => tied = true,
@@ -608,7 +837,8 @@ fn source_prose_location(
             }
         }
     }
-    best.filter(|_| !tied).map(|(_, row, byte)| (row, byte))
+    best.filter(|_| !tied)
+        .map(|(rank, row, byte)| (row, byte, rank.0))
 }
 
 #[cfg(test)]
@@ -676,7 +906,10 @@ mod tests {
             source_word_location(source, 13, "Some datasets convey geometry.", 5, 4),
             Some((12, 5))
         );
-        assert_eq!(source_word_location(source, 10, "datasets", 1, 4), None);
+        assert_eq!(
+            source_word_location(source, 10, "datasets", 1, 4),
+            Some((2, 5))
+        );
         assert_eq!(source_word_location(source, 13, "Other", 1, 4), None);
     }
 
@@ -688,6 +921,250 @@ mod tests {
             source_word_location(source, 4, "Identical visible phrase.", 10, 4),
             None
         );
+    }
+
+    #[test]
+    fn inverse_title_word_survives_unrelated_opaque_math() {
+        let source = "\\begin{frame}[fragile]{Let's revisit this example}\n\
+                      Ordinary body words:\n\
+                      \\begin{equation*}\n\
+                      \\custom{x}\n\
+                      \\end{equation*}\n\
+                      \\end{frame}";
+        let context = "Let’s revisit this example\r\nOrdinary body words:";
+        assert_eq!(
+            source_prose_scored_location(source, 6, context, 0, 0..6, true)
+                .map(|(row, byte, _)| (row, byte)),
+            Some((1, 23))
+        );
+        assert_eq!(
+            source_word_location(source, 6, context, 0, 4),
+            Some((1, 23))
+        );
+    }
+
+    #[test]
+    fn inverse_title_words_prefer_the_frame_header_when_body_repeats_them() {
+        let source = "\\begin{frame}{Overview}\n\
+                      An overview follows in the body.\n\
+                      $\\custom{x}$\n\
+                      \\end{frame}";
+        assert_eq!(
+            source_word_location(source, 4, "Overview\r\n0.0 0.2", 6, 4),
+            Some((1, 14))
+        );
+        assert_eq!(
+            source_word_location(source, 4, "An overview follows", 3, 4),
+            Some((2, 3))
+        );
+        let source = "\\begin{frame}{Primary Topic}{A small example}\n\
+                      A different body sentence.\n\
+                      $\\custom{x}$\n\
+                      \\end{frame}";
+        let context = "Primary Topic\r\nA small example\r\nTheorem";
+        assert_eq!(
+            source_word_location(source, 4, context, context.find("A small").unwrap(), 4),
+            Some((
+                1,
+                source.lines().next().unwrap().find("{A small").unwrap() + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn inverse_heading_matches_tex_accent_and_pdf_unicode() {
+        let source = "\\begin{frame}{An example from \\v Cech's construction}\n\
+                      $x$\n\
+                      \\end{frame}";
+        let context = "An example from Čech’s construction";
+        assert_eq!(
+            source_word_location(source, 3, context, context.find('Č').unwrap(), 4),
+            Some((1, source.lines().next().unwrap().find("Cech").unwrap()))
+        );
+    }
+
+    #[test]
+    fn inverse_literal_words_inside_boxed_math_keep_their_source_spans() {
+        let source = "\\begin{frame}{Example}\n\
+                      \\[\\boxed{\\textnormal{Visible sentence inside the box.}}\\]\n\
+                      \\[\\begin{aligned}N\\to\\infty\\end{aligned}\\]\n\
+                      \\end{frame}";
+        let context = "Example\r\nVisible sentence inside the box.";
+        assert_eq!(
+            source_word_location(source, 4, context, context.find("Visible").unwrap(), 4),
+            Some((2, source.lines().nth(1).unwrap().find("Visible").unwrap()))
+        );
+    }
+
+    #[test]
+    fn inverse_prose_word_does_not_match_inside_longer_math_word() {
+        let source = "\\begin{frame}{Example}\n\
+                      Pick an option here.\n\
+                      $\\mathrm{constant}(x)$ $\\custom{q}$\n\
+                      \\end{frame}";
+        let context = "Pick an option here. constant(x)";
+        assert_eq!(
+            source_word_location(source, 4, context, context.find("an option").unwrap(), 4),
+            Some((2, 5))
+        );
+    }
+
+    #[test]
+    fn inverse_caption_word_ignores_image_filename() {
+        let source = "\\begin{frame}{Example}\n\
+                      \\includegraphics[width=\\textwidth]{assets/sample_green_blue_shapes--[Maker].jpg}\n\
+                      \\caption{Sample green blue shapes, Maker.}\n\
+                      \\end{frame}";
+        let context = "Figure 1: Sample green blue shapes, Maker.";
+        assert_eq!(
+            source_word_location(source, 4, context, context.find("green").unwrap(), 4),
+            Some((3, source.lines().nth(2).unwrap().find("green").unwrap()))
+        );
+        assert_eq!(source_word_location(source, 4, "assets", 0, 4), None);
+    }
+
+    #[test]
+    fn inverse_repeated_prose_uses_words_past_adjacent_math() {
+        let source = "\\begin{frame}{Example}\n\
+                      \\item the \\blue{$X_i$}s are random variables in $\\mathcal{X}$, a space of inputs,\n\
+                      \\item the \\blue{$Y_i$}s are random variables in $\\mathcal{Y}$, a space of labels,\n\
+                      \\end{frame}";
+        let context = "the Xis are random variables in X, a space of inputs,\r\n\
+                       the Yis are random variables in Y, a space of labels,";
+        for (needle, line) in [("inputs", 2), ("labels", 3)] {
+            let at = context.find(needle).unwrap();
+            let selected = context[..at].rfind("variables").unwrap();
+            assert_eq!(
+                source_word_location(source, 4, context, selected, 4),
+                Some((
+                    line,
+                    source
+                        .lines()
+                        .nth(line as usize - 1)
+                        .unwrap()
+                        .find("variables")
+                        .unwrap()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn inverse_prose_context_beats_unrelated_math_word() {
+        let source = "\\begin{frame}{Example}\n\
+                      The map defines an \\emph{order} $(a_1, a_2)$ on a set.\n\
+                      \\begin{equation*}\\mathrm{order}(f)=\\mathrm{order}(g)\\end{equation*}\n\
+                      \\end{frame}";
+        let context = "The map defines an order (a1, a2) on a set.";
+        assert_eq!(
+            source_word_location(source, 4, context, context.find("order").unwrap(), 4),
+            Some((2, source.lines().nth(1).unwrap().find("order").unwrap()))
+        );
+    }
+
+    #[test]
+    fn inverse_repeated_word_uses_short_context_across_math() {
+        let source = "\\begin{frame}{Example}\n\
+                      It is smooth on $\\mathrm{cell}(f)$ as soon\n\
+                      as $\\mathrm{t}(g)$ is smooth.\n\
+                      \\end{frame}";
+        let context = "It is smooth on cell(f) as soon\r\nas t(g) is smooth.";
+        let selected = context.rfind("smooth").unwrap();
+        assert_eq!(
+            source_word_location(source, 4, context, selected, 4),
+            Some((3, source.lines().nth(2).unwrap().find("smooth").unwrap()))
+        );
+    }
+
+    #[test]
+    fn inverse_ordinary_word_rejects_a_different_source_word() {
+        let source = "The map is smooth and has a finite image.";
+        let byte = source.find("smooth").unwrap();
+        assert_eq!(
+            ordinary_word_source_start(
+                source,
+                "The map is regular and has a finite image.",
+                "The map is ".len(),
+                1,
+                byte,
+            ),
+            None
+        );
+        assert_eq!(
+            ordinary_word_source_start(
+                source,
+                "The map is smooth and has a finite image.",
+                "The map is ".len(),
+                1,
+                byte + 2,
+            ),
+            Some(byte)
+        );
+    }
+
+    #[test]
+    fn inverse_generated_verbatim_maps_to_original_only_with_unique_alignment() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("slides.pdf");
+        let source = "\\begin{frame}[fragile]{A title}\n\
+                      Distinct first sentence in the original frame.\n\
+                      Distinct second sentence in the original frame.\n\
+                      \\end{frame}\n";
+        fs::write(pdf.with_extension("tex"), source).unwrap();
+        let generated = directory.path().join("build/slides.vrb");
+        fs::create_dir(generated.parent().unwrap()).unwrap();
+        let contents = "\\frametitle{A title}\n\
+                        Distinct first sentence in the original frame.\n\
+                        Distinct second sentence in the original frame.\n";
+        assert_eq!(
+            original_source_from_verbatim(&pdf, &generated, contents, 2),
+            Some((
+                fs::canonicalize(pdf.with_extension("tex"))
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                source.to_owned(),
+                2
+            ))
+        );
+        assert!(
+            original_source_from_verbatim(&pdf, &generated, contents.lines().next().unwrap(), 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inverse_document_metadata_resolves_title_and_direct_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("slides.pdf");
+        let main = "\\input{preamble.tex}\n\
+                    \\title{Example Report and Results}\n\
+                    \\author{Ada Example}\n\
+                    \\begin{document}\n\
+                    \\begin{frame}{Other title}\n\
+                    Body text.\n\
+                    \\end{frame}\n";
+        fs::write(pdf.with_extension("tex"), main).unwrap();
+        fs::write(
+            directory.path().join("preamble.tex"),
+            "\\institute{North Research Center\\\\\nExample School for Mathematics}\n",
+        )
+        .unwrap();
+        let found =
+            document_metadata_word_location(&pdf, "Example Report and Results", "Example ".len())
+                .unwrap();
+        assert_eq!((found.2, found.3), (2, 15));
+        assert!(found.4 >= 6);
+        let found = document_metadata_word_location(
+            &pdf,
+            "North Research Center\r\nExample School for Mathematics",
+            "North Research Center\r\nExample School for ".len(),
+        )
+        .unwrap();
+        assert!(found.0.ends_with("preamble.tex"));
+        assert_eq!((found.2, found.3), (2, 19));
+        assert!(document_metadata_word_location(&pdf, "Report", 0).is_none());
     }
 
     #[test]

@@ -1681,14 +1681,36 @@ impl From<WorkerCommand> for WorkerTask {
 fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)>, String> {
     let text = page.text().map_err(|error| error.to_string())?;
     let chars = text.chars();
-    let Some(character) = chars.get_char_near_point(
-        PdfPoints::new(x),
-        PdfPoints::new(6.0),
-        PdfPoints::new(y),
-        PdfPoints::new(6.0),
-    ) else {
+    let x = PdfPoints::new(x);
+    let y = PdfPoints::new(y);
+    let Some(mut character) =
+        chars.get_char_near_point(x, PdfPoints::new(6.0), y, PdfPoints::new(6.0))
+    else {
         return Ok(None);
     };
+    // PDFium can choose a large mathematical glyph over a smaller word glyph
+    // when their bounds overlap. Prefer the smallest alphabetic glyph actually
+    // under the pointer, while retaining PDFium's nearest-hit fallback.
+    if !char::from_u32(character.unicode_value()).is_some_and(char::is_alphanumeric)
+        && let Ok(bounds) = character.tight_bounds()
+        && bounds.contains(x, y)
+    {
+        let mut area = bounds.width().value * bounds.height().value;
+        for candidate in chars.iter() {
+            if !char::from_u32(candidate.unicode_value()).is_some_and(char::is_alphabetic) {
+                continue;
+            }
+            if let Ok(bounds) = candidate.tight_bounds()
+                && bounds.contains(x, y)
+            {
+                let candidate_area = bounds.width().value * bounds.height().value;
+                if candidate_area < area {
+                    character = candidate;
+                    area = candidate_area;
+                }
+            }
+        }
+    }
     unicode_context(chars.len(), character.index(), |index| {
         chars
             .get(index)

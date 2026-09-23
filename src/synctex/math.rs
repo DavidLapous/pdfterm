@@ -43,7 +43,7 @@ fn command(source: &str, start: usize) -> (&str, usize) {
     (&source[after..end], end)
 }
 
-fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)> {
+pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)> {
     let start = start + source[start..].len() - source[start..].trim_start().len();
     if source.as_bytes().get(start) != Some(&b'{') {
         return None;
@@ -81,6 +81,7 @@ fn math_environment(name: &str) -> bool {
             | "displaymath"
             | "equation"
             | "align"
+            | "aligned"
             | "alignat"
             | "flalign"
             | "gather"
@@ -258,7 +259,7 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
 }
 
 /// An opaque expression can render glyphs absent from its lexical atoms, or
-/// change their extraction order. It blocks precision throughout the scope.
+/// change their extraction order. Its math atoms cannot prove a location.
 fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
     let mut result = Vec::new();
     let mut opaque = false;
@@ -298,11 +299,19 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
                     }
                     continue;
                 }
+                if name == "end" {
+                    let (environment, end) = group(source, i)?;
+                    opaque |= !math_environment(&source[environment]);
+                    i = end;
+                    continue;
+                }
                 // These standard wrappers change appearance, not character identity.
                 if matches!(
                     name,
                     "mathcal"
+                        | "boxed"
                         | "mathnormal"
+                        | "textnormal"
                         | "displaystyle"
                         | "textstyle"
                         | "scriptstyle"
@@ -372,13 +381,13 @@ pub(super) fn source_location(
     within_frame: bool,
     context: &str,
     offset: usize,
-    prose: Option<(u32, usize)>,
+    prose: Option<(u32, usize, isize)>,
 ) -> Option<(u32, usize)> {
     let regions = regions(source);
     let starts: Vec<_> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
-    let prose = prose.filter(|(row, byte)| {
+    let prose = prose.filter(|(row, byte, _)| {
         let index = starts[*row as usize - 1] + byte;
         !regions.iter().any(|range| range.contains(&index))
     });
@@ -387,7 +396,7 @@ pub(super) fn source_location(
         append(&mut pdf, c, i..i + c.len_utf8());
     }
     let Some(selected) = pdf.iter().position(|atom| atom.span.contains(&offset)) else {
-        return prose;
+        return prose.map(|(row, byte, _)| (row, byte));
     };
     if pdf[selected].value == '\0' || private_use(pdf[selected].value) {
         return None;
@@ -411,6 +420,7 @@ pub(super) fn source_location(
     }
     let mut best = None;
     let mut tied = false;
+    let mut saw_opaque = false;
     for range in regions {
         if range.start >= *starts.get(lines.end).unwrap_or(&source.len())
             || range.end <= *starts.get(lines.start).unwrap_or(&source.len())
@@ -418,10 +428,9 @@ pub(super) fn source_location(
             continue;
         }
         let (atoms, opaque) = atoms(source, range.clone())?;
-        // Unknown macro arguments/expansions and reordered scripts can hide
-        // another occurrence, even when none of their known atoms match.
         if opaque {
-            return None;
+            saw_opaque = true;
+            continue;
         }
         let atoms = inline_context(source, &range, atoms);
         for (index, atom) in atoms.iter().enumerate() {
@@ -446,17 +455,49 @@ pub(super) fn source_location(
             {
                 continue;
             }
+            // A PDF word cannot be a substring of a longer source word.
+            if pdf[selected].value.is_alphanumeric()
+                && (begin
+                    .checked_sub(1)
+                    .and_then(|i| atoms.get(i))
+                    .is_some_and(|previous| {
+                        previous.value.is_alphanumeric()
+                            && previous.span.end == atoms[begin].span.start
+                    })
+                    || atoms.get(begin + word.len()).is_some_and(|next| {
+                        next.value.is_alphanumeric()
+                            && atoms[begin + word.len() - 1].span.end == next.span.start
+                    }))
+            {
+                continue;
+            }
             // Stop at the first mismatch and at this expression's boundary.
             // Context from a different formula must not break an ambiguity tie.
             let mut score = 0;
+            let mut lexical_score = 0;
             for direction in [-1isize, 1] {
+                let source_edge = if direction < 0 {
+                    begin
+                } else {
+                    begin + word.len() - 1
+                };
+                let pdf_edge = if direction < 0 {
+                    word.start
+                } else {
+                    word.end - 1
+                };
                 for distance in 1..=8 {
                     let delta = direction * distance;
                     match (
-                        index.checked_add_signed(delta).and_then(|i| atoms.get(i)),
-                        selected.checked_add_signed(delta).and_then(|i| pdf.get(i)),
+                        source_edge
+                            .checked_add_signed(delta)
+                            .and_then(|i| atoms.get(i)),
+                        pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
                     ) {
-                        (Some(a), Some(b)) if a.value == b.value => score += 9 - distance,
+                        (Some(a), Some(b)) if a.value == b.value => {
+                            score += 9 - distance;
+                            lexical_score += usize::from(a.value.is_alphanumeric());
+                        }
                         _ => break,
                     }
                 }
@@ -472,7 +513,7 @@ pub(super) fn source_location(
             } else {
                 location.0.abs_diff(line)
             };
-            let rank = (score, std::cmp::Reverse(proximity));
+            let rank = (score, lexical_score, std::cmp::Reverse(proximity));
             match best {
                 Some((old, _)) if rank < old => {}
                 Some((old, previous)) if rank == old => tied |= previous != location,
@@ -483,10 +524,40 @@ pub(super) fn source_location(
             }
         }
     }
+    let known_math = best.is_some();
     let mathematical = best.filter(|_| !tied).map(|(_, location)| location);
+    let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
+        && best.is_some_and(|((_, lexical_score, _), _)| lexical_score == 0);
+    if prose_evidence {
+        return prose.map(|(row, byte, _)| (row, byte));
+    }
+    // Opaque math leaves symbols uncertain. A complete literal word still
+    // identifies its known source span when no second known match competes.
+    if saw_opaque {
+        let literal_word = word.len() > 1
+            && pdf[word.clone()]
+                .iter()
+                .all(|atom| atom.value.is_alphabetic());
+        if prose.is_some() && known_math {
+            return None;
+        }
+        let prose = prose.filter(|(row, _, _)| {
+            !known_math
+                && (literal_word
+                    || source
+                        .lines()
+                        .nth(*row as usize - 1)
+                        .is_some_and(|line| line.contains("\\begin{frame}")))
+                && pdf[word.clone()]
+                    .iter()
+                    .all(|atom| atom.value.is_alphabetic())
+        });
+        let mathematical = mathematical.filter(|_| literal_word);
+        return prose.map(|(row, byte, _)| (row, byte)).or(mathematical);
+    }
     match (prose, mathematical) {
         (Some(_), Some(_)) => None,
-        (prose, mathematical) => prose.or(mathematical),
+        (prose, mathematical) => prose.map(|(row, byte, _)| (row, byte)).or(mathematical),
     }
 }
 
@@ -580,7 +651,7 @@ mod tests {
             None
         );
         assert_eq!(
-            source_location("$\\custom{x}+y$", 1, 0..1, false, "x+y", 0, Some((1, 9))),
+            source_location("$\\custom{x}+y$", 1, 0..1, false, "x+y", 0, Some((1, 9, 0))),
             None
         );
         assert_eq!(

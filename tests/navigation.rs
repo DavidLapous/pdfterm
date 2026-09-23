@@ -327,12 +327,14 @@ fn beamer_frame_body_navigates_to_own_frame() {
     let closing = synctex::resolve_forward(&pdf, &tex, end as u32, 3).unwrap();
     assert_eq!(closing.page, page);
 
-    // Inverse: the raw sidecar resolves the clicked point within the deck's
-    // live layout, which drifts between builds, so only the resolver-guaranteed
-    // invariants are asserted: a positive line, no precise refinement (the
-    // figure environment blocks precision throughout the frame scope per the
-    // documented opaque-region contract), and line-only navigation without a
-    // warning.
+    // Without PDF text, the figure click remains a coarse SyncTeX location.
+    let coarse = synctex::resolve_inverse(&pdf, page, 160.0, 130.0, None, 4, &operation).unwrap();
+    assert!(coarse.location.line > 0);
+    assert!(!coarse.location.precise);
+    assert!(coarse.warning.is_none());
+
+    // A known literal prose word in the same frame remains navigable even
+    // though the frame also contains a figure.
     let inverse = synctex::resolve_inverse(
         &pdf,
         page,
@@ -343,7 +345,17 @@ fn beamer_frame_body_navigates_to_own_frame() {
         &operation,
     )
     .unwrap();
-    assert!(inverse.location.line > 0, "resolved line is positive");
-    assert!(!inverse.location.precise, "figure blocks precision");
+    assert!(inverse.location.precise);
+    assert_eq!(
+        inverse.location.line as usize,
+        source
+            .lines()
+            .position(
+                |row| row.contains("Consider the two following image functions")
+                    && !row.trim_start().starts_with('%')
+            )
+            .unwrap()
+            + 1
+    );
     assert!(inverse.warning.is_none());
 }
