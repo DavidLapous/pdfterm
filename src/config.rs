@@ -265,7 +265,7 @@ impl Default for ViewerSettings {
         Self {
             continuous_scroll: true,
             prefetch_pages: 5,
-            smooth_scroll: true,
+            smooth_scroll: false,
             scroll_frame_ms: 16,
             scroll_ease_divisor: 4,
             scroll_step_percent: 12,
@@ -396,11 +396,12 @@ mod tests {
         Config::load_path(&path).unwrap();
         let template = fs::read_to_string(&path).unwrap();
         assert_eq!(template, include_str!("../config.default.toml"));
-        fs::write(&path, "[viewer]\nsmooth_scroll = false\n").unwrap();
         assert!(!Config::load_path(&path).unwrap().viewer.smooth_scroll);
+        fs::write(&path, "[viewer]\nsmooth_scroll = true\n").unwrap();
+        assert!(Config::load_path(&path).unwrap().viewer.smooth_scroll);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "[viewer]\nsmooth_scroll = false\n"
+            "[viewer]\nsmooth_scroll = true\n"
         );
         fs::write(&path, "[viewer]\nscroll_frame_ms = 0\n").unwrap();
         assert!(Config::load_path(&path).is_err());

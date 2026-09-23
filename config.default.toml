@@ -26,7 +26,7 @@ path = "editor.sock"               # Relative to private run/ directory
 [viewer]
 continuous_scroll = true           # Display adjacent pages together; false restores page-at-a-time
 prefetch_pages = 5                 # Background-render this many pages on each side (0 disables)
-smooth_scroll = true               # Animate vertical wheel/j/k movement in continuous mode
+smooth_scroll = false              # Animate vertical wheel/j/k movement in continuous mode
 scroll_frame_ms = 16               # Minimum interval between animation frames, 1–1000 ms
 scroll_ease_divisor = 4            # Fraction of remaining distance per frame, 1–100 (1 = instant)
 scroll_step_percent = 12           # Small vertical movement as viewport percent, 1–100
