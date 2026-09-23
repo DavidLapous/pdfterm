@@ -2387,7 +2387,12 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(output)?,
             KeyCode::Char('0') => self.reset_zoom(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
-            KeyCode::Char('s') if key.modifiers == KeyModifiers::ALT => {
+            KeyCode::Char('S')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.toggle_smooth_scroll(output)?
+            }
+            KeyCode::Char('s') if key.modifiers == KeyModifiers::SHIFT => {
                 self.toggle_smooth_scroll(output)?
             }
             KeyCode::Char('p') => self.toggle_performance(output)?,
@@ -5669,7 +5674,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
         ("Alt/Option-click", "word jump + focus"),
-        ("Alt/Option-S", "toggle smooth scroll"),
+        ("S", "toggle smooth scroll"),
         ("p", "performance timings"),
         ("t", "table of contents"),
         ("T", "choose theme"),

@@ -63,6 +63,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `+` / `-` | zoom in / out in 25% steps (up to 400%) |
 | `0` | reset zoom to the fitted size |
 | `i` | toggle Polaris-style dark mode |
+| `S` | toggle smooth scrolling for the current session |
 | `Alt`/`Option` + click | resolve the clicked location via SyncTeX and jump to its source; no toggle |
 | `p` | toggle detailed render-performance timings |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
@@ -155,8 +156,8 @@ and flushed at the end of each synchronized update. Active animation waits until
 the next `viewer.scroll_frame_ms` deadline rather than a fixed input-poll interval;
 integer-millisecond timing and terminal scheduling do not guarantee exact 120 Hz.
 Smooth scrolling is off by default. Set `smooth_scroll = true` to animate steps.
-`Alt/Option-S` toggles smooth scrolling for the current viewer session without changing
-the config; the terminal must send Option as Alt.
+`S` toggles smooth scrolling for the current viewer session without changing
+the config.
 `continuous_scroll = false` retains single-page scrolling.
 
 `viewer.prefetch_pages = 5` renders and caches up to five pages before and after
