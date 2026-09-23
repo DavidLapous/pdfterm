@@ -2385,6 +2385,9 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(output)?,
             KeyCode::Char('0') => self.reset_zoom(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
+            KeyCode::Char('s') if key.modifiers == KeyModifiers::ALT => {
+                self.toggle_smooth_scroll(output)?
+            }
             KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
             KeyCode::Char('T') => self.open_theme_picker(output)?,
@@ -2698,6 +2701,23 @@ impl App {
         let inverted = !self.tab().invert;
         self.tab_mut().invert = inverted;
         self.request_current(output)
+    }
+
+    fn toggle_smooth_scroll(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.viewer.smooth_scroll = !self.viewer.smooth_scroll;
+        if !self.viewer.smooth_scroll && self.smooth_scroll_remaining != 0 {
+            self.pending_vertical_scroll += std::mem::take(&mut self.smooth_scroll_remaining);
+            if self.apply_vertical_scroll(self.viewport()?)? {
+                self.request_current(output)?;
+            }
+        }
+        let state = if self.viewer.smooth_scroll {
+            "smooth scroll on"
+        } else {
+            "smooth scroll off"
+        };
+        self.draw_status(output, self.viewport()?, state)?;
+        Ok(())
     }
 
     fn toggle_performance(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -5617,7 +5637,7 @@ fn link_picker_label(label: &str) -> String {
 
 fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
     const NAVIGATION: &[(&str, &str)] = &[
-        ("j/k · ↑/↓", "smooth scroll"),
+        ("j/k · ↑/↓", "scroll vertically"),
         ("h/l · ←/→", "move horizontally"),
         ("Space · PgDn", "page viewport forward"),
         ("Backspace · PgUp", "page viewport backward"),
@@ -5625,7 +5645,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         (":", "go to page"),
         ("/", "search document"),
         ("n / N", "next / prev match"),
-        ("Mouse wheel", "smooth scroll"),
+        ("Mouse wheel", "scroll vertically"),
         ("Enter", "browse PDF links"),
         ("Click", "follow PDF link"),
         ("h / l (split)", "focus PDF/pane"),
@@ -5641,6 +5661,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
         ("Alt/Option-click", "word jump + focus"),
+        ("Alt/Option-S", "toggle smooth scroll"),
         ("p", "performance timings"),
         ("t", "table of contents"),
         ("T", "choose theme"),

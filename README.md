@@ -155,6 +155,8 @@ and flushed at the end of each synchronized update. Active animation waits until
 the next `viewer.scroll_frame_ms` deadline rather than a fixed input-poll interval;
 integer-millisecond timing and terminal scheduling do not guarantee exact 120 Hz.
 Smooth scrolling is off by default. Set `smooth_scroll = true` to animate steps.
+`Alt/Option-S` toggles smooth scrolling for the current viewer session without changing
+the config; the terminal must send Option as Alt.
 `continuous_scroll = false` retains single-page scrolling.
 
 `viewer.prefetch_pages = 5` renders and caches up to five pages before and after
