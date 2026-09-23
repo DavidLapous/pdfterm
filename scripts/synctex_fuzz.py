@@ -6,7 +6,9 @@ text to catch a selected source word missing from one raw candidate when
 another raw candidate contains the word and its source context. Raw page
 disagreement is reported, not failed: a resolver may refine an imprecise
 SyncTeX source position.
-Inverse probes round-trip each raw `synctex edit` result through `synctex view`.
+Inverse probes click centers of on-page painted PDF glyph boxes found by PyMuPDF.
+The raw `synctex edit` result must name a real source line; its `synctex view`
+page is diagnostic because overlays can make the raw mapping asymmetric.
 This script does not launch the viewer or Neovim or exercise pdfterm's inverse
 word refinement. Output is one JSON summary. Any failed probe exits nonzero.
 
@@ -22,8 +24,10 @@ import re
 import subprocess
 import sys
 import unicodedata
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
+
+GlyphPoint = tuple[str, tuple[float, float, float, float]]
 
 
 def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
@@ -32,10 +36,11 @@ def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
     if result.returncode:
         raise RuntimeError(f"synctex view: {result.stderr.strip()[:200]}")
-    return set(int(p) for p in re.findall(r"^Page:(\d+)$", result.stdout, re.M))
+    return {int(p) for p in re.findall(r"^Page:(\d+)$", result.stdout, re.MULTILINE)}
 
 
 def raw_inverse(pdf: Path, x: float, y: float, page: int) -> tuple[int, str] | None:
@@ -44,10 +49,11 @@ def raw_inverse(pdf: Path, x: float, y: float, page: int) -> tuple[int, str] | N
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
     if result.returncode:
         raise RuntimeError(f"synctex edit: {result.stderr.strip()[:200]}")
-    matches = re.findall(r"^Input:(.*)$\n^Line:(\d+)", result.stdout, re.M)
+    matches = re.findall(r"^Input:(.*)$\n^Line:(\d+)", result.stdout, re.MULTILINE)
     return (int(matches[-1][1]), matches[-1][0]) if matches else None
 
 
@@ -121,6 +127,7 @@ def pdf_visible_words(pdf: Path) -> list[list[str]]:
         text=True,
         errors="replace",
         timeout=120,
+        check=False,
     )
     if result.returncode:
         raise SystemExit(f"pdftotext: {result.stderr.strip()[:200]}")
@@ -141,7 +148,12 @@ def forward(
         try:
             expected = raw_pages(pdf, source, line, column)
         except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
-            yield {"direction": "forward", "line": line, "ok": False, "error": str(error)}
+            yield {
+                "direction": "forward",
+                "line": line,
+                "ok": False,
+                "error": str(error),
+            }
             continue
         try:
             result = subprocess.run(
@@ -158,10 +170,16 @@ def forward(
                 capture_output=True,
                 text=True,
                 timeout=30,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
-            yield {"direction": "forward", "line": line, "column": column,
-                   "ok": False, "error": str(error)}
+            yield {
+                "direction": "forward",
+                "line": line,
+                "column": column,
+                "ok": False,
+                "error": str(error),
+            }
             continue
         if result.returncode != 0:
             yield {
@@ -182,7 +200,12 @@ def forward(
                 and 1 <= page <= page_count
             )
         except (ValueError, KeyError, TypeError) as error:
-            yield {"direction": "forward", "line": line, "ok": False, "error": str(error)}
+            yield {
+                "direction": "forward",
+                "line": line,
+                "ok": False,
+                "error": str(error),
+            }
             continue
         entry = {
             "direction": "forward",
@@ -213,7 +236,9 @@ def forward(
                 ]
                 if chosen_score is None and better:
                     entry["ok"] = False
-                    entry["error"] = "selected word absent from chosen page but present with source context on another SyncTeX page"
+                    entry["error"] = (
+                        "selected word absent from chosen page but present with source context on another SyncTeX page"
+                    )
                     entry["visible_alternatives"] = sorted(better)
             except (IndexError, KeyError, TypeError, ValueError) as error:
                 entry["ok"] = False
@@ -235,24 +260,30 @@ def input_path(name: str, pdf: Path, source: Path) -> Path:
 def inverse(
     pdf: Path,
     source: Path,
-    pages: list[int],
-    n: int,
-    info: dict[int, tuple[float, float]],
-    rng: random.Random,
+    glyph_points: dict[int, list[GlyphPoint]],
 ) -> Iterator[dict]:
-    for page in pages:
-        width, height = info[page]
-        for point in sample_points(width, height, n, rng):
+    for page, glyphs in glyph_points.items():
+        for symbol, box in glyphs:
+            x = (box[0] + box[2]) / 2
+            y = (box[1] + box[3]) / 2
             try:
-                raw = raw_inverse(pdf, point[0], point[1], page)
+                raw = raw_inverse(pdf, x, y, page)
             except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
-                yield {"direction": "inverse", "page": page, "ok": False, "error": str(error)}
+                yield {
+                    "direction": "inverse",
+                    "page": page,
+                    "symbol": symbol,
+                    "ok": False,
+                    "error": str(error),
+                }
                 continue
             entry = {
                 "direction": "inverse",
                 "page": page,
-                "x": point[0],
-                "y": point[1],
+                "x": x,
+                "y": y,
+                "symbol": symbol,
+                "glyph_box": box,
                 "ok": raw is not None,
                 "raw_line": raw[0] if raw else None,
             }
@@ -263,46 +294,79 @@ def inverse(
                 entry["raw_file"] = str(file)
                 if not file.is_file() or raw[0] < 1:
                     entry["ok"] = False
-                    entry["error"] = "synctex edit returned a missing file or invalid line"
+                    entry["error"] = (
+                        "synctex edit returned a missing file or invalid line"
+                    )
                 else:
                     try:
                         view_pages = raw_pages(pdf, file, raw[0])
-                        entry["ok"] = page in view_pages
-                        if not entry["ok"]:
-                            entry["error"] = "synctex edit/view round trip changed page"
-                            entry["raw_pages"] = sorted(view_pages)
+                        entry["roundtrip_page_match"] = page in view_pages
+                        entry["roundtrip_pages"] = sorted(view_pages)
                     except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
                         entry["ok"] = False
                         entry["error"] = str(error)
             yield entry
 
 
-def sample_points(
-    width: float, height: float, n: int, rng: random.Random
-) -> list[tuple[float, float]]:
-    columns = (0.1, 0.35, 0.6, 0.85)
-    rows = (0.1, 0.3, 0.5, 0.7, 0.9)
-    points = [(width * fx, height * fy) for fy in rows for fx in columns]
-    points.extend(
-        (width * rng.uniform(0.05, 0.95), height * rng.uniform(0.05, 0.95))
-        for _ in range(max(0, n - len(points)))
-    )
-    return points[:n]
+def sample_glyph_points(
+    pdf: Path, page_count: int, pages: int, points: int, rng: random.Random
+) -> tuple[dict[int, list[GlyphPoint]], int]:
+    """Sample character boxes with paint, opacity, and an on-page center."""
+    if pages == 0 or points == 0:
+        return {}, 0
+    try:
+        import pymupdf
+    except ImportError as error:
+        raise SystemExit(
+            "inverse glyph probes require PyMuPDF in the Python environment"
+        ) from error
+
+    selected = {}
+    skipped = 0
+    candidates = list(range(1, page_count + 1))
+    rng.shuffle(candidates)
+    with pymupdf.open(pdf) as document:
+        if document.page_count != page_count:
+            raise SystemExit("PyMuPDF page count differs from pdfinfo")
+        for page_number in candidates:
+            page = document[page_number - 1]
+            glyphs = []
+            for span in page.get_texttrace():
+                if span["type"] not in (0, 1) or span["opacity"] <= 0:
+                    continue
+                for codepoint, _, _, coordinates in span["chars"]:
+                    if not 0 < codepoint <= 0x10FFFF:
+                        continue
+                    symbol = chr(codepoint)
+                    box = pymupdf.Rect(coordinates)
+                    if (
+                        not symbol.isspace()
+                        and box.width > 0
+                        and box.height > 0
+                        and page.rect.contains(box.tl + (box.br - box.tl) / 2)
+                    ):
+                        glyphs.append((symbol, tuple(coordinates)))
+            if glyphs:
+                selected[page_number] = rng.sample(glyphs, min(points, len(glyphs)))
+                if len(selected) == pages:
+                    break
+            else:
+                skipped += 1
+    if not selected:
+        raise SystemExit("no on-page painted text glyphs to probe in this PDF")
+    return dict(sorted(selected.items())), skipped
 
 
-def pdfinfo(pdf: Path) -> dict[int, tuple[float, float]]:
-    sizes = {}
+def pdf_page_count(pdf: Path) -> int:
     result = subprocess.run(
-        ["pdfinfo", "-l", "1000000", str(pdf)], capture_output=True, text=True
+        ["pdfinfo", str(pdf)], capture_output=True, text=True, check=False
     )
     if result.returncode:
         raise SystemExit(f"pdfinfo: {result.stderr.strip()[:200]}")
-    for row in result.stdout.splitlines():
-        if match := re.match(r"Page\s+(\d+) size:\s+([\d.]+) x ([\d.]+)", row):
-            sizes[int(match.group(1))] = (float(match.group(2)), float(match.group(3)))
-    if not sizes:
-        raise SystemExit("pdfinfo returned no page sizes")
-    return sizes
+    match = re.search(r"^Pages:\s+(\d+)$", result.stdout, re.MULTILINE)
+    if not match:
+        raise SystemExit("pdfinfo returned no page count")
+    return int(match.group(1))
 
 
 def pdfterm_bin() -> Path:
@@ -315,13 +379,21 @@ def pdfterm_bin() -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", type=Path)
-    parser.add_argument("--source", type=Path, help="source file to sample (default: PDF basename with .tex)")
+    parser.add_argument(
+        "--source",
+        type=Path,
+        help="source file to sample (default: PDF basename with .tex)",
+    )
     parser.add_argument("--lines", type=int, default=100, help="source lines to sample")
-    parser.add_argument("--points", type=int, default=20, help="inverse points per sampled page")
+    parser.add_argument(
+        "--points", type=int, default=20, help="inverse points per sampled page"
+    )
     parser.add_argument("--pages", type=int, default=12, help="inverse pages to sample")
     parser.add_argument("--max-fails", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260922)
-    parser.add_argument("--allow-stale", action="store_true", help="accept an older PDF/SyncTeX pair")
+    parser.add_argument(
+        "--allow-stale", action="store_true", help="accept an older PDF/SyncTeX pair"
+    )
     args = parser.parse_args()
     if min(args.lines, args.pages, args.points) < 0 or args.max_fails < 1:
         parser.error("counts must be nonnegative and --max-fails must be positive")
@@ -331,13 +403,23 @@ def main() -> None:
     if not source_file.is_file():
         raise SystemExit(f"missing source {source_file}; pass --source PATH")
     companion = next(
-        (path for path in (pdf.with_suffix(".synctex.gz"), pdf.with_suffix(".synctex")) if path.exists()),
+        (
+            path
+            for path in (pdf.with_suffix(".synctex.gz"), pdf.with_suffix(".synctex"))
+            if path.exists()
+        ),
         None,
     )
     if not pdf.is_file() or companion is None:
         raise SystemExit("missing PDF or matching SyncTeX sidecar")
-    if not args.allow_stale and min(pdf.stat().st_mtime_ns, companion.stat().st_mtime_ns) < source_file.stat().st_mtime_ns:
-        raise SystemExit("PDF/SyncTeX pair predates the TeX source; rebuild or pass --allow-stale")
+    if (
+        not args.allow_stale
+        and min(pdf.stat().st_mtime_ns, companion.stat().st_mtime_ns)
+        < source_file.stat().st_mtime_ns
+    ):
+        raise SystemExit(
+            "PDF/SyncTeX pair predates the TeX source; rebuild or pass --allow-stale"
+        )
     if companion.suffix == ".gz":
         with gzip.open(companion, "rb") as stream:
             while stream.read(1024 * 1024):
@@ -346,26 +428,31 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     forward_positions = sample_source_positions(source, rng, args.lines)
-    info = pdfinfo(pdf)
-    pages = sorted(rng.sample(list(info), min(args.pages, len(info))))
+    page_count = pdf_page_count(pdf)
+    glyph_points, skipped_pages = sample_glyph_points(
+        pdf, page_count, args.pages, args.points, rng
+    )
     visible_words = pdf_visible_words(pdf) if forward_positions else []
-    if visible_words and len(visible_words) != len(info):
+    if visible_words and len(visible_words) != page_count:
         raise SystemExit("pdftotext page count differs from pdfinfo")
 
     results = []
     failures = 0
-    for probe in forward(pdf, source_file, forward_positions, len(info), visible_words):
+    for probe in forward(
+        pdf, source_file, forward_positions, page_count, visible_words
+    ):
         results.append(probe)
         failures += not probe["ok"]
         if failures >= args.max_fails:
             break
     if failures < args.max_fails:
-        for probe in inverse(pdf, source_file, pages, args.points, info, rng):
+        for probe in inverse(pdf, source_file, glyph_points):
             results.append(probe)
             failures += not probe["ok"]
             if failures >= args.max_fails:
                 break
-    stopped = len(results) < len(forward_positions) + len(pages) * args.points
+    expected_probes = len(forward_positions) + sum(map(len, glyph_points.values()))
+    stopped = len(results) < expected_probes
     print(
         json.dumps(
             {
@@ -374,7 +461,14 @@ def main() -> None:
                 "probes": len(results),
                 "fails": failures,
                 "stopped_early": stopped,
-                "visible_checked": sum(bool(probe.get("visible_checked")) for probe in results),
+                "inverse_pages": len(glyph_points),
+                "glyphless_pages_skipped": skipped_pages,
+                "inverse_roundtrip_mismatches": sum(
+                    probe.get("roundtrip_page_match") is False for probe in results
+                ),
+                "visible_checked": sum(
+                    bool(probe.get("visible_checked")) for probe in results
+                ),
                 "results": results,
             },
             indent=2,
