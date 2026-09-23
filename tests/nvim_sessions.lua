@@ -25,6 +25,20 @@ if case then
   vim.notify = function(message)
     messages[#messages + 1] = tostring(message)
   end
+  local copied
+  vim.g.clipboard = {
+    name = 'test clipboard',
+    copy = {
+      ['+'] = function(lines)
+        copied = table.concat(lines, '\n')
+      end,
+      ['*'] = function() end,
+    },
+    paste = {
+      ['+'] = function() return {}, 'v' end,
+      ['*'] = function() return {}, 'v' end,
+    },
+  }
   vim.env.SSH_CONNECTION = '127.0.0.1 50000 127.0.0.1 22'
   -- Even forwarded terminal identifiers must not trigger local window control.
   vim.env.KITTY_WINDOW_ID, vim.env.TERM_PROGRAM = '123', 'ghostty'
@@ -115,6 +129,7 @@ if case then
     return
   end
   local command = messages[1]
+  assert(copied == command, 'viewer command was not sent to clipboard')
   local resolved = vim
     .system({ '/bin/sh', '-c', command .. ' --print-config' }, { text = true })
     :wait(10000)

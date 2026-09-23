@@ -355,7 +355,9 @@ function M.viewer_command(pdf)
   ready(function()
     pdf = pdf and vim.fn.fnamemodify(pdf, ':p')
       or project.describe(options.project, main_file or source).pdf
-    vim.notify(viewer_command(pdf))
+    local shell_command = viewer_command(pdf)
+    vim.fn.setreg('+', shell_command)
+    vim.notify(shell_command)
   end, true)
 end
 function M.build()

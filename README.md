@@ -519,9 +519,11 @@ same remote machine. In Neovim, use:
 :PdfTermViewerCommand
 ```
 
-This activates the inverse listener and prints a shell-quoted command with the
-matching session and PDF. Run that command in a second SSH terminal connected to
-the same machine. Use `:PdfTermViewerCommand /path/to/document.pdf` to select a PDF
+This activates the inverse listener, prints a shell-quoted command with the
+matching session and PDF, and copies it to the `+` register. With a configured
+clipboard provider such as OSC 52 over SSH, the command reaches the client
+clipboard. Run it in a second SSH terminal connected to the same machine. Use
+`:PdfTermViewerCommand /path/to/document.pdf` to select a PDF
 directly. Activate this command **before** inverse-clicking a separately started
 viewer; no forward search is required. The local terminal must support Kitty
 graphics over SSH. This manual mode needs no client helper or socket forwarding.
@@ -534,8 +536,8 @@ page one without source positioning. This also works when no viewer is running.
 A failed compile-before-forward build still stops navigation rather than opening
 stale output.
 Commands are `:PdfTermOpen [pdf]`, `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
-`:PdfTermCompile`. `:PdfTermViewerCommand [pdf]` / `viewer_command(pdf)` print the
-paired viewer invocation. `forward_search(pdf, json_payload)` sends an already-resolved
+`:PdfTermCompile`. `:PdfTermViewerCommand [pdf]` / `viewer_command(pdf)` print and
+copy the paired viewer invocation. `forward_search(pdf, json_payload)` sends an already-resolved
 request. Builds, configuration, and resolution are asynchronous. Navigation generations start
 at invocation; stale completions cannot navigate. Builds sharing a canonical
 working directory or an output PDF run serially, retaining only the newest
