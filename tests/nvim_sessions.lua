@@ -155,8 +155,8 @@ if case then
   wait(function()
     return #messages > 1
   end)
-  assert(messages[2]:find(command, 1, true), messages[2])
-  assert(messages[2]:match('another terminal'))
+  assert(messages[2]:find('PdfTermViewerCommand', 1, true), messages[2])
+  assert(messages[2]:match('viewer unavailable'), messages[2])
   print(vim.json.encode({
     case = case,
     setup_ns = setup_ns,

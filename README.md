@@ -362,8 +362,10 @@ pdfterm only; it does not configure other viewers or editors.
 
 With the repository on `runtimepath`, `require("pdfterm").setup()` needs no
 arguments for bidirectional SyncTeX. Open a compiled TeX document and run
-`:PdfTermForward`; Option/Alt-click the PDF to jump back and focus its source
-terminal. This works locally and through the SSH bridge described below.
+`:PdfTermForward` to navigate an existing viewer, or `:PdfTermForwardSplit` to
+launch a right-hand terminal split if none is running. Option/Alt-click the PDF
+to jump back and focus its source terminal. This works locally and through the
+SSH bridge described below.
 The PDF needs a matching `.synctex.gz` sidecar and `synctex` must be on `PATH`.
 Keybindings and automatic compilation remain optional.
 
@@ -426,11 +428,13 @@ Each editor gets a unique session unless `session` is explicitly supplied.
 Local navigation captures its source terminal at invocation, before asynchronous
 configuration, builds, or resolution can observe another focused window. It then
 tries the viewer socket. A capture failure does not prevent socket-only attachment.
-If no viewer is available and `attach_only` is false, the Kitty/Ghostty backend
-may launch one using that captured identity. Inverse focus is enabled by default;
-set `focus_on_inverse = false` to keep focus in the viewer.
-Both terminals launch a right-hand split beside the captured source, in its existing
-tab and OS window. Kitty window control requires remote-control permission.
+`:PdfTermForward` never creates a terminal split; if the viewer is absent it reports
+the missing viewer. `:PdfTermForwardSplit` can launch one using the captured identity
+when `attach_only` is false. Inverse focus is enabled by default; set
+`focus_on_inverse = false` to keep focus in the viewer. An explicit `:PdfTermOpen`
+also launches a viewer when needed. Both terminals launch a right-hand split beside
+the captured source, in its existing tab and OS window.
+Kitty window control requires remote-control permission.
 The adapter selects the source tab's `splits` layout; include `splits` if you
 restrict Kitty's `enabled_layouts` (the standard defaults already include it).
 Local Ghostty capture and focus share one lazily started JavaScript-for-Automation
@@ -489,12 +493,13 @@ The private SSH master shares the interactive session's foreground process group
 and does not request extra confirmation for each multiplexed forwarding request.
 Finite control/bootstrap helpers use null stdin; they never pass the terminal's
 input descriptor to the background master.
-On first forward search, the adapter asks the client helper to open a viewer
-running **SSH back to the same host**, with the same PDF, session, `PATH`, and
-configuration directory. Both Kitty and Ghostty split the original source terminal
-to the right, within the same tab and OS window. The PDF, SyncTeX data,
-and editor/viewer sockets stay remote; Kitty graphics travel over the viewer's SSH
-connection. Existing viewers attach without creating another terminal surface.
+On `:PdfTermForwardSplit` or explicit `:PdfTermOpen` when no viewer is running,
+the adapter asks the client helper to open a viewer running **SSH back to the same
+host**, with the same PDF, session, `PATH`, and configuration directory. Both
+Kitty and Ghostty split the original source terminal to the right, within the
+same tab and OS window. The PDF, SyncTeX data, and editor/viewer sockets stay
+remote; Kitty graphics travel over the viewer's SSH connection. Ordinary
+`:PdfTermForward` attaches to an existing viewer without creating a terminal.
 Inverse-focus, if enabled, returns to the original client source terminal.
 
 The helper lives for that SSH connection, across successive editor sessions.
@@ -530,17 +535,19 @@ directly. Activate this command **before** inverse-clicking a separately started
 viewer; no forward search is required. The local terminal must support Kitty
 graphics over SSH. This manual mode needs no client helper or socket forwarding.
 
-Public actions are `open(pdf)`, `forward()`, `build()`, `set_main(file)`, and `toggle_compile()`.
-`open(pdf)` opens or selects a PDF at page one using the same local/SSH session;
-it needs neither TeX sources nor a SyncTeX sidecar.
-If `forward()` cannot resolve a SyncTeX location, it warns and opens the PDF at
-page one without source positioning. This also works when no viewer is running.
+Public actions are `open(pdf)`, `forward()`, `forward_split()`, `build()`,
+`set_main(file)`, and `toggle_compile()`. `open(pdf)` opens or selects a PDF at
+page one using the same local/SSH session; it needs neither TeX sources nor a
+SyncTeX sidecar. If `forward()` or `forward_split()` cannot resolve a SyncTeX
+location, it warns and navigates to page one without source positioning.
 A failed compile-before-forward build still stops navigation rather than opening
 stale output.
-Commands are `:PdfTermOpen [pdf]`, `:PdfTermForward`, `:PdfTermBuild`, `:PdfTermMain [file]`, and
+Commands are `:PdfTermOpen [pdf]`, `:PdfTermForward`, `:PdfTermForwardSplit`,
+`:PdfTermBuild`, `:PdfTermMain [file]`, and
 `:PdfTermCompile`. `:PdfTermViewerCommand [pdf]` / `viewer_command(pdf)` print and
-copy the paired viewer invocation. `forward_search(pdf, json_payload)` sends an already-resolved
-request. Builds, configuration, and resolution are asynchronous. Navigation generations start
+copy the paired viewer invocation. `forward_search(pdf, json_payload)` sends an
+already-resolved request to an existing viewer without launching a terminal.
+Builds, configuration, and resolution are asynchronous. Navigation generations start
 at invocation; stale completions cannot navigate. Builds sharing a canonical
 working directory or an output PDF run serially, retaining only the newest
 pending build.

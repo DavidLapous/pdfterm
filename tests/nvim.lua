@@ -176,7 +176,11 @@ local ok, failure = xpcall(function()
     vim.fn.readfile(directory .. '/bootstrap.log')[1] == 'selected',
     'bootstrap executable ignored'
   )
-  assert(vim.fn.exists(':PdfTermForward') == 2 and vim.fn.exists(':PdfTermBuild') == 2)
+  assert(
+    vim.fn.exists(':PdfTermForward') == 2
+      and vim.fn.exists(':PdfTermForwardSplit') == 2
+  )
+  assert(vim.fn.exists(':PdfTermBuild') == 2)
   for _, mapping in ipairs(vim.api.nvim_get_keymap('n')) do
     assert(not (mapping.desc or ''):match('^pdfterm'), 'default mappings are not opt-in')
   end
@@ -191,27 +195,30 @@ local ok, failure = xpcall(function()
     'setup opened an inverse listener before first use'
   )
   local requests = {}
-  server = assert(vim.uv.new_pipe(false))
-  assert(server:bind(config.forward_socket))
-  server:listen(16, function(error)
-    assert(not error, error)
-    local client = assert(vim.uv.new_pipe(false))
-    server:accept(client)
-    local chunks = {}
-    client:read_start(function(read_error, chunk)
-      assert(not read_error, read_error)
-      if chunk then
-        chunks[#chunks + 1] = chunk
-      else
-        requests[#requests + 1] = vim.json.decode(table.concat(chunks))
-        client:write('{"ok":true,"error":null}', function()
-          client:shutdown(function()
-            client:close()
+  local function receive()
+    server = assert(vim.uv.new_pipe(false))
+    assert(server:bind(config.forward_socket))
+    server:listen(16, function(error)
+      assert(not error, error)
+      local client = assert(vim.uv.new_pipe(false))
+      server:accept(client)
+      local chunks = {}
+      client:read_start(function(read_error, chunk)
+        assert(not read_error, read_error)
+        if chunk then
+          chunks[#chunks + 1] = chunk
+        else
+          requests[#requests + 1] = vim.json.decode(table.concat(chunks))
+          client:write('{"ok":true,"error":null}', function()
+            client:shutdown(function()
+              client:close()
+            end)
           end)
-        end)
-      end
+        end
+      end)
     end)
-  end)
+  end
+  receive()
   vim.cmd.edit(vim.fn.fnameescape(source))
   vim.api.nvim_win_set_cursor(0, { 4, 0 })
   adapter.forward()
@@ -394,8 +401,42 @@ local ok, failure = xpcall(function()
     return focused ~= nil
   end)
   assert(focused == 'new', 'superseded capture changed inverse focus')
+  -- Ordinary forward only attaches; explicit split launches and then delivers.
+  server:close()
+  local launches, notices = 0, {}
+  terminal.launch_split = function(_, _, _, callback)
+    launches = launches + 1
+    receive()
+    vim.schedule(function()
+      callback({ code = 0 }, { kind = 'ghostty', id = 'viewer' })
+    end)
+    return { wait = function() end }
+  end
+  terminal.capture_source = function(callback)
+    callback(nil, { kind = 'ghostty', id = 'source' })
+  end
+  terminal.close = function(split)
+    assert(split.id == 'viewer')
+  end
+  vim.notify = function(message, level)
+    notices[#notices + 1] = { message = message, level = level }
+  end
+  vim.cmd('PdfTermForward')
+  wait(function()
+    return #notices >= 2
+  end)
+  assert(launches == 0 and #requests == 8, 'ordinary forward launched a viewer')
+  assert(notices[#notices].message:find('PdfTermForwardSplit', 1, true))
+  vim.cmd('PdfTermForwardSplit')
+  wait(function()
+    return #requests == 9
+  end)
+  assert(
+    launches == 1 and requests[9].page == 1,
+    'explicit split did not launch and forward'
+  )
   print(
-    'adapter regressions passed: serialized/latest build, timeout/output cap, bootstrap, named session, attach-only, inverse socket; event ticks='
+    'adapter regressions passed: serialized/latest build, timeout/output cap, bootstrap, named session, forward-only, explicit split, inverse socket; event ticks='
       .. ticks
   )
 end, debug.traceback)

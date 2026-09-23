@@ -221,7 +221,7 @@ local function launch(id, source, source_error, callback)
   end
 end
 
-local function deliver(pdf, payload, id, source, source_error)
+local function deliver(pdf, payload, id, source, source_error, allow_launch)
   assert(initialized, 'pdfterm: call setup() first')
   if not alive(id) then
     return
@@ -258,6 +258,14 @@ local function deliver(pdf, payload, id, source, source_error)
           notify(error)
           return
         end
+        if not allow_launch then
+          notify(
+            options.attach_only and 'viewer unavailable; attach_only requires an existing viewer'
+              or remote_session() and 'viewer unavailable; use :PdfTermViewerCommand for manual pairing'
+              or 'viewer unavailable; use :PdfTermForwardSplit to launch one'
+          )
+          return
+        end
         if not launched then
           launched = true
           M._launch_pdf = pdf
@@ -290,14 +298,14 @@ function M.forward_search(pdf, payload, source)
   with_source(id, source, function(captured, capture_error)
     ready(function()
       if alive(id) then
-        deliver(pdf, payload, id, captured, capture_error)
+        deliver(pdf, payload, id, captured, capture_error, false)
       end
     end, true)
   end)
 end
 
 -- Open a standalone PDF at page one, without TeX or a SyncTeX sidecar.
-local function open_pdf(pdf, id, source, source_error)
+local function open_pdf(pdf, id, source, source_error, allow_launch)
   pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
   ready(function()
     if not alive(id) then
@@ -323,7 +331,7 @@ local function open_pdf(pdf, id, source, source_error)
       width = 0,
       height = 0,
     })
-    deliver(path, payload, id, source, source_error)
+    deliver(path, payload, id, source, source_error, allow_launch)
   end, true)
 end
 
@@ -331,7 +339,7 @@ function M.open(pdf)
   local id = intent()
   pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
   with_source(id, nil, function(source, source_error)
-    open_pdf(pdf, id, source, source_error)
+    open_pdf(pdf, id, source, source_error, true)
   end)
 end
 function M.set_main(file)
@@ -371,7 +379,7 @@ function M.build()
     project.build(p, id)
   end)
 end
-function M.forward()
+local function forward(allow_launch)
   local id = intent() -- Before save, configuration, build, resolution, and delivery.
   local cursor = vim.api.nvim_win_get_cursor(0)
   local file = vim.api.nvim_buf_get_name(0)
@@ -410,10 +418,10 @@ function M.forward()
                   .. vim.trim(result.stderr):gsub('^pdfterm:%s*', ''),
                 vim.log.levels.WARN
               )
-              open_pdf(p.pdf, id, source, source_error)
+              open_pdf(p.pdf, id, source, source_error, allow_launch)
               return
             end
-            deliver(p.pdf, result.stdout, id, source, source_error)
+            deliver(p.pdf, result.stdout, id, source, source_error, allow_launch)
           end
         )
       end
@@ -428,6 +436,12 @@ function M.forward()
       end
     end, true)
   end)
+end
+function M.forward()
+  forward(false)
+end
+function M.forward_split()
+  forward(true)
 end
 
 function M.setup(opts)
@@ -507,6 +521,7 @@ function M.setup(opts)
     })
   end
   vim.api.nvim_create_user_command('PdfTermForward', M.forward, {})
+  vim.api.nvim_create_user_command('PdfTermForwardSplit', M.forward_split, {})
   vim.api.nvim_create_user_command('PdfTermBuild', M.build, {})
   vim.api.nvim_create_user_command('PdfTermMain', function(args)
     M.set_main(args.args ~= '' and args.args or nil)
