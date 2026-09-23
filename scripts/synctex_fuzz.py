@@ -2,10 +2,10 @@
 """Fuzz forward and inverse SyncTeX mappings for any TeX-built PDF.
 
 Forward probes compare pdfterm's page with raw SyncTeX results and use Poppler
-text to catch a selected source word missing from one raw candidate when
-another raw candidate contains the word and its source context. Raw page
-disagreement is reported, not failed: a resolver may refine an imprecise
-SyncTeX source position.
+text to check selected source words. When raw SyncTeX has no page but the
+selected word appears in the PDF (for example, a title argument), it must
+appear on pdfterm's chosen page. Raw page disagreement is reported, not
+failed: a resolver may refine an imprecise SyncTeX source position.
 Inverse probes click centers of on-page painted PDF glyph boxes found by PyMuPDF.
 The raw `synctex edit` result must name a real source line; its `synctex view`
 page is diagnostic because overlays can make the raw mapping asymmetric.
@@ -193,12 +193,7 @@ def forward(
         try:
             got = json.loads(result.stdout)
             page = got["page"]
-            valid = (
-                bool(expected)
-                and got["pdf"] == str(pdf)
-                and type(page) is int
-                and 1 <= page <= page_count
-            )
+            valid = got["pdf"] == str(pdf) and type(page) is int and 1 <= page <= page_count
         except (ValueError, KeyError, TypeError) as error:
             yield {
                 "direction": "forward",
@@ -215,31 +210,41 @@ def forward(
             "resolved_page": page,
             "raw_pages": sorted(expected),
             "raw_page_match": page in expected,
+            "raw_unmapped": not expected,
         }
         if (
             valid
             and visible_words is not None
-            and len(expected) > 1
-            and page in expected
+            and (not expected or len(expected) > 1)
             and got.get("word")
         ):
             try:
                 hint = got["word"]
                 chosen_score = context_score(visible_words[page - 1], hint)
-                entry["visible_checked"] = True
-                better = [
-                    candidate
-                    for candidate in expected
-                    if candidate != page
-                    and 1 <= candidate <= page_count
-                    and (context_score(visible_words[candidate - 1], hint) or 0) > 0
-                ]
-                if chosen_score is None and better:
-                    entry["ok"] = False
-                    entry["error"] = (
-                        "selected word absent from chosen page but present with source context on another SyncTeX page"
+                if not expected:
+                    elsewhere = chosen_score is None and any(
+                        context_score(words, hint) is not None
+                        for words in visible_words
                     )
-                    entry["visible_alternatives"] = sorted(better)
+                    entry["visible_checked"] = chosen_score is not None or elsewhere
+                    if elsewhere:
+                        entry["ok"] = False
+                        entry["error"] = "raw SyncTeX has no page and selected word is absent from chosen PDF page"
+                elif page in expected:
+                    entry["visible_checked"] = True
+                    better = [
+                        candidate
+                        for candidate in expected
+                        if candidate != page
+                        and 1 <= candidate <= page_count
+                        and (context_score(visible_words[candidate - 1], hint) or 0) > 0
+                    ]
+                    if chosen_score is None and better:
+                        entry["ok"] = False
+                        entry["error"] = (
+                            "selected word absent from chosen page but present with source context on another SyncTeX page"
+                        )
+                        entry["visible_alternatives"] = sorted(better)
             except (IndexError, KeyError, TypeError, ValueError) as error:
                 entry["ok"] = False
                 entry["error"] = f"invalid forward word or PDF page: {error}"
