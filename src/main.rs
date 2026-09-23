@@ -91,7 +91,13 @@ fn main() -> ExitCode {
                 .path
                 .as_ref()
                 .ok_or("a PDF path is required for forward search")?;
-            let request = pdfterm::synctex::resolve_forward(pdf, source, cli.line, cli.column)?;
+            let request = pdfterm::synctex::resolve_forward_with_library(
+                pdf,
+                source,
+                cli.line,
+                cli.column,
+                cli.pdfium_library.as_deref(),
+            )?;
             if cli.synctex_view.is_some() {
                 println!("{}", serde_json::to_string(&request)?);
             } else {

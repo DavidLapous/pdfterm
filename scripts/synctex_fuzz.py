@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Fuzz SyncTeX navigation in both directions for a PDF and report mismatches.
+"""Fuzz forward and inverse SyncTeX mappings for any TeX-built PDF.
 
-Forward: sample source lines of the companion .tex, resolve with the pdfterm
-CLI, and compare the resolved page against the raw `synctex view` mapping. A
-line inside a literal Beamer frame must map to the frame's closing-line pages
-exactly; any other line must match its own raw mapping. Inverse: sample points
-on sampled pages, run `synctex edit`, and require a match whose line lies
-inside the enclosing frame when the raw result is a frame closing line.
-Output is JSON, one object per probe. Breaks (nonzero exit) after --max-fails.
+Forward probes compare pdfterm's page with raw SyncTeX results and use Poppler
+text to catch a selected source word missing from one raw candidate when
+another raw candidate contains the word and its source context. Raw page
+disagreement is reported, not failed: a resolver may refine an imprecise
+SyncTeX source position.
+Inverse probes round-trip each raw `synctex edit` result through `synctex view`.
+This script does not launch the viewer or Neovim or exercise pdfterm's inverse
+word refinement. Output is one JSON summary. Any failed probe exits nonzero.
 
-Usage: synctex_fuzz.py PDF [--lines N] [--points N] [--pages N] [--max-fails N]
+Usage: synctex_fuzz.py PDF [--source TEX] [--lines N]
+       [--points N] [--pages N] [--max-fails N] [--allow-stale]
 """
 
 import argparse
@@ -19,133 +21,233 @@ import random
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
-
-FRAME_BEGIN = re.compile(r"\\begin\s*\{frame\}")
-
-
-def tex_path(pdf: Path) -> Path:
-    return pdf.with_suffix(".tex")
+from typing import Iterator
 
 
-def raw_pages(pdf: Path, line: int) -> set[int]:
-    stdout = subprocess.run(
-        ["synctex", "view", "-i", f"{line}:1:{tex_path(pdf)}", "-o", str(pdf)],
+def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
+    result = subprocess.run(
+        ["synctex", "view", "-i", f"{line}:{column}:{source}", "-o", str(pdf)],
         capture_output=True,
         text=True,
         timeout=30,
-    ).stdout
-    return set(int(p) for p in re.findall(r"^Page:(\d+)$", stdout, re.M))
+    )
+    if result.returncode:
+        raise RuntimeError(f"synctex view: {result.stderr.strip()[:200]}")
+    return set(int(p) for p in re.findall(r"^Page:(\d+)$", result.stdout, re.M))
 
 
 def raw_inverse(pdf: Path, x: float, y: float, page: int) -> tuple[int, str] | None:
-    stdout = subprocess.run(
+    result = subprocess.run(
         ["synctex", "edit", "-o", f"{page}:{x:.2f}:{y:.2f}:{pdf}"],
         capture_output=True,
         text=True,
         timeout=30,
-    ).stdout
-    match = re.search(r"^Input:(.*)$\n^Line:(\d+)", stdout, re.M)
-    return (int(match.group(2)), match.group(1)) if match else None
+    )
+    if result.returncode:
+        raise RuntimeError(f"synctex edit: {result.stderr.strip()[:200]}")
+    matches = re.findall(r"^Input:(.*)$\n^Line:(\d+)", result.stdout, re.M)
+    return (int(matches[-1][1]), matches[-1][0]) if matches else None
 
 
-def frame_bounds(source: str, line: int) -> tuple[int, int] | None:
-    start = None
-    for index, text in enumerate(source.splitlines(), 1):
-        stripped = text.lstrip()
-        if FRAME_BEGIN.match(stripped):
-            start = index
-        elif stripped.startswith("\\end{frame}"):
-            if start is not None and start <= line <= index:
-                return (start, index)
-            start = None
-    return None
+def source_line_text(text: str) -> str:
+    escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "%":
+            return text[:index]
+    return text
 
 
-def word_column(source: str, line: int) -> int:
-    row = source.splitlines()[line - 1] if line <= len(source.splitlines()) else ""
-    match = re.search(r"[A-Za-z]{2,}", row)
-    return match.start() + 1 if match else 1
-
-
-def forward(pdf: Path, lines: list[int], source: str) -> list[dict]:
-    results = []
-    for line in lines:
-        inside = frame_bounds(source, line)
-        # A frame-interior line must resolve to the closing line's pages only;
-        # that is the Beamer refinement this project implements.
-        expected = raw_pages(pdf, inside[1]) if inside else raw_pages(pdf, line)
-        column = word_column(source, line)
-        stdout = subprocess.run(
-            [
-                str(pdfterm_bin()),
-                str(pdf),
-                "--synctex-view",
-                str(tex_path(pdf)),
-                "--line",
-                str(line),
-                "--column",
-                str(column),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if stdout.returncode != 0:
-            results.append(
-                {
-                    "direction": "forward",
-                    "line": line,
-                    "ok": False,
-                    "error": stdout.stderr.strip()[:200],
-                }
-            )
+def sample_source_positions(
+    source: str, rng: random.Random, count: int
+) -> list[tuple[int, int]]:
+    candidates = []
+    for line, row in enumerate(source.splitlines(), 1):
+        if not row.strip() or row.lstrip().startswith("%"):
             continue
-        got = json.loads(stdout.stdout)
-        results.append(
-            {
+        row = source_line_text(row)
+        words = [
+            match.start() + 1
+            for match in re.finditer(r"[A-Za-z]{6,}", row)
+            if match.start() == 0 or row[match.start() - 1] != "\\"
+        ]
+        candidates.append((line, rng.choice(words) if words else 1))
+    return sorted(rng.sample(candidates, min(count, len(candidates))))
+
+
+def normalized_words(value: str) -> list[str]:
+    folded = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", value).casefold()
+        if not unicodedata.combining(char)
+    )
+    return re.findall(r"\w+", folded)
+
+
+def context_score(tokens: list[str], hint: dict) -> int | None:
+    source = [normalized_words(word) for word in hint["words"]]
+    if any(len(word) != 1 for word in source):
+        return None
+    source = [word[0] for word in source]
+    selected = hint["selected"]
+    best = None
+    for index, word in enumerate(tokens):
+        if word != source[selected]:
+            continue
+        score = 0
+        for distance in range(1, 4):
+            for direction in (-1, 1):
+                neighbor = index + direction * distance
+                source_neighbor = selected + direction * distance
+                if (
+                    0 <= neighbor < len(tokens)
+                    and 0 <= source_neighbor < len(source)
+                    and tokens[neighbor] == source[source_neighbor]
+                ):
+                    score += 4 - distance
+        best = max(score, best or 0)
+    return best
+
+
+def pdf_visible_words(pdf: Path) -> list[list[str]]:
+    result = subprocess.run(
+        ["pdftotext", "-layout", str(pdf), "-"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=120,
+    )
+    if result.returncode:
+        raise SystemExit(f"pdftotext: {result.stderr.strip()[:200]}")
+    pages = result.stdout.split("\f")
+    if pages[-1].strip() == "":
+        pages.pop()
+    return [normalized_words(page) for page in pages]
+
+
+def forward(
+    pdf: Path,
+    source: Path,
+    positions: list[tuple[int, int]],
+    page_count: int,
+    visible_words: list[list[str]] | None = None,
+) -> Iterator[dict]:
+    for line, column in positions:
+        try:
+            expected = raw_pages(pdf, source, line, column)
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+            yield {"direction": "forward", "line": line, "ok": False, "error": str(error)}
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    str(pdfterm_bin()),
+                    str(pdf),
+                    "--synctex-view",
+                    str(source),
+                    "--line",
+                    str(line),
+                    "--column",
+                    str(column),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            yield {"direction": "forward", "line": line, "column": column,
+                   "ok": False, "error": str(error)}
+            continue
+        if result.returncode != 0:
+            yield {
                 "direction": "forward",
                 "line": line,
-                "ok": got["page"] in expected,
-                "resolved_page": got["page"],
+                "ok": not expected and "no complete match" in result.stderr,
+                "error": result.stderr.strip()[:200],
                 "raw_pages": sorted(expected),
             }
-        )
-    return results
-
-
-def page_frames(pdf: Path, source: str, pages: list[int]) -> dict[int, list[tuple[int, int]]]:
-    """Frame ranges whose closing line maps to each sampled page."""
-    owners: dict[int, list[tuple[int, int]]] = {page: [] for page in pages}
-    closing: list[int] = []
-    lines = source.splitlines()
-    start = None
-    for index, text in enumerate(lines, 1):
-        if FRAME_BEGIN.match(text.lstrip()):
-            start = index
-        elif text.lstrip().startswith("\\end{frame}"):
-            if start is not None:
-                closing.append(index)
-            start = None
-    for line in closing:
-        inside = frame_bounds(source, line)
-        if inside is None:
             continue
-        for page in raw_pages(pdf, line):
-            if page in owners:
-                owners[page].append(inside)
-    return owners
+        try:
+            got = json.loads(result.stdout)
+            page = got["page"]
+            valid = (
+                bool(expected)
+                and got["pdf"] == str(pdf)
+                and type(page) is int
+                and 1 <= page <= page_count
+            )
+        except (ValueError, KeyError, TypeError) as error:
+            yield {"direction": "forward", "line": line, "ok": False, "error": str(error)}
+            continue
+        entry = {
+            "direction": "forward",
+            "line": line,
+            "column": column,
+            "ok": valid,
+            "resolved_page": page,
+            "raw_pages": sorted(expected),
+            "raw_page_match": page in expected,
+        }
+        if (
+            valid
+            and visible_words is not None
+            and len(expected) > 1
+            and page in expected
+            and got.get("word")
+        ):
+            try:
+                hint = got["word"]
+                chosen_score = context_score(visible_words[page - 1], hint)
+                entry["visible_checked"] = True
+                better = [
+                    candidate
+                    for candidate in expected
+                    if candidate != page
+                    and 1 <= candidate <= page_count
+                    and (context_score(visible_words[candidate - 1], hint) or 0) > 0
+                ]
+                if chosen_score is None and better:
+                    entry["ok"] = False
+                    entry["error"] = "selected word absent from chosen page but present with source context on another SyncTeX page"
+                    entry["visible_alternatives"] = sorted(better)
+            except (IndexError, KeyError, TypeError, ValueError) as error:
+                entry["ok"] = False
+                entry["error"] = f"invalid forward word or PDF page: {error}"
+        yield entry
+
+
+def input_path(name: str, pdf: Path, source: Path) -> Path:
+    path = Path(name)
+    if path.is_absolute():
+        return path.resolve()
+    for root in (pdf.parent, source.parent):
+        candidate = (root / path).resolve()
+        if candidate.is_file():
+            return candidate
+    return (pdf.parent / path).resolve()
 
 
 def inverse(
-    pdf: Path, pages: list[int], n: int, source: str, owners: dict[int, list[tuple[int, int]]]
-) -> list[dict]:
-    results = []
-    info = pdfinfo(pdf)
+    pdf: Path,
+    source: Path,
+    pages: list[int],
+    n: int,
+    info: dict[int, tuple[float, float]],
+    rng: random.Random,
+) -> Iterator[dict]:
     for page in pages:
         width, height = info[page]
-        for point in sample_points(width, height, n):
-            raw = raw_inverse(pdf, point[0], point[1], page)
+        for point in sample_points(width, height, n, rng):
+            try:
+                raw = raw_inverse(pdf, point[0], point[1], page)
+            except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+                yield {"direction": "inverse", "page": page, "ok": False, "error": str(error)}
+                continue
             entry = {
                 "direction": "inverse",
                 "page": page,
@@ -156,38 +258,48 @@ def inverse(
             }
             if raw is None:
                 entry["error"] = "synctex edit returned no match"
-            elif raw[1].endswith(".tex"):
-                frames = owners.get(page) or []
-                if frames:
-                    # The raw line must belong to a frame that owns this page:
-                    # a click on a page whose frames span 4708..4730 mapping to
-                    # the preceding frame's closing line 4703 is the bug.
-                    entry["ok"] = any(
-                        begin <= raw[0] <= end + 1 for begin, end in frames
-                    )
-                    entry["frames"] = [list(f) for f in frames]
-            results.append(entry)
-    return results
+            else:
+                file = input_path(raw[1], pdf, source)
+                entry["raw_file"] = str(file)
+                if not file.is_file() or raw[0] < 1:
+                    entry["ok"] = False
+                    entry["error"] = "synctex edit returned a missing file or invalid line"
+                else:
+                    try:
+                        view_pages = raw_pages(pdf, file, raw[0])
+                        entry["ok"] = page in view_pages
+                        if not entry["ok"]:
+                            entry["error"] = "synctex edit/view round trip changed page"
+                            entry["raw_pages"] = sorted(view_pages)
+                    except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+                        entry["ok"] = False
+                        entry["error"] = str(error)
+            yield entry
 
 
-def sample_points(width: float, height: float, n: int) -> list[tuple[float, float]]:
+def sample_points(
+    width: float, height: float, n: int, rng: random.Random
+) -> list[tuple[float, float]]:
     columns = (0.1, 0.35, 0.6, 0.85)
     rows = (0.1, 0.3, 0.5, 0.7, 0.9)
     points = [(width * fx, height * fy) for fy in rows for fx in columns]
+    points.extend(
+        (width * rng.uniform(0.05, 0.95), height * rng.uniform(0.05, 0.95))
+        for _ in range(max(0, n - len(points)))
+    )
     return points[:n]
 
 
 def pdfinfo(pdf: Path) -> dict[int, tuple[float, float]]:
     sizes = {}
-    total = None
-    output = subprocess.run(
+    result = subprocess.run(
         ["pdfinfo", "-l", "1000000", str(pdf)], capture_output=True, text=True
-    ).stdout
-    for row in output.splitlines():
+    )
+    if result.returncode:
+        raise SystemExit(f"pdfinfo: {result.stderr.strip()[:200]}")
+    for row in result.stdout.splitlines():
         if match := re.match(r"Page\s+(\d+) size:\s+([\d.]+) x ([\d.]+)", row):
             sizes[int(match.group(1))] = (float(match.group(2)), float(match.group(3)))
-        elif total := re.match(r"Pages:\s+(\d+)", row):
-            total = int(total.group(1))
     if not sizes:
         raise SystemExit("pdfinfo returned no page sizes")
     return sizes
@@ -203,53 +315,72 @@ def pdfterm_bin() -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", type=Path)
-    parser.add_argument("--lines", type=int, default=40, help="forward source lines to sample")
+    parser.add_argument("--source", type=Path, help="source file to sample (default: PDF basename with .tex)")
+    parser.add_argument("--lines", type=int, default=100, help="source lines to sample")
     parser.add_argument("--points", type=int, default=20, help="inverse points per sampled page")
     parser.add_argument("--pages", type=int, default=12, help="inverse pages to sample")
     parser.add_argument("--max-fails", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260922)
+    parser.add_argument("--allow-stale", action="store_true", help="accept an older PDF/SyncTeX pair")
     args = parser.parse_args()
+    if min(args.lines, args.pages, args.points) < 0 or args.max_fails < 1:
+        parser.error("counts must be nonnegative and --max-fails must be positive")
 
     pdf = args.pdf.resolve()
-    tex = tex_path(pdf)
-    if not tex.exists():
-        raise SystemExit(f"missing companion {tex}")
-    companion = pdf.with_suffix(".synctex.gz")
-    if companion.exists():
-        gzip.decompress(companion.read_bytes())
-    source = tex.read_text()
+    source_file = (args.source or pdf.with_suffix(".tex")).resolve()
+    if not source_file.is_file():
+        raise SystemExit(f"missing source {source_file}; pass --source PATH")
+    companion = next(
+        (path for path in (pdf.with_suffix(".synctex.gz"), pdf.with_suffix(".synctex")) if path.exists()),
+        None,
+    )
+    if not pdf.is_file() or companion is None:
+        raise SystemExit("missing PDF or matching SyncTeX sidecar")
+    if not args.allow_stale and min(pdf.stat().st_mtime_ns, companion.stat().st_mtime_ns) < source_file.stat().st_mtime_ns:
+        raise SystemExit("PDF/SyncTeX pair predates the TeX source; rebuild or pass --allow-stale")
+    if companion.suffix == ".gz":
+        with gzip.open(companion, "rb") as stream:
+            while stream.read(1024 * 1024):
+                pass
+    source = source_file.read_text()
 
     rng = random.Random(args.seed)
-    text_lines = [
-        i + 1
-        for i, row in enumerate(source.splitlines())
-        if row.strip() and not row.lstrip().startswith("%")
-    ]
-    forward_lines = sorted(rng.sample(text_lines, min(args.lines, len(text_lines))))
-    pages = sorted(rng.sample(list(pdfinfo(pdf)), min(args.pages, len(pdfinfo(pdf)))))
+    forward_positions = sample_source_positions(source, rng, args.lines)
+    info = pdfinfo(pdf)
+    pages = sorted(rng.sample(list(info), min(args.pages, len(info))))
+    visible_words = pdf_visible_words(pdf) if forward_positions else []
+    if visible_words and len(visible_words) != len(info):
+        raise SystemExit("pdftotext page count differs from pdfinfo")
 
-    results = forward(pdf, forward_lines, source)
-    owners = page_frames(pdf, source, pages)
-    results += inverse(pdf, pages, args.points, source, owners)
-    fails = [p for p in results if not p["ok"]]
-    stopped = len(fails) >= args.max_fails
-    if stopped:
-        shown = results[: [i for i, p in enumerate(results) if not p["ok"]][args.max_fails - 1] + 1]
-    else:
-        shown = results
+    results = []
+    failures = 0
+    for probe in forward(pdf, source_file, forward_positions, len(info), visible_words):
+        results.append(probe)
+        failures += not probe["ok"]
+        if failures >= args.max_fails:
+            break
+    if failures < args.max_fails:
+        for probe in inverse(pdf, source_file, pages, args.points, info, rng):
+            results.append(probe)
+            failures += not probe["ok"]
+            if failures >= args.max_fails:
+                break
+    stopped = len(results) < len(forward_positions) + len(pages) * args.points
     print(
         json.dumps(
             {
                 "pdf": str(pdf),
+                "source": str(source_file),
                 "probes": len(results),
-                "fails": len(fails),
+                "fails": failures,
                 "stopped_early": stopped,
-                "results": shown,
+                "visible_checked": sum(bool(probe.get("visible_checked")) for probe in results),
+                "results": results,
             },
             indent=2,
         )
     )
-    sys.exit(1 if stopped else 0)
+    sys.exit(1 if failures else 0)
 
 
 if __name__ == "__main__":

@@ -142,7 +142,7 @@ impl ForwardWord {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardRequest {
     pub pdf: std::path::PathBuf,
@@ -208,6 +208,16 @@ pub fn resolve_forward(
     line: u32,
     column: u32,
 ) -> io::Result<ForwardRequest> {
+    resolve_forward_with_library(pdf, file, line, column, None)
+}
+
+pub fn resolve_forward_with_library(
+    pdf: &Path,
+    file: &Path,
+    line: u32,
+    column: u32,
+    library: Option<&Path>,
+) -> io::Result<ForwardRequest> {
     if line == 0 || column == 0 {
         return Err(io::Error::other("source line and column must be positive"));
     }
@@ -239,6 +249,8 @@ pub fn resolve_forward(
         ],
     )?;
     let (mut page, mut h, mut v, mut width, mut height) = (None, None, None, None, None);
+    let mut candidates = Vec::new();
+    let mut captured = false;
     for row in stdout.lines() {
         if let Some((key, value)) = row.split_once(':') {
             match key {
@@ -248,6 +260,7 @@ pub fn resolve_forward(
                     v = None;
                     width = None;
                     height = None;
+                    captured = false;
                 }
                 "h" => h = value.trim().parse::<f32>().ok(),
                 "v" => v = value.trim().parse::<f32>().ok(),
@@ -256,25 +269,54 @@ pub fn resolve_forward(
                 _ => {}
             }
         }
-        if let (Some(page), Some(h), Some(v), Some(width), Some(height)) =
-            (page, h, v, width, height)
+        if !captured
+            && let (Some(page), Some(h), Some(v), Some(width), Some(height)) =
+                (page, h, v, width, height)
         {
             let result = ForwardRequest {
                 revision,
-                pdf,
+                pdf: pdf.clone(),
                 page,
                 h,
                 v,
                 width,
                 height,
-                word,
+                word: word.clone(),
             };
-            result.validate()?;
-            revision.check(&result.pdf)?;
-            return Ok(result);
+            match result.validate() {
+                Ok(()) => candidates.push(result),
+                Err(error) if candidates.is_empty() => return Err(error),
+                Err(_) => {}
+            }
+            captured = true;
         }
     }
-    Err(io::Error::other("synctex view returned no complete match"))
+    let mut result = candidates
+        .first()
+        .cloned()
+        .ok_or_else(|| io::Error::other("synctex view returned no complete match"))?;
+    if let Some(hint) = &word {
+        let mut pages = Vec::new();
+        for candidate in &candidates {
+            if !pages.contains(&candidate.page) {
+                pages.push(candidate.page);
+            }
+        }
+        // SyncTeX returns overlay matches in traversal order, which need not
+        // be page order. Keep its first result as fallback, then inspect the
+        // remaining overlays in the order a reader sees them.
+        if pages.len() > 1 {
+            pages[1..].sort_unstable();
+        }
+        if let Some(page) = crate::pdf::first_visible_forward_page(&pdf, &pages, hint, library)
+            .map_err(io::Error::other)?
+            && let Some(candidate) = candidates.iter().find(|candidate| candidate.page == page)
+        {
+            result = candidate.clone();
+        }
+    }
+    revision.check(&pdf)?;
+    Ok(result)
 }
 
 fn run(operation: &Operation, args: &[&str]) -> io::Result<String> {

@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded};
 use pdfium_render::prelude::{
     PdfAction, PdfBookmark, PdfDestination, PdfDestinationViewSettings, PdfDocument, PdfLink,
-    PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon, PdfPageObjectsCommon, PdfPoints,
-    PdfRect, PdfRenderConfig, Pdfium,
+    PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon, PdfPageObjectsCommon,
+    PdfPageTextRenderMode, PdfPoints, PdfRect, PdfRenderConfig, Pdfium, PdfiumError,
 };
 
 use crate::synctex::{DocumentRevision, ForwardWord, PdfRevision, words};
 use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
 const LOW_CHROMA_THRESHOLD: u8 = 10;
 const MAX_DARK_MODE_WORKERS: usize = 8;
@@ -1825,6 +1826,117 @@ fn push_normalized_character(
     source_index_by_byte.extend(std::iter::repeat_n(source_index, character.len_utf8()));
 }
 
+fn same_forward_word(a: &str, b: &str) -> bool {
+    a.nfkd()
+        .filter(|character| !is_combining_mark(*character))
+        .flat_map(char::to_lowercase)
+        .eq(b
+            .nfkd()
+            .filter(|character| !is_combining_mark(*character))
+            .flat_map(char::to_lowercase))
+}
+
+fn forward_neighbor_score(tokens: &[(usize, &str)], hint: &ForwardWord, index: usize) -> u32 {
+    let mut score = 0;
+    for distance in 1..=3isize {
+        for direction in [-1, 1] {
+            let delta = distance * direction;
+            if let (Some(a), Some(b)) = (
+                index.checked_add_signed(delta).and_then(|i| tokens.get(i)),
+                hint.selected
+                    .checked_add_signed(delta)
+                    .and_then(|i| hint.words.get(i)),
+            ) && same_forward_word(a.1, b)
+            {
+                score += 4 - distance as u32;
+            }
+        }
+    }
+    score
+}
+
+fn forward_context_score(text: &str, hint: &ForwardWord) -> Option<u32> {
+    let selected = hint.words.get(hint.selected)?;
+    let tokens = words(text);
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, word))| same_forward_word(word, selected))
+        .map(|(index, _)| forward_neighbor_score(&tokens, hint, index))
+        .max()
+}
+
+/// Beamer can keep future overlay text in the PDF at coordinates well outside
+/// the page. PDFium extracts those glyphs, so raw page text is not evidence
+/// that the words are visible on the current overlay.
+fn visible_forward_text(page: &PdfPage) -> Option<String> {
+    let text = page.text().ok()?;
+    let crop = page
+        .boundaries()
+        .crop()
+        .map(|boundary| boundary.bounds)
+        .unwrap_or_else(|_| page.page_size());
+    let (normalized, _) =
+        normalize_search_characters(text.chars().iter().filter_map(|character| {
+            let value = character.unicode_char()?;
+            if value.is_whitespace() {
+                return Some((character.index(), value));
+            }
+            let bounds = character.tight_bounds().ok()?;
+            let within_crop = bounds.right().value > crop.left().value
+                && bounds.left().value < crop.right().value
+                && bounds.top().value > crop.bottom().value
+                && bounds.bottom().value < crop.top().value;
+            let painted = !matches!(
+                character.render_mode(),
+                Ok(PdfPageTextRenderMode::Invisible | PdfPageTextRenderMode::InvisibleClipping)
+            );
+            (within_crop && painted).then_some((character.index(), value))
+        }));
+    Some(normalized)
+}
+
+/// Prefer a later SyncTeX candidate only when visible PDF text matches the
+/// selected source word together with nearby source words. A single word or
+/// an unreadable page never overrides the first complete SyncTeX result.
+pub(crate) fn first_visible_forward_page(
+    pdf: &Path,
+    candidates: &[u32],
+    hint: &ForwardWord,
+    library: Option<&Path>,
+) -> Result<Option<u32>, String> {
+    if candidates.len() < 2 || hint.words.len() < 2 {
+        return Ok(None);
+    }
+    let pdfium = load_pdfium(library)?;
+    let document = pdfium
+        .load_pdf_from_file(pdf, None)
+        .map_err(|error| format!("could not open {}: {error}", pdf.display()))?;
+    let pages = u32::try_from(document.pages().len())
+        .map_err(|_| "PDFium returned a negative page count".to_string())?;
+    let score = |page: u32| -> Option<u32> {
+        let index = page.checked_sub(1)?;
+        if index >= pages {
+            return None;
+        }
+        let index = i32::try_from(index).ok()?;
+        let page = document.pages().get(index).ok()?;
+        let text = visible_forward_text(&page)?;
+        forward_context_score(&text, hint)
+    };
+    let first_score = score(candidates[0]);
+    if first_score.is_some_and(|value| value > 0) {
+        return Ok(None);
+    }
+    for &page in candidates.iter().take(64).skip(1) {
+        let candidate_score = score(page);
+        if candidate_score.is_some_and(|value| value > 0) {
+            return Ok(Some(page));
+        }
+    }
+    Ok(None)
+}
+
 /// Match complete PDF words inside the SyncTeX region, never an arbitrary nearest
 /// glyph. Equal context scores are ambiguous and retain the coarse region.
 fn forward_word_rect(
@@ -1833,17 +1945,12 @@ fn forward_word_rect(
     hint: &ForwardWord,
     region: SearchRect,
 ) -> Result<Option<SearchRect>, String> {
-    let same = |a: &str, b: &str| {
-        a.nfkc()
-            .flat_map(char::to_lowercase)
-            .eq(b.nfkc().flat_map(char::to_lowercase))
-    };
     let tokens = words(&cached.normalized);
     let text = page.text().map_err(|e| e.to_string())?;
     let mut best = None;
     let mut tied = false;
     for (index, &(start, word)) in tokens.iter().enumerate() {
-        if !same(word, &hint.words[hint.selected]) {
+        if !same_forward_word(word, &hint.words[hint.selected]) {
             continue;
         }
         let end = start + word.len();
@@ -1874,21 +1981,7 @@ fn forward_word_rect(
         {
             continue;
         }
-        let mut score = 0;
-        for distance in 1..=3isize {
-            for direction in [-1, 1] {
-                let delta = direction * distance;
-                if let (Some(a), Some(b)) = (
-                    index.checked_add_signed(delta).and_then(|i| tokens.get(i)),
-                    hint.selected
-                        .checked_add_signed(delta)
-                        .and_then(|i| hint.words.get(i)),
-                ) && same(a.1, b)
-                {
-                    score += 4 - distance;
-                }
-            }
-        }
+        let score = forward_neighbor_score(&tokens, hint, index);
         let rect = SearchRect {
             left: bounds.left().value,
             right: bounds.right().value,
@@ -2756,26 +2849,31 @@ fn blend_rectangle(
 }
 
 fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
-    let bindings = if let Some(path) = library {
-        Pdfium::bind_to_library(path)
-            .map_err(|error| format!("could not load Pdfium from {}: {error}", path.display()))?
-    } else {
-        let embedded = crate::embedded_pdfium::materialize().map_err(|error| {
+    let path = match library {
+        Some(path) => path.to_path_buf(),
+        None => crate::embedded_pdfium::materialize().map_err(|error| {
             format!("could not extract embedded PDFium to the user cache: {error}")
-        })?;
-        Pdfium::bind_to_library(&embedded).map_err(|error| {
-            format!(
-                "could not load embedded PDFium from {}: {error}",
-                embedded.display()
-            )
-        })?
+        })?,
     };
-
-    Ok(Pdfium::new(bindings))
+    match Pdfium::bind_to_library(&path) {
+        Ok(bindings) => Ok(Pdfium::new(bindings)),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(Pdfium::default()),
+        Err(error) => Err(format!(
+            "could not load PDFium from {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forward_words_match_tex_accents_in_pdf_text() {
+        assert!(super::same_forward_word("Čech", "Cech"));
+        assert!(super::same_forward_word("Cafe\u{301}", "café"));
+        assert!(!super::same_forward_word("Cech", "Delaunay"));
+    }
+
     #[test]
     fn clicked_unicode_maps_both_surrogate_halves_to_one_glyph() {
         let values = [0xe9, 0xd835, 0xdefc, b'z' as u32, 0x1d465];

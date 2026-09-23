@@ -21,6 +21,62 @@ fn message(worker: &RenderWorker) -> WorkerMessage {
 }
 
 #[test]
+fn beamer_overlay_forward_uses_visible_source_context() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("overlay.tex");
+    fs::write(
+        &source,
+        r"\documentclass{beamer}
+\begin{document}
+\begin{frame}{Overlay}
+\begin{itemize}
+\item Base words remain visible.
+\pause
+\item UniqueZephyr appears after the first overlay.
+\end{itemize}
+\only<3->{AnotherNebula appears on the third overlay.}
+\end{frame}
+\end{document}
+",
+    )
+    .unwrap();
+    let output = process::output(
+        Command::new("pdflatex")
+            .current_dir(directory.path())
+            .args([
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-synctex=1",
+                "overlay.tex",
+            ]),
+        &Operation::new(Duration::from_secs(30)),
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let pdf = directory.path().join("overlay.pdf");
+    assert_eq!(
+        synctex::resolve_forward(&pdf, &source, 5, 7).unwrap().page,
+        1
+    );
+    assert_eq!(
+        synctex::resolve_forward(&pdf, &source, 7, 7).unwrap().page,
+        2
+    );
+    assert_eq!(
+        synctex::resolve_forward(&pdf, &source, 9, 12).unwrap().page,
+        3
+    );
+    assert_eq!(
+        synctex::resolve_forward(&pdf, &source, 9, 1).unwrap().page,
+        1
+    );
+}
+
+#[test]
 fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("navigation.tex");
