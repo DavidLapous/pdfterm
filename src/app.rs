@@ -133,7 +133,7 @@ pub fn run(
     }
 
     let mut output = io::BufWriter::new(io::stdout().lock());
-    let defaults = AppDefaults::from_config(config, focus_token);
+    let defaults = AppDefaults::from_config(config, focus_token)?;
     let theme = defaults.theme;
     let _terminal = TerminalGuard::enter(&mut output, theme)?;
     let path = match path {
@@ -330,6 +330,7 @@ struct App {
     smooth_scroll_remaining: i64,
     smooth_scroll_tick: Instant,
     title_document: Option<DocumentId>,
+    flash_font: crate::screenshot::FlashFont,
     viewer: ViewerSettings,
     next_image_id: u32,
     last_status_row: Option<u16>,
@@ -382,10 +383,11 @@ struct AppDefaults {
     forward_socket: Option<String>,
     focus_token: Option<String>,
     viewer: ViewerSettings,
+    flash_font: crate::screenshot::FlashFont,
 }
 
 impl AppDefaults {
-    fn from_config(config: &Config, focus_token: Option<String>) -> Self {
+    fn from_config(config: &Config, focus_token: Option<String>) -> io::Result<Self> {
         let themes = crate::theme::available_themes(config.theme_catalog(), config.theme());
         let configured_theme = crate::theme::load_or_default(config.theme());
         let theme_index = themes
@@ -395,7 +397,7 @@ impl AppDefaults {
         let theme = themes
             .get(theme_index)
             .map_or(configured_theme, |(_, theme)| *theme);
-        Self {
+        Ok(Self {
             fit: config.fit_mode(),
             invert: config.dark_mode(),
             dark_mode_style: DarkModeStyle::new(
@@ -413,11 +415,12 @@ impl AppDefaults {
             editor: config.editor.clone(),
             forward_socket: config.forward_socket().map(str::to_owned),
             focus_token,
-            viewer: config.viewer,
+            viewer: config.viewer.clone(),
+            flash_font: crate::screenshot::FlashFont::load(&config.viewer.flash_label_font)?,
             theme,
             themes,
             theme_index,
-        }
+        })
     }
 }
 
@@ -893,6 +896,7 @@ impl App {
             label_request_id: 1,
             label_matches: Vec::new(),
             label_overlay_id: None,
+            flash_font: defaults.flash_font,
             label_overlay: None,
             viewer: defaults.viewer,
         }
@@ -1482,32 +1486,8 @@ impl App {
             if crop.width == 0 || crop.height == 0 {
                 continue;
             }
-            let screen_point = |point: (u32, u32)| {
-                if point.0 < crop.x
-                    || point.0 >= crop.x.saturating_add(crop.width)
-                    || point.1 < crop.y
-                    || point.1 >= crop.y.saturating_add(crop.height)
-                {
-                    return None;
-                }
-                let native = placement.native_cell.is_some();
-                let x = u32::from(placement.left) * cw
-                    + if native {
-                        point.0 - crop.x
-                    } else {
-                        (point.0 - crop.x) * u32::from(placement.columns) * cw / crop.width
-                    };
-                let page_y = u32::from(top.saturating_sub(viewport.top)) * ch;
-                let y = if native {
-                    page_y + placement.offset_y + (point.1 - crop.y)
-                } else {
-                    page_y + (point.1 - crop.y) * u32::from(placement.rows) * ch / crop.height
-                };
-                Some((x, y))
-            };
-            let anchor_position =
-                screen_point(labeled.visible.anchor).or_else(|| screen_point(labeled.visible.hit));
             let mut badge_position = None;
+            let mut match_height = 0;
             for rect in &labeled.visible.rects {
                 let x0 = rect.left.max(crop.x);
                 let x1 = rect.right.min(crop.x.saturating_add(crop.width));
@@ -1546,28 +1526,35 @@ impl App {
                         y: pixel_y,
                         width,
                         height,
-                        color: [255, 215, 0, 96],
+                        color: [0x3d, 0x59, 0xa1, 96],
                     });
-                    badge_position = Some((pixel_x.saturating_add(width), pixel_y));
+                    badge_position = Some((pixel_x, pixel_x.saturating_add(width), pixel_y));
+                    match_height = match_height.max(height);
                 }
             }
-            if let Some((x, rect_y)) = badge_position {
-                let y = anchor_position.map_or(rect_y, |(_, anchor_y)| anchor_y);
-                let badge_width = (labeled.label.chars().count() as u32)
-                    .saturating_mul(8)
-                    .saturating_add(4);
-                let x = x.min(u32::from(viewport.pixel_width).saturating_sub(badge_width));
-                let y = y.min(u32::from(viewport.pixel_height).saturating_sub(10));
+            if let Some((word_x, x, rect_y)) = badge_position {
+                let glyph_size = badge_glyph_size(match_height);
+                let layout = self.flash_font.badge_layout(&labeled.label, glyph_size)?;
+                let (badge_width, badge_height) = (layout.width, layout.height);
+                let x = if x.saturating_add(badge_width) > u32::from(viewport.pixel_width)
+                    && word_x >= badge_width
+                {
+                    word_x - badge_width
+                } else {
+                    x.min(u32::from(viewport.pixel_width).saturating_sub(badge_width))
+                };
+                let y = rect_y.min(u32::from(viewport.pixel_height).saturating_sub(badge_height));
                 badges.push(ScreenshotBadge {
                     x,
                     y,
+                    layout,
                     text: &labeled.label,
-                    foreground: [0, 0, 0],
-                    background: [255, 215, 0],
+                    foreground: [0xc0, 0xca, 0xf5],
+                    background: [0xff, 0x00, 0x7c],
                 });
             }
         }
-        let rgba = crate::screenshot::overlay(viewport, &rects, &badges)?;
+        let rgba = crate::screenshot::overlay(&mut self.flash_font, viewport, &rects, &badges)?;
         let compressed = kitty::compress_rgba(&rgba)?;
         let id = self.next_image_id;
         self.next_image_id = id.wrapping_add(1).max(1);
@@ -2052,7 +2039,7 @@ impl App {
         let overlay = if let Some(overlay) = self.label_overlay.as_deref() {
             overlay
         } else {
-            empty_overlay = crate::screenshot::overlay(viewport, &[], &[])?;
+            empty_overlay = crate::screenshot::blank_overlay(viewport)?;
             &empty_overlay
         };
         crate::screenshot::save(
@@ -3005,7 +2992,7 @@ impl App {
             return Ok(false);
         }
         match key.code {
-            KeyCode::Char('X') if self.session.pending_open.is_none() && !self.link_mode => {
+            KeyCode::Char('x') if self.session.pending_open.is_none() && !self.link_mode => {
                 self.begin_label_mode(output)?
             }
             KeyCode::Char('?') => self.open_help(output)?,
@@ -4380,6 +4367,11 @@ fn link_at_cell(
                 .saturating_add(cell_center_y.abs_diff(link_center_y).saturating_pow(2))
         })
         .map(|link| link.target.clone())
+}
+
+fn badge_glyph_size(text_height: u32) -> u32 {
+    // Keep short labels readable at small on-page word sizes.
+    text_height.saturating_sub(2).max(8)
 }
 
 fn same_render_view(a: RenderKey, b: RenderKey) -> bool {
@@ -6460,7 +6452,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("+ / -", "zoom in / out"),
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
-        ("X", "find visible PDF text + SyncTeX jump"),
+        ("x", "find visible PDF text + SyncTeX jump"),
         ("Alt/Option-click", "word jump + focus"),
         ("S", "toggle smooth scroll"),
         ("p", "performance timings"),
@@ -6541,7 +6533,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
             Line::from(format!("Config: {path}")),
             Line::from("[viewer]: smooth_scroll, scroll_frame_ms, scroll_ease_divisor"),
             Line::from("[viewer]: continuous_scroll, prefetch_pages, set_window_title, center_forward_search"),
-            Line::from("[viewer]: flash_duration_ms, word_precision, source_context_lines"),
+            Line::from("[viewer]: flash_duration_ms, flash_label_font, word_precision, source_context_lines"),
             Line::from("[nvim]: focus_on_forward, focus_on_inverse, compile; [nvim.keys]: editor keys"),
             Line::from("Commented defaults on first launch. Edit config, then restart."),
         ])
@@ -8478,6 +8470,13 @@ mod tests {
         assert!(!floating_output.contains("a=p"));
         assert!(!floating_output.contains("a=T"));
     }
+    #[test]
+    fn tiny_visible_text_keeps_flash_labels_readable() {
+        assert_eq!(super::badge_glyph_size(3), 8);
+        assert_eq!(super::badge_glyph_size(10), 8);
+        assert_eq!(super::badge_glyph_size(18), 16);
+    }
+
     #[test]
     fn visible_match_targets_only_displayed_glyphs() {
         use crate::pdf::PixelRect;

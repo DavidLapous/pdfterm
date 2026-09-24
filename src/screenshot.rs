@@ -1,8 +1,9 @@
 use crate::pdf::Frame;
 use crate::terminal::{ImagePlacement, Viewport};
 use flate2::read::ZlibDecoder;
-use font8x8::UnicodeFonts;
+use fontdue::{Font, FontSettings, Metrics};
 use png::{BitDepth, ColorType, Encoder};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
@@ -26,9 +27,168 @@ pub struct Rect {
 pub struct Badge<'a> {
     pub x: u32,
     pub y: u32,
+    pub layout: BadgeLayout,
     pub text: &'a str,
     pub foreground: [u8; 3],
     pub background: [u8; 3],
+}
+
+#[derive(Clone, Copy)]
+pub struct BadgeLayout {
+    pub width: u32,
+    pub height: u32,
+    glyph_size: u32,
+    origin_x: i64,
+    baseline: i64,
+}
+
+struct Glyph {
+    metrics: Metrics,
+    coverage: Vec<u8>,
+}
+
+pub struct FlashFont {
+    font: Font,
+    glyphs: HashMap<(u32, char), Glyph>,
+}
+
+impl FlashFont {
+    pub fn load(family: &str) -> io::Result<Self> {
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        let generic = family == "monospace";
+        #[cfg(target_os = "macos")]
+        let family = if family == "monospace" {
+            "Menlo"
+        } else {
+            family
+        };
+        let family = if family == "monospace" {
+            database.family_name(&fontdb::Family::Monospace)
+        } else {
+            family
+        };
+        let families = [fontdb::Family::Name(family)];
+        let query = fontdb::Query {
+            families: &families,
+            weight: fontdb::Weight::NORMAL,
+            stretch: fontdb::Stretch::Normal,
+            style: fontdb::Style::Normal,
+        };
+        let id = database
+            .query(&query)
+            .or_else(|| {
+                generic
+                    .then(|| {
+                        database
+                            .faces()
+                            .find(|face| face.monospaced)
+                            .map(|face| face.id)
+                    })
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("flash-label font family {family:?} is not installed"),
+                )
+            })?;
+        let face = database.face(id).expect("queried font face exists");
+        if !generic && !face.families.iter().any(|(name, _)| name == family) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("flash-label font family {family:?} is not installed"),
+            ));
+        }
+        let font = database
+            .with_face_data(id, |data, index| {
+                Font::from_bytes(
+                    data,
+                    FontSettings {
+                        collection_index: index,
+                        ..FontSettings::default()
+                    },
+                )
+            })
+            .ok_or_else(|| io::Error::other("selected system font data is unavailable"))?
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("cannot parse flash-label font {family:?}: {error}"),
+                )
+            })?;
+        Ok(Self {
+            font,
+            glyphs: HashMap::new(),
+        })
+    }
+
+    pub fn badge_layout(&mut self, text: &str, size: u32) -> io::Result<BadgeLayout> {
+        if size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "badge glyph size must be positive",
+            ));
+        }
+        let px = size as f32;
+        let line = self.font.horizontal_line_metrics(px).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flash-label font has no horizontal metrics",
+            )
+        })?;
+        let baseline = 1 + line.ascent.round() as i64;
+        let mut cursor = 2.0f32;
+        let mut ink_left = 2i64;
+        let mut ink_top = 1i64;
+        let mut ink_right = 0i64;
+        let mut ink_bottom = 0i64;
+        let mut previous = None;
+        for character in text.chars() {
+            if let Some(left) = previous {
+                cursor += self
+                    .font
+                    .horizontal_kern(left, character, px)
+                    .unwrap_or(0.0);
+            }
+            let metrics = &self.glyph(character, size)?.metrics;
+            if metrics.width > 0 && metrics.height > 0 {
+                let x = cursor.round() as i64 + i64::from(metrics.xmin);
+                let y = baseline - i64::from(metrics.ymin) - metrics.height as i64;
+                ink_left = ink_left.min(x);
+                ink_top = ink_top.min(y);
+                ink_right = ink_right.max(x + metrics.width as i64);
+                ink_bottom = ink_bottom.max(y + metrics.height as i64);
+            }
+            cursor += metrics.advance_width;
+            previous = Some(character);
+        }
+        let extra_x = (2 - ink_left).max(0);
+        let extra_y = (1 - ink_top).max(0);
+        Ok(BadgeLayout {
+            width: ((cursor + 2.0).ceil() as i64 + extra_x).max(ink_right + extra_x + 2) as u32,
+            height: ((line.ascent - line.descent).ceil() as i64 + 2 + extra_y)
+                .max(ink_bottom + extra_y + 1) as u32,
+            glyph_size: size,
+            origin_x: 2 + extra_x,
+            baseline: baseline + extra_y,
+        })
+    }
+
+    fn glyph(&mut self, character: char, size: u32) -> io::Result<&Glyph> {
+        let key = (size, character);
+        if !self.glyphs.contains_key(&key) {
+            if !self.font.chars().contains_key(&character) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("flash-label font does not contain {character:?}"),
+                ));
+            }
+            let (metrics, coverage) = self.font.rasterize(character, size as f32);
+            self.glyphs.insert(key, Glyph { metrics, coverage });
+        }
+        Ok(self.glyphs.get(&key).expect("glyph was inserted"))
+    }
 }
 
 fn pixel_count(viewport: Viewport) -> io::Result<usize> {
@@ -48,8 +208,17 @@ fn pixel_count(viewport: Viewport) -> io::Result<usize> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "viewport is too large"))
 }
 
-pub fn overlay(viewport: Viewport, rects: &[Rect], badges: &[Badge<'_>]) -> io::Result<Vec<u8>> {
-    let mut pixels = vec![0; pixel_count(viewport)?];
+pub fn blank_overlay(viewport: Viewport) -> io::Result<Vec<u8>> {
+    Ok(vec![0; pixel_count(viewport)?])
+}
+
+pub fn overlay(
+    font: &mut FlashFont,
+    viewport: Viewport,
+    rects: &[Rect],
+    badges: &[Badge<'_>],
+) -> io::Result<Vec<u8>> {
+    let mut pixels = blank_overlay(viewport)?;
     let width = u32::from(viewport.pixel_width);
     let height = u32::from(viewport.pixel_height);
     for rect in rects {
@@ -63,14 +232,9 @@ pub fn overlay(viewport: Viewport, rects: &[Rect], badges: &[Badge<'_>]) -> io::
         }
     }
     for badge in badges {
-        let glyphs: Vec<_> = badge
-            .text
-            .chars()
-            .map(|ch| font8x8::BASIC_FONTS.get(ch))
-            .collect();
-        let text_width = (glyphs.len() as u32).saturating_mul(8);
-        for y in badge.y..badge.y.saturating_add(10).min(height) {
-            for x in badge.x..badge.x.saturating_add(text_width + 4).min(width) {
+        let layout = badge.layout;
+        for y in badge.y.min(height)..badge.y.saturating_add(layout.height).min(height) {
+            for x in badge.x.min(width)..badge.x.saturating_add(layout.width).min(width) {
                 let offset = ((y * width + x) * 4) as usize;
                 pixels[offset..offset + 4].copy_from_slice(&[
                     badge.background[0],
@@ -80,26 +244,44 @@ pub fn overlay(viewport: Viewport, rects: &[Rect], badges: &[Badge<'_>]) -> io::
                 ]);
             }
         }
-        for (index, glyph) in glyphs.iter().enumerate() {
-            let Some(glyph) = glyph else { continue };
-            for (gy, bits) in glyph.iter().enumerate() {
-                for gx in 0..8 {
-                    if bits & (1 << gx) == 0 {
+        let baseline = badge.y as i64 + layout.baseline;
+        let mut cursor = badge.x as f32 + layout.origin_x as f32;
+        let mut previous = None;
+        for character in badge.text.chars() {
+            if let Some(left) = previous {
+                cursor += font
+                    .font
+                    .horizontal_kern(left, character, layout.glyph_size as f32)
+                    .unwrap_or(0.0);
+            }
+            let glyph = font.glyph(character, layout.glyph_size)?;
+            let x0 = cursor.round() as i64 + i64::from(glyph.metrics.xmin);
+            let y0 = baseline - i64::from(glyph.metrics.ymin) - glyph.metrics.height as i64;
+            for gy in 0..glyph.metrics.height {
+                let y = y0 + gy as i64;
+                if !(0..i64::from(height)).contains(&y) {
+                    continue;
+                }
+                for gx in 0..glyph.metrics.width {
+                    let x = x0 + gx as i64;
+                    if !(0..i64::from(width)).contains(&x) {
                         continue;
                     }
-                    let x = badge.x.saturating_add(2 + index as u32 * 8 + gx);
-                    let y = badge.y.saturating_add(1 + gy as u32);
-                    if x < width && y < height {
-                        let offset = ((y * width + x) * 4) as usize;
-                        pixels[offset..offset + 4].copy_from_slice(&[
-                            badge.foreground[0],
-                            badge.foreground[1],
-                            badge.foreground[2],
-                            255,
-                        ]);
+                    let alpha = u32::from(glyph.coverage[gy * glyph.metrics.width + gx]);
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let offset = ((y as u32 * width + x as u32) * 4) as usize;
+                    for channel in 0..3 {
+                        pixels[offset + channel] = ((u32::from(badge.foreground[channel]) * alpha
+                            + u32::from(pixels[offset + channel]) * (255 - alpha)
+                            + 127)
+                            / 255) as u8;
                     }
                 }
             }
+            cursor += glyph.metrics.advance_width;
+            previous = Some(character);
         }
     }
     Ok(pixels)
@@ -383,5 +565,73 @@ mod tests {
         assert_eq!(&pixels[4 * 4 + 4..4 * 4 + 8], &[80, 40, 0, 255]);
         assert_eq!(&pixels[2 * 4 * 4..2 * 4 * 4 + 4], &[40, 80, 0, 255]);
         assert_eq!(&pixels[3 * 4 * 4..3 * 4 * 4 + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flash_labels_are_antialiased_and_respect_selected_font() {
+        let viewport = Viewport {
+            columns: 40,
+            rows: 10,
+            pixel_width: 160,
+            pixel_height: 40,
+            top: 0,
+            status_row: 10,
+        };
+        let badge = |y, layout| Badge {
+            x: 4,
+            y,
+            layout,
+            text: "Data",
+            foreground: [192, 202, 245],
+            background: [255, 0, 124],
+        };
+        let mut mono = FlashFont::load("monospace").expect("system monospace font");
+        let fit_badge = badge(2, mono.badge_layout("Data", 10).unwrap());
+        let fit = overlay(&mut mono, viewport, &[], &[fit_badge]).unwrap();
+        let zoom_badge = badge(2, mono.badge_layout("Data", 22).unwrap());
+        let zoom = overlay(&mut mono, viewport, &[], &[zoom_badge]).unwrap();
+        assert_ne!(fit, zoom, "zoom-sized glyphs must rasterize differently");
+        assert!(
+            fit.chunks_exact(4).any(|pixel| {
+                pixel[3] == 255 && pixel[..3] != [255, 0, 124] && pixel[..3] != [192, 202, 245]
+            }),
+            "glyph edges should blend against the opaque label background"
+        );
+
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        let monospace = database.family_name(&fontdb::Family::Monospace);
+        let mut families = std::collections::HashSet::new();
+        for face in database.faces() {
+            for (family, _) in &face.families {
+                if family != monospace {
+                    families.insert(family.clone());
+                }
+            }
+        }
+        let mut other_pixels = None;
+        for family in families {
+            if let Ok(mut other) = FlashFont::load(&family)
+                && let Ok(layout) = other.badge_layout("Data", 10)
+                && let Ok(pixels) = overlay(&mut other, viewport, &[], &[badge(2, layout)])
+                && pixels != fit
+            {
+                other_pixels = Some(pixels);
+                break;
+            }
+        }
+        assert!(
+            other_pixels.is_some(),
+            "an installed alternative face should change rendered pixels"
+        );
+    }
+
+    #[test]
+    fn flash_label_rejects_unknown_font_family() {
+        assert!(
+            FlashFont::load("pdfterm-font-family-that-does-not-exist")
+                .err()
+                .is_some()
+        );
     }
 }

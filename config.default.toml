@@ -34,6 +34,7 @@ page_scroll_percent = 85           # Large vertical movement as viewport percent
 set_window_title = true            # Set terminal/window title to active PDF filename
 center_forward_search = true       # Center SyncTeX box; false aligns its top near viewport top
 flash_duration_ms = 1000            # Highlight lifetime after frame submission, 1–60000 ms
+flash_label_font = "monospace"     # Installed system font family (e.g. Menlo)
 word_precision = true              # Refine inverse search with nearby PDF/source words
 source_context_lines = 4           # Source radius outside Beamer frames, 0–100; frames use full block
 

@@ -243,7 +243,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ViewerSettings {
     pub continuous_scroll: bool,
@@ -256,6 +256,7 @@ pub struct ViewerSettings {
     pub set_window_title: bool,
     pub center_forward_search: bool,
     pub flash_duration_ms: u64,
+    pub flash_label_font: String,
     pub word_precision: bool,
     pub source_context_lines: u64,
 }
@@ -272,6 +273,7 @@ impl Default for ViewerSettings {
             page_scroll_percent: 85,
             set_window_title: true,
             center_forward_search: true,
+            flash_label_font: "monospace".into(),
             flash_duration_ms: 1000,
             word_precision: true,
             source_context_lines: 4,
@@ -326,6 +328,15 @@ mod tests {
                 .expect("config");
         assert!(config.nvim.focus_on_forward);
         assert!(config.nvim.focus_on_inverse);
+    }
+
+    #[test]
+    fn flash_label_font_is_configurable() {
+        let default: Config = toml::from_str("").expect("default config");
+        assert_eq!(default.viewer.flash_label_font, "monospace");
+        let configured: Config =
+            toml::from_str("[viewer]\nflash_label_font = \"Menlo\"\n").expect("config");
+        assert_eq!(configured.viewer.flash_label_font, "Menlo");
     }
 
     #[test]

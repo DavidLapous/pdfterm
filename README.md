@@ -75,7 +75,7 @@ selected render is still pending; retry after the current PDF frame appears.
 | `0` | reset zoom to the fitted size |
 | `i` | toggle Polaris-style dark mode |
 | `S` | toggle smooth scrolling for the current session |
-| `X` | find visible PDF text and jump to its source with SyncTeX |
+| `x` | find visible PDF text and jump to its source with SyncTeX |
 | `Alt`/`Option` + click | resolve the clicked location via SyncTeX and jump to its source; no toggle |
 | `p` | toggle detailed render-performance timings |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
@@ -106,7 +106,7 @@ The search is case-insensitive, treats runs of whitespace as a single space, and
 highlights matches using the active theme. Image-only PDFs require OCR and are
 reported as having no matches.
 
-Press `X` to find text only on the currently visible page or pages; type a query
+Press `x` to find text only on the currently visible page or pages; type a query
 to update matching highlights and labels as you go, then type a displayed label
 to run inverse SyncTeX and deliver the resulting source location to the configured
 editor. `Esc` exits; `Backspace` removes label input first, then edits the query.
@@ -115,13 +115,22 @@ precedence over another query character; once only one match remains, its label
 is the next ASCII word character when available, or a regular label otherwise.
 When one-key labels cannot identify every match, labels use short multi-key
 sequences so every highlighted location remains selectable.
+
+Match highlights use translucent blue so PDF text stays legible; labels use the
+magenta and pale text of the current Neovim Flash palette.
+Badge glyphs scale with the matched text height (minimum 8 pixels for
+readability), use antialiased glyphs from `viewer.flash_label_font` (default
+`monospace`), and sit beside the final visible glyph. Set an installed family
+name such as `Menlo` to choose another face; `monospace` maps to Menlo on macOS
+and the installed generic monospace elsewhere. Unknown or unsupported fonts fail.
+
 This is a viewport search, not a document-wide scan: arrows and PageUp/PageDown
 scroll; `Ctrl-+` / `Ctrl--` zoom without leaving the mode; resizing, switching
 tabs, or reloading updates the visible matches. It requires selectable PDF text
 and a working SyncTeX/editor setup; it does not guess a source location when
 SyncTeX cannot resolve the match.
 PDF text extraction excludes invisible and transparent glyphs but cannot detect
-glyphs covered by later opaque drawing. Like `/` and text copy, `X` is not a
+glyphs covered by later opaque drawing. Like `/` and text copy, `x` is not a
 redaction check: sanitize PDFs before using it on sensitive covered content.
 
 Click a PDF hyperlink to follow it; no mode toggle is required. Mouse capture stays
@@ -173,8 +182,8 @@ ranges, and file-access errors stop startup with the configuration path.
 - Top level: fit, colors, link-browser layout, SyncTeX, and socket paths.
 - `[editor]`: inverse-search delivery: `none`, `command`, or `socket`.
 - `[viewer]`: continuous/smooth scrolling, adjacent-page prefetch, animation
-  interval and easing, small/page scroll distances, filename titles,
-  forward-search centering and flash duration, word matching and source-context radius.
+  interval/easing, forward-search centering, flash duration and label font,
+  word matching and source-context radius.
 
 Restart the viewer after editing its configuration. `?` shows controls and the
 active configuration path.
