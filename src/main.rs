@@ -44,6 +44,9 @@ struct Cli {
     /// Named viewer/editor session sharing the same configuration.
     #[arg(long)]
     session: Option<String>,
+    /// Opaque launch identity used by the bundled Neovim adapter.
+    #[arg(long, hide = true)]
+    focus_token: Option<String>,
 
     /// Save the running viewer's visible PDF viewport as a PNG.
     #[arg(long, conflicts_with_all = ["path", "forward_search", "synctex_view"])]
@@ -141,7 +144,13 @@ fn main() -> ExitCode {
             }
         };
     }
-    match pdfterm::app::run(cli.path, cli.pdfium_library, cli.page - 1, &config) {
+    match pdfterm::app::run(
+        cli.path,
+        cli.pdfium_library,
+        cli.page - 1,
+        &config,
+        cli.focus_token,
+    ) {
         Ok(()) | Err(pdfterm::app::AppError::Quit) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("pdfterm: {error}");

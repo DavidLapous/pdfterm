@@ -156,6 +156,7 @@ local ok, failure = xpcall(function()
     session = 'adapter',
     attach_only = false,
     focus_on_inverse = true,
+    focus_on_forward = true,
     compile = true,
     project = {
       main = 'navigation.tex',
@@ -194,7 +195,7 @@ local ok, failure = xpcall(function()
     not vim.uv.fs_lstat(config.editor.path),
     'setup opened an inverse listener before first use'
   )
-  local requests = {}
+  local requests, viewer_reply_token = {}, nil
   local function receive()
     server = assert(vim.uv.new_pipe(false))
     assert(server:bind(config.forward_socket))
@@ -209,7 +210,11 @@ local ok, failure = xpcall(function()
           chunks[#chunks + 1] = chunk
         else
           requests[#requests + 1] = vim.json.decode(table.concat(chunks))
-          client:write('{"ok":true,"error":null}', function()
+          client:write(vim.json.encode({
+            ok = true,
+            error = vim.NIL,
+            viewer_token = viewer_reply_token,
+          }), function()
             client:shutdown(function()
               client:close()
             end)
@@ -271,7 +276,14 @@ local ok, failure = xpcall(function()
     return #requests == 3
   end)
   assert(requests[3].pdf == vim.uv.fs_realpath(pdf) and requests[3].page == 1)
-  assert(#navigation_notices == 1 and navigation_notices[1].level == vim.log.levels.WARN)
+  wait(function()
+    return #navigation_notices >= 2
+  end)
+  assert(
+    #navigation_notices == 2
+      and navigation_notices[1].level == vim.log.levels.WARN
+      and navigation_notices[2].message:find('viewer focus unavailable', 1, true)
+  )
   -- Superseding an in-flight resolution must suppress its warning and fallback.
   navigation_notices = {}
   vim.fn.writefile({}, directory .. '/hold-resolution')
@@ -329,6 +341,10 @@ local ok, failure = xpcall(function()
   -- The terminal selected before a slow resolver owns launch/inverse focus.
   vim.env.SSH_CONNECTION = nil
   local foreground, focused = 'A', nil
+  local focus_notices = {}
+  vim.notify = function(message)
+    focus_notices[#focus_notices + 1] = message
+  end
   terminal.capture_source = function(callback)
     local captured = foreground
     vim.defer_fn(function()
@@ -351,6 +367,11 @@ local ok, failure = xpcall(function()
   wait(function()
     return #requests == 5
   end)
+  wait(function()
+    return focus_notices[#focus_notices]
+      and focus_notices[#focus_notices]:find('viewer focus unavailable', 1, true)
+  end)
+  assert(focused == nil, 'external viewer was mistaken for a plugin-owned split')
   inverse_jump()
   wait(function()
     return focused ~= nil
@@ -404,8 +425,9 @@ local ok, failure = xpcall(function()
   -- Ordinary forward only attaches; explicit split launches and then delivers.
   server:close()
   local launches, notices = 0, {}
-  terminal.launch_split = function(_, _, _, callback)
+  terminal.launch_split = function(_, _, _, callback, _, token)
     launches = launches + 1
+    viewer_reply_token = token
     receive()
     vim.schedule(function()
       callback({ code = 0 }, { kind = 'ghostty', id = 'viewer' })
@@ -416,7 +438,7 @@ local ok, failure = xpcall(function()
     callback(nil, { kind = 'ghostty', id = 'source' })
   end
   terminal.close = function(split)
-    assert(split.id == 'viewer')
+    assert(split.id == 'viewer' or split.id == 'viewer2')
   end
   vim.notify = function(message, level)
     notices[#notices + 1] = { message = message, level = level }
@@ -427,16 +449,56 @@ local ok, failure = xpcall(function()
   end)
   assert(launches == 0 and #requests == 8, 'ordinary forward launched a viewer')
   assert(notices[#notices].message:find('PdfTermForwardSplit', 1, true))
+  focused = nil
   vim.cmd('PdfTermForwardSplit')
   wait(function()
-    return #requests == 9
+    return #requests == 9 and focused == 'viewer'
   end)
   assert(
     launches == 1 and requests[9].page == 1,
-    'explicit split did not launch and forward'
+    'explicit split did not launch and focus its viewer after forward'
   )
+  focused = nil
+  adapter.forward_search(pdf, vim.json.encode(requests[1]), { kind = 'ghostty', id = 'source' })
+  wait(function()
+    return #requests == 10 and focused == 'viewer'
+  end)
+  focused = nil
+  adapter.open(pdf)
+  wait(function()
+    return #requests == 11
+  end)
+  assert(focused == nil, 'opening an existing PDF unexpectedly changed terminal focus')
+  server:close()
+  viewer_reply_token = nil
+  receive()
+  local before = #notices
+  adapter.forward_search(pdf, vim.json.encode(requests[1]), { kind = 'ghostty', id = 'source' })
+  wait(function()
+    return #requests == 12 and #notices > before
+  end)
+  assert(focused == nil and notices[#notices].message:find('viewer focus unavailable', 1, true))
+  -- Another viewer can win the socket race after a split is launched.
+  server:close()
+  terminal.launch_split = function(_, _, _, callback)
+    launches = launches + 1
+    viewer_reply_token = 'unrelated-viewer'
+    receive()
+    vim.schedule(function()
+      callback({ code = 0 }, { kind = 'ghostty', id = 'viewer2' })
+    end)
+    return { wait = function() end }
+  end
+  before = #notices
+  vim.cmd('PdfTermForwardSplit')
+  wait(function()
+    return #requests == 13
+      and #notices > before
+      and notices[#notices].message:find('viewer focus unavailable', 1, true)
+  end)
+  assert(focused == nil and launches == 2, 'racing viewer stole focus from the actual responder')
   print(
-    'adapter regressions passed: serialized/latest build, timeout/output cap, bootstrap, named session, forward-only, explicit split, inverse socket; event ticks='
+    'adapter regressions passed: builds, timeouts, bootstrap, sessions, forward focus, inverse focus, split ownership; event ticks='
       .. ticks
   )
 end, debug.traceback)

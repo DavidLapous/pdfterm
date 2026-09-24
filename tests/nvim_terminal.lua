@@ -54,9 +54,10 @@ local successful = terminal.launch_split(source, 'viewer', 'paper.pdf', function
   count = count + 1
   assert(result.code == 0)
   owned = assert(split)
-end, 'session')
+end, 'session', string.rep('f', 32))
 assert(successful:wait(1000).code == 0 and count == 1 and owned.id == 'viewer-7')
 assert(requests[1].argv[3] == '--session' and requests[1].argv[4] == 'session')
+assert(requests[1].argv[5] == '--focus-token' and requests[1].argv[6] == string.rep('f', 32))
 assert(requests[1].token == token, 'SSH launch must authenticate the exact source session')
 terminal.close(owned)
 assert(#requests == 2 and #failures == 0)

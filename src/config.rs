@@ -279,26 +279,15 @@ impl Default for ViewerSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NvimSettings {
     pub compile: bool,
     pub focus_on_inverse: bool,
+    pub focus_on_forward: bool,
     pub executable: String,
     pub attach_only: bool,
     pub keys: NvimKeys,
-}
-
-impl Default for NvimSettings {
-    fn default() -> Self {
-        Self {
-            compile: false,
-            focus_on_inverse: true,
-            executable: String::new(),
-            attach_only: false,
-            keys: NvimKeys::default(),
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -325,7 +314,18 @@ mod tests {
         assert_eq!(config.theme_catalog(), None);
         assert!(!config.persistent_link_picker());
         assert_eq!(config.link_picker_split_percent(), 50);
+        assert!(!config.nvim.focus_on_forward);
+        assert!(!config.nvim.focus_on_inverse);
         assert_eq!(config.link_picker_layout(), LinkPickerLayout::Auto);
+    }
+
+    #[test]
+    fn parses_nvim_focus_overrides() {
+        let config: Config =
+            toml::from_str("[nvim]\nfocus_on_forward = true\nfocus_on_inverse = true\n")
+                .expect("config");
+        assert!(config.nvim.focus_on_forward);
+        assert!(config.nvim.focus_on_inverse);
     }
 
     #[test]

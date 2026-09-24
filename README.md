@@ -395,8 +395,8 @@ With the repository on `runtimepath`, `require("pdfterm").setup()` needs no
 arguments for bidirectional SyncTeX. Open a compiled TeX document and run
 `:PdfTermForward` to navigate an existing viewer, or `:PdfTermForwardSplit` to
 launch a right-hand terminal split if none is running. Option/Alt-click the PDF
-to jump back and focus its source terminal. This works locally and through the
-SSH bridge described below.
+to jump back to its source. Neither direction changes terminal focus by default.
+This works locally and through the SSH bridge described below.
 The PDF needs a matching `.synctex.gz` sidecar and `synctex` must be on `PATH`.
 Keybindings and automatic compilation remain optional.
 
@@ -407,8 +407,9 @@ control bridge and is not provided by ordinary SSH.
 
 Existing configuration files are never overwritten. If upgrading from the old
 clipboard-only defaults, set `[editor]` to `transport = "socket"` and
-`path = "editor.sock"`, and set `[nvim] focus_on_inverse = true`.
-Restart both Neovim and the viewer after editing the configuration.
+`path = "editor.sock"`. Set `[nvim] focus_on_inverse = true` to return to the
+source terminal after inverse search. Restart both Neovim and the viewer after
+editing the configuration.
 
 With [Lazy.nvim](https://github.com/folke/lazy.nvim):
 
@@ -466,10 +467,16 @@ configuration, builds, or resolution can observe another focused window. It then
 tries the viewer socket. A capture failure does not prevent socket-only attachment.
 `:PdfTermForward` never creates a terminal split; if the viewer is absent it reports
 the missing viewer. `:PdfTermForwardSplit` can launch one using the captured identity
-when `attach_only` is false. Inverse focus is enabled by default; set
-`focus_on_inverse = false` to keep focus in the viewer. An explicit `:PdfTermOpen`
-also launches a viewer when needed. Both terminals launch a right-hand split beside
-the captured source, in its existing tab and OS window.
+when `attach_only` is false. Set `focus_on_forward = true` to focus a viewer split
+launched by this Neovim session after the forward frame is submitted. A manually
+started viewer has no terminal handle in the forward socket; its navigation still
+succeeds, but requested focus reports that it is unavailable. Set
+`focus_on_inverse = true` to return to the captured source terminal after inverse
+search. Both options default to false; explicit `setup()` options override `[nvim]`
+values in the TOML configuration.
+`:PdfTermOpen` does not shift focus, but a split opened there can be focused on a
+later forward search. Both terminals launch a right-hand split beside the captured
+source, in its existing tab and OS window.
 Kitty window control requires remote-control permission.
 The adapter selects the source tab's `splits` layout; include `splits` if you
 restrict Kitty's `enabled_layouts` (the standard defaults already include it).

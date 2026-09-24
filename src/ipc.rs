@@ -154,12 +154,23 @@ impl Drop for Listener {
         }
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Reply {
     pub ok: bool,
     pub error: Option<String>,
+    #[serde(rename = "viewer_token", default)]
+    _viewer_token: Option<String>,
 }
+
+#[derive(Serialize)]
+struct ReplyBody<'a> {
+    ok: bool,
+    error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewer_token: Option<&'a str>,
+}
+
 #[derive(Debug)]
 pub enum ViewerRequest {
     Forward(ForwardRequest),
@@ -195,6 +206,10 @@ impl ForwardReply {
     }
 
     pub fn finish(&mut self, error: Option<String>) {
+        self.finish_with_token(error, None);
+    }
+
+    pub fn finish_with_token(&mut self, error: Option<String>, viewer_token: Option<&str>) {
         let Some(mut stream) = self.0.take() else {
             return;
         };
@@ -205,9 +220,10 @@ impl ForwardReply {
                 format!("{}…", message.chars().take(512).collect::<String>())
             }
         });
-        let reply = Reply {
+        let reply = ReplyBody {
             ok: error.is_none(),
-            error,
+            error: error.as_deref(),
+            viewer_token: if error.is_none() { viewer_token } else { None },
         };
         let result = (|| -> io::Result<()> {
             let bytes = serde_json::to_vec(&reply)?;
@@ -437,6 +453,23 @@ mod tests {
         let response: Reply = serde_json::from_str(&payload).unwrap();
         assert!(response.ok);
         assert!(response.error.is_none());
+        assert!(response._viewer_token.is_none());
+    }
+
+    #[test]
+    fn forward_reply_identifies_only_successful_viewer() {
+        for error in [None, Some("render failed".to_owned())] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let mut reply = ForwardReply::new(server);
+            reply.finish_with_token(error, Some("launched-viewer"));
+            let mut payload = String::new();
+            client.read_to_string(&mut payload).unwrap();
+            let response: Reply = serde_json::from_str(&payload).unwrap();
+            assert_eq!(
+                response._viewer_token.as_deref(),
+                response.ok.then_some("launched-viewer")
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h')
 local options, main_file, initialized, exiting
 local cancel_forward, cancel_resolution, close_listener
 local owned_splits, launch_waiters = {}, nil
+local viewer_handle, viewer_token
 local launch_process
 local setup_options, config_waiters, install_mappings
 
@@ -181,16 +182,20 @@ local function launch(id, source, source_error, callback)
     return
   end
   launch_waiters = { callback }
-  local function complete(error)
+  local focus_token
+  local function complete(error, split)
     local waiters = launch_waiters or {}
     launch_waiters = nil
     for _, waiter in ipairs(waiters) do
-      waiter(error)
+      waiter(error, split, focus_token)
     end
   end
   if not source then
     complete(source_error or 'source terminal unavailable')
     return
+  end
+  if options.focus_on_forward then
+    focus_token = vim.fn.sha256(assert(vim.uv.random(16))):sub(1, 32)
   end
   local ok, process = pcall(
     terminal.launch_split,
@@ -207,12 +212,14 @@ local function launch(id, source, source_error, callback)
           complete('editor stopped')
         else
           complete(
-            not split and ('terminal split failed: ' .. (result.stderr or 'missing ID')) or nil
+            not split and ('terminal split failed: ' .. (result.stderr or 'missing ID')) or nil,
+            split
           )
         end
       end)
     end,
-    options.session
+    options.session,
+    focus_token
   )
   if ok then
     launch_process = process
@@ -221,7 +228,7 @@ local function launch(id, source, source_error, callback)
   end
 end
 
-local function deliver(pdf, payload, id, source, source_error, allow_launch)
+local function deliver(pdf, payload, id, source, source_error, allow_launch, focus_forward)
   assert(initialized, 'pdfterm: call setup() first')
   if not alive(id) then
     return
@@ -231,7 +238,7 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch)
     return
   end
   M._source_terminal = source
-  local launched, retry_deadline = false, nil
+  local launched, launched_viewer, launched_token, retry_deadline = false, nil, nil, nil
   local attempt
   attempt = function()
     if not alive(id) then
@@ -240,12 +247,29 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch)
     cancel_forward = socket.request(
       options.forward_socket,
       payload,
-      function(error, connection_error)
+      function(error, connection_error, reply)
         if not alive(id) then
           return
         end
         cancel_forward = nil
         if not error then
+          if launched_viewer and launched_token and reply.viewer_token == launched_token then
+            viewer_handle, viewer_token = launched_viewer, launched_token
+          end
+          if focus_forward and options.focus_on_forward then
+            if viewer_handle and reply.viewer_token == viewer_token then
+              terminal.focus(
+                viewer_handle,
+                vim.schedule_wrap(function(result)
+                  if result.code ~= 0 then
+                    notify('could not focus viewer terminal: ' .. (result.stderr or ''))
+                  end
+                end)
+              )
+            else
+              notify('navigation succeeded; viewer focus unavailable: no matching plugin-owned viewer')
+            end
+          end
           if options.focus_on_inverse and not remote_session() and not source then
             notify(
               'navigation succeeded; focus unavailable: '
@@ -269,13 +293,14 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch)
         if not launched then
           launched = true
           M._launch_pdf = pdf
-          launch(id, source, source_error, function(launch_error)
+          launch(id, source, source_error, function(launch_error, split, token)
             if not alive(id) then
               return
             end
             if launch_error then
               notify(launch_error)
             else
+              launched_viewer, launched_token = split, token
               retry_deadline = vim.uv.hrtime() + 5e9
               attempt()
             end
@@ -298,14 +323,14 @@ function M.forward_search(pdf, payload, source)
   with_source(id, source, function(captured, capture_error)
     ready(function()
       if alive(id) then
-        deliver(pdf, payload, id, captured, capture_error, false)
+        deliver(pdf, payload, id, captured, capture_error, false, true)
       end
     end, true)
   end)
 end
 
 -- Open a standalone PDF at page one, without TeX or a SyncTeX sidecar.
-local function open_pdf(pdf, id, source, source_error, allow_launch)
+local function open_pdf(pdf, id, source, source_error, allow_launch, focus_forward)
   pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
   ready(function()
     if not alive(id) then
@@ -331,7 +356,7 @@ local function open_pdf(pdf, id, source, source_error, allow_launch)
       width = 0,
       height = 0,
     })
-    deliver(path, payload, id, source, source_error, allow_launch)
+    deliver(path, payload, id, source, source_error, allow_launch, focus_forward)
   end, true)
 end
 
@@ -339,7 +364,7 @@ function M.open(pdf)
   local id = intent()
   pdf = vim.fn.fnamemodify(pdf or vim.api.nvim_buf_get_name(0), ':p')
   with_source(id, nil, function(source, source_error)
-    open_pdf(pdf, id, source, source_error, true)
+    open_pdf(pdf, id, source, source_error, true, false)
   end)
 end
 function M.set_main(file)
@@ -418,10 +443,10 @@ local function forward(allow_launch)
                   .. vim.trim(result.stderr):gsub('^pdfterm:%s*', ''),
                 vim.log.levels.WARN
               )
-              open_pdf(p.pdf, id, source, source_error, allow_launch)
+              open_pdf(p.pdf, id, source, source_error, allow_launch, true)
               return
             end
-            deliver(p.pdf, result.stdout, id, source, source_error, allow_launch)
+            deliver(p.pdf, result.stdout, id, source, source_error, allow_launch, true)
           end
         )
       end

@@ -135,6 +135,9 @@ if case then
     :wait(10000)
   assert(resolved.code == 0, resolved.stderr)
   local config = vim.json.decode(resolved.stdout)
+  if case == 'defaults' then
+    assert(not config.nvim.focus_on_forward and not config.nvim.focus_on_inverse)
+  end
   assert(config.editor.path:match('/n%x+%-editor.sock$'), command)
   local source = directory .. '/source-' .. vim.fn.getpid() .. '.tex'
   vim.fn.writefile({ 'first line', 'second line' }, source)

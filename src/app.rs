@@ -126,13 +126,14 @@ pub fn run(
     pdfium_library: Option<PathBuf>,
     start_page: u32,
     config: &Config,
+    focus_token: Option<String>,
 ) -> Result<(), AppError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::NotInteractive);
     }
 
     let mut output = io::BufWriter::new(io::stdout().lock());
-    let defaults = AppDefaults::from(config);
+    let defaults = AppDefaults::from_config(config, focus_token);
     let theme = defaults.theme;
     let _terminal = TerminalGuard::enter(&mut output, theme)?;
     let path = match path {
@@ -348,6 +349,7 @@ struct App {
     editor: crate::editor::Editor,
     forward_socket: Option<String>,
     forward_listener: Option<crate::ipc::ForwardListener>,
+    focus_token: Option<String>,
     pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
     persistent_link_picker: bool,
@@ -378,11 +380,12 @@ struct AppDefaults {
     synctex_enabled: bool,
     editor: crate::editor::Editor,
     forward_socket: Option<String>,
+    focus_token: Option<String>,
     viewer: ViewerSettings,
 }
 
-impl From<&Config> for AppDefaults {
-    fn from(config: &Config) -> Self {
+impl AppDefaults {
+    fn from_config(config: &Config, focus_token: Option<String>) -> Self {
         let themes = crate::theme::available_themes(config.theme_catalog(), config.theme());
         let configured_theme = crate::theme::load_or_default(config.theme());
         let theme_index = themes
@@ -409,6 +412,7 @@ impl From<&Config> for AppDefaults {
             synctex_enabled: config.synctex_enabled(),
             editor: config.editor.clone(),
             forward_socket: config.forward_socket().map(str::to_owned),
+            focus_token,
             viewer: config.viewer,
             theme,
             themes,
@@ -875,6 +879,7 @@ impl App {
             editor: defaults.editor,
             forward_socket: defaults.forward_socket,
             forward_listener: None,
+            focus_token: defaults.focus_token,
             pending_link_picker_open: false,
             link_picker: None,
             persistent_link_picker: defaults.persistent_link_picker,
@@ -2061,7 +2066,9 @@ impl App {
 
     fn finish_forward(&mut self, error: Option<String>) {
         if let Some(mut pending) = self.navigation.forward.take() {
-            pending.reply.finish(error);
+            pending
+                .reply
+                .finish_with_token(error, self.focus_token.as_deref());
         }
     }
 
@@ -6535,7 +6542,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
             Line::from("[viewer]: smooth_scroll, scroll_frame_ms, scroll_ease_divisor"),
             Line::from("[viewer]: continuous_scroll, prefetch_pages, set_window_title, center_forward_search"),
             Line::from("[viewer]: flash_duration_ms, word_precision, source_context_lines"),
-            Line::from("[nvim]: focus_on_inverse, viewer, compile; [nvim.keys]: editor keys"),
+            Line::from("[nvim]: focus_on_forward, focus_on_inverse, compile; [nvim.keys]: editor keys"),
             Line::from("Commented defaults on first launch. Edit config, then restart."),
         ])
         .style(Style::default().bg(colors.surface).fg(colors.text))

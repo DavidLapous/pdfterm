@@ -105,10 +105,13 @@ end
 
 -- Callback runs before scheduling editor work so VimLeavePre can retain ownership
 -- even when it is waiting for an in-flight launch to finish.
-function M.launch_split(source, executable, pdf, callback, session)
+function M.launch_split(source, executable, pdf, callback, session, focus_token)
   local argv = { executable, pdf }
   if session then
     vim.list_extend(argv, { '--session', session })
+  end
+  if focus_token then
+    vim.list_extend(argv, { '--focus-token', focus_token })
   end
   local done, reply, callback_failure = false, nil, nil
   adapter(source).launch(source, argv, function(result)
