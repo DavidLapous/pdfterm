@@ -175,6 +175,32 @@ struct ReplyBody<'a> {
 pub enum ViewerRequest {
     Forward(ForwardRequest),
     Screenshot(PathBuf),
+    Focus(String),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FocusRequest {
+    #[serde(rename = "type")]
+    kind: String,
+    viewer_token: String,
+}
+
+fn parse_focus_request(payload: &str) -> io::Result<String> {
+    let request: FocusRequest = serde_json::from_str(payload)?;
+    if request.kind != "focus"
+        || request.viewer_token.len() != 32
+        || !request
+            .viewer_token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid focus request",
+        ));
+    }
+    Ok(request.viewer_token)
 }
 pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -402,21 +428,23 @@ impl ForwardListener {
                 let client = self.clients.remove(index);
                 let request = result.and_then(|payload| {
                     let value: serde_json::Value = serde_json::from_str(&payload)?;
-                    if value.get("type").and_then(serde_json::Value::as_str) == Some("screenshot") {
-                        let path = value
-                            .get("path")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "screenshot request has no path",
-                                )
-                            })?;
-                        let path = PathBuf::from(path);
-                        validate_screenshot_path(&path)?;
-                        Ok(ViewerRequest::Screenshot(path))
-                    } else {
-                        parse_forward_request(&payload).map(ViewerRequest::Forward)
+                    match value.get("type").and_then(serde_json::Value::as_str) {
+                        Some("screenshot") => {
+                            let path = value
+                                .get("path")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "screenshot request has no path",
+                                    )
+                                })?;
+                            let path = PathBuf::from(path);
+                            validate_screenshot_path(&path)?;
+                            Ok(ViewerRequest::Screenshot(path))
+                        }
+                        Some("focus") => parse_focus_request(&payload).map(ViewerRequest::Focus),
+                        _ => parse_forward_request(&payload).map(ViewerRequest::Forward),
                     }
                 });
                 ready.push((request, ForwardReply::new(client.stream)));
@@ -470,6 +498,44 @@ mod tests {
                 response.ok.then_some("launched-viewer")
             );
         }
+    }
+
+    #[test]
+    fn focus_request_is_strict_and_replies_without_a_viewer_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_focus_request(&format!(r#"{{"type":"focus","viewer_token":"{token}"}}"#))
+                .unwrap(),
+            token
+        );
+        for payload in [
+            r#"{"type":"focus","viewer_token":"bad"}"#,
+            r#"{"type":"focus","viewer_token":"0123456789abcdef0123456789abcdef","extra":true}"#,
+            r#"{"type":"screenshot","viewer_token":"0123456789abcdef0123456789abcdef"}"#,
+        ] {
+            assert_eq!(
+                parse_focus_request(payload).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private/focus.sock");
+        let mut listener = ForwardListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        write!(client, r#"{{"type":"focus","viewer_token":"{token}"}}"#).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let ready = listener.poll().unwrap();
+        assert_eq!(ready.len(), 1);
+        let (request, mut reply) = ready.into_iter().next().unwrap();
+        assert!(matches!(request.unwrap(), ViewerRequest::Focus(value) if value == token));
+        reply.finish(None);
+        let mut payload = String::new();
+        client.read_to_string(&mut payload).unwrap();
+        let response: Reply = serde_json::from_str(&payload).unwrap();
+        assert!(response.ok);
+        assert!(response.error.is_none());
+        assert!(response._viewer_token.is_none());
     }
 
     #[test]

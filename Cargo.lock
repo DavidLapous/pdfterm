@@ -1109,6 +1109,7 @@ dependencies = [
  "flate2",
  "fontdb",
  "fontdue",
+ "getrandom 0.4.3",
  "latex2mathml",
  "libc",
  "nucleo-matcher",

@@ -195,7 +195,7 @@ local ok, failure = xpcall(function()
     not vim.uv.fs_lstat(config.editor.path),
     'setup opened an inverse listener before first use'
   )
-  local requests, viewer_reply_token = {}, nil
+  local requests, focus_requests, viewer_reply_token = {}, {}, nil
   local function receive()
     server = assert(vim.uv.new_pipe(false))
     assert(server:bind(config.forward_socket))
@@ -209,7 +209,12 @@ local ok, failure = xpcall(function()
         if chunk then
           chunks[#chunks + 1] = chunk
         else
-          requests[#requests + 1] = vim.json.decode(table.concat(chunks))
+          local request = vim.json.decode(table.concat(chunks))
+          if request.type == 'focus' then
+            focus_requests[#focus_requests + 1] = request
+          else
+            requests[#requests + 1] = request
+          end
           client:write(vim.json.encode({
             ok = true,
             error = vim.NIL,
@@ -377,6 +382,30 @@ local ok, failure = xpcall(function()
     return focused ~= nil
   end)
   assert(focused == 'A', 'slow navigation retargeted inverse focus to a later terminal')
+  -- Manual pairing does not expose a runnable command until asynchronous capture completes.
+  local manual_capture
+  terminal.capture_source = function(callback)
+    manual_capture = callback
+  end
+  local command_notices = #focus_notices
+  adapter.viewer_command(pdf)
+  assert(manual_capture and #focus_notices == command_notices)
+  assert(adapter._source_terminal == nil, 'old source survived a new manual pairing')
+  manual_capture(nil, { kind = 'ghostty', id = 'manual-source' })
+  wait(function()
+    return adapter._source_terminal and adapter._source_terminal.id == 'manual-source'
+      and #focus_notices > command_notices
+  end)
+  assert(
+    focus_notices[#focus_notices]:find(root .. '/scripts/pdfterm-viewer', 1, true),
+    'focused manual command omitted the terminal-aware launcher'
+  )
+  focused = nil
+  inverse_jump()
+  wait(function()
+    return focused ~= nil
+  end)
+  assert(focused == 'manual-source', 'manual viewer command did not retain invocation terminal')
 
   -- Explicit source handles win; socket attachment still works without capture.
   terminal.capture_source = function()
@@ -469,13 +498,22 @@ local ok, failure = xpcall(function()
     return #requests == 11
   end)
   assert(focused == nil, 'opening an existing PDF unexpectedly changed terminal focus')
+  viewer_reply_token = string.rep('a', 32)
+  adapter.forward_search(pdf, vim.json.encode(requests[1]), { kind = 'ghostty', id = 'source' })
+  wait(function()
+    return #requests == 12 and #focus_requests == 1
+  end)
+  assert(
+    focus_requests[1].viewer_token == viewer_reply_token,
+    'manual viewer focus did not use its acknowledged token'
+  )
   server:close()
   viewer_reply_token = nil
   receive()
   local before = #notices
   adapter.forward_search(pdf, vim.json.encode(requests[1]), { kind = 'ghostty', id = 'source' })
   wait(function()
-    return #requests == 12 and #notices > before
+    return #requests == 13 and #notices > before
   end)
   assert(focused == nil and notices[#notices].message:find('viewer focus unavailable', 1, true))
   -- Another viewer can win the socket race after a split is launched.
@@ -492,7 +530,7 @@ local ok, failure = xpcall(function()
   before = #notices
   vim.cmd('PdfTermForwardSplit')
   wait(function()
-    return #requests == 13
+    return #requests == 14
       and #notices > before
       and notices[#notices].message:find('viewer focus unavailable', 1, true)
   end)

@@ -5,7 +5,7 @@ local project = require('pdfterm.project')
 local terminal = require('pdfterm.terminal')
 local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h')
 local options, main_file, initialized, exiting
-local cancel_forward, cancel_resolution, close_listener
+local cancel_forward, cancel_focus, cancel_resolution, close_listener
 local owned_splits, launch_waiters = {}, nil
 local viewer_handle, viewer_token
 local launch_process
@@ -27,6 +27,10 @@ local function intent()
   if cancel_forward then
     cancel_forward()
     cancel_forward = nil
+  end
+  if cancel_focus then
+    cancel_focus()
+    cancel_focus = nil
   end
   if cancel_resolution then
     cancel_resolution()
@@ -71,15 +75,23 @@ local function inverse(location)
   local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ''
   vim.api.nvim_win_set_cursor(0, { line, math.min(location.byte_column, #text) })
   vim.cmd('normal! zvzz')
-  if options.focus_on_inverse and not remote_session() and M._source_terminal then
-    terminal.focus(
-      M._source_terminal,
-      vim.schedule_wrap(function(result)
-        if result.code ~= 0 then
-          notify('could not focus source terminal: ' .. (result.stderr or ''))
-        end
-      end)
-    )
+  if options.focus_on_inverse then
+    if remote_session() or not M._source_terminal then
+      notify(
+        'could not focus source terminal: '
+          .. (remote_session() and 'plain SSH has no terminal focus bridge'
+            or 'source terminal unavailable')
+      )
+    else
+      terminal.focus(
+        M._source_terminal,
+        vim.schedule_wrap(function(result)
+          if result.code ~= 0 then
+            notify('could not focus source terminal: ' .. (result.stderr or ''))
+          end
+        end)
+      )
+    end
   end
 end
 
@@ -163,6 +175,9 @@ end
 
 local function viewer_command(pdf)
   local argv = command({ pdf })
+  if options.focus_on_forward then
+    argv = vim.list_extend({ root .. '/scripts/pdfterm-viewer' }, argv)
+  end
   if vim.env.XDG_CONFIG_HOME then
     argv = vim.list_extend({ 'env', 'XDG_CONFIG_HOME=' .. vim.env.XDG_CONFIG_HOME }, argv)
   end
@@ -253,21 +268,43 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch, foc
         end
         cancel_forward = nil
         if not error then
-          if launched_viewer and launched_token and reply.viewer_token == launched_token then
+          local valid_token = type(reply.viewer_token) == 'string'
+            and reply.viewer_token:match('^[0-9a-fA-F]+$')
+            and #reply.viewer_token == 32
+          local matching_launch = launched_viewer
+            and launched_token
+            and reply.viewer_token == launched_token
+          if matching_launch then
             viewer_handle, viewer_token = launched_viewer, launched_token
           end
           if focus_forward and options.focus_on_forward then
-            if viewer_handle and reply.viewer_token == viewer_token then
+            if launched_viewer and not matching_launch then
+              notify('navigation succeeded; viewer focus unavailable: no matching plugin-owned viewer')
+            elseif matching_launch or (viewer_handle and reply.viewer_token == viewer_token) then
               terminal.focus(
-                viewer_handle,
+                matching_launch and launched_viewer or viewer_handle,
                 vim.schedule_wrap(function(result)
-                  if result.code ~= 0 then
+                  if alive(id) and result.code ~= 0 then
                     notify('could not focus viewer terminal: ' .. (result.stderr or ''))
                   end
                 end)
               )
+            elseif valid_token then
+              cancel_focus = socket.request(
+                options.forward_socket,
+                vim.json.encode({ type = 'focus', viewer_token = reply.viewer_token }),
+                function(focus_error)
+                  if not alive(id) then
+                    return
+                  end
+                  cancel_focus = nil
+                  if focus_error then
+                    notify('navigation succeeded; could not focus viewer: ' .. focus_error)
+                  end
+                end
+              )
             else
-              notify('navigation succeeded; viewer focus unavailable: no matching plugin-owned viewer')
+              notify('navigation succeeded; viewer focus unavailable: invalid or missing viewer token')
             end
           end
           if options.focus_on_inverse and not remote_session() and not source then
@@ -384,13 +421,42 @@ function M.toggle_compile()
   end)
 end
 function M.viewer_command(pdf)
+  local id = intent()
   local source = vim.api.nvim_buf_get_name(0)
-  ready(function()
+  M._source_terminal = nil
+  local captured_source, source_error, capture_done, configured = nil, nil, false, false
+  local function publish()
+    if not configured or not capture_done or not alive(id) then
+      return
+    end
+    M._source_terminal = captured_source
     pdf = pdf and vim.fn.fnamemodify(pdf, ':p')
       or project.describe(options.project, main_file or source).pdf
     local shell_command = viewer_command(pdf)
     vim.fn.setreg('+', shell_command)
     vim.notify(shell_command)
+    if options.focus_on_inverse and not captured_source then
+      notify('source terminal focus unavailable: ' .. (source_error or 'source terminal unavailable'))
+    end
+  end
+  local function capture(error, handle)
+    if not alive(id) or capture_done then
+      return
+    end
+    captured_source, source_error, capture_done = handle, error, true
+    publish()
+  end
+  if remote_session() then
+    capture('plain SSH has no terminal focus bridge')
+  else
+    local ok, error = pcall(terminal.capture_source, capture)
+    if not ok then
+      capture(tostring(error))
+    end
+  end
+  ready(function()
+    configured = true
+    publish()
   end, true)
 end
 function M.build()

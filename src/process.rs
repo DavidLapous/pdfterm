@@ -24,6 +24,20 @@ impl Operation {
             deadline: Instant::now() + timeout,
         }
     }
+    /// Keep the parent's cancellation while applying a shorter helper deadline.
+    pub fn limited(&self, timeout: Duration) -> Self {
+        Self {
+            cancelled: Arc::clone(&self.cancelled),
+            deadline: self.deadline.min(Instant::now() + timeout),
+        }
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+    pub fn remaining(&self) -> io::Result<Duration> {
+        self.check()?;
+        Ok(self.deadline.saturating_duration_since(Instant::now()))
+    }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }

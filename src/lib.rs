@@ -3,6 +3,7 @@ mod browser;
 pub mod config;
 pub mod editor;
 mod embedded_pdfium;
+pub(crate) mod focus;
 pub mod ipc;
 pub mod kitty;
 mod navigation;

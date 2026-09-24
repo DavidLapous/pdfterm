@@ -121,6 +121,17 @@ fn read_event() -> Result<Event, AppError> {
     Ok(event)
 }
 
+fn new_focus_token() -> io::Result<String> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut token, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(token)
+}
+
 pub fn run(
     path: Option<PathBuf>,
     pdfium_library: Option<PathBuf>,
@@ -133,7 +144,12 @@ pub fn run(
     }
 
     let mut output = io::BufWriter::new(io::stdout().lock());
-    let defaults = AppDefaults::from_config(config, focus_token)?;
+
+    let focus_token = match focus_token {
+        Some(token) => token,
+        None => new_focus_token()?,
+    };
+    let defaults = AppDefaults::from_config(config, Some(focus_token))?;
     let theme = defaults.theme;
     let _terminal = TerminalGuard::enter(&mut output, theme)?;
     let path = match path {
@@ -351,6 +367,8 @@ struct App {
     forward_socket: Option<String>,
     forward_listener: Option<crate::ipc::ForwardListener>,
     focus_token: Option<String>,
+    focus_task: Option<FocusTask>,
+    focus_waiting: Option<crate::ipc::ForwardReply>,
     pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
     persistent_link_picker: bool,
@@ -365,6 +383,23 @@ struct App {
     label_overlay_id: Option<u32>,
     label_overlay: Option<Vec<u8>>,
     theme_index: usize,
+}
+
+struct FocusTask {
+    operation: crate::process::Operation,
+    worker: std::thread::JoinHandle<io::Result<()>>,
+    reply: crate::ipc::ForwardReply,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(task) = self.focus_task.take() {
+            task.operation.cancel();
+            let _ = task.worker.join();
+            let mut reply = task.reply;
+            reply.finish(Some("viewer stopped before focus completed".into()));
+        }
+    }
 }
 
 struct AppDefaults {
@@ -883,6 +918,8 @@ impl App {
             forward_socket: defaults.forward_socket,
             forward_listener: None,
             focus_token: defaults.focus_token,
+            focus_task: None,
+            focus_waiting: None,
             pending_link_picker_open: false,
             link_picker: None,
             persistent_link_picker: defaults.persistent_link_picker,
@@ -1941,6 +1978,17 @@ impl App {
             .as_mut()
             .expect("listener bound")
             .poll()?;
+        let newer_forward = ready
+            .iter()
+            .any(|(result, _)| matches!(result, Ok(crate::ipc::ViewerRequest::Forward(_))));
+        if newer_forward {
+            if let Some(task) = self.focus_task.as_ref() {
+                task.operation.cancel();
+            }
+            if let Some(mut waiting) = self.focus_waiting.take() {
+                waiting.finish(Some("focus superseded by a newer forward request".into()));
+            }
+        }
         for (result, mut reply) in ready {
             match result {
                 Ok(crate::ipc::ViewerRequest::Forward(request)) => {
@@ -1967,6 +2015,31 @@ impl App {
                         self.draw_status(output, self.viewport()?, "screenshot saved")?;
                     }
                 }
+                Ok(crate::ipc::ViewerRequest::Focus(viewer_token)) => {
+                    let error = if newer_forward || self.navigation.forward.is_some() {
+                        Some("focus rejected because a forward request is pending".to_owned())
+                    } else if self.focus_token.as_deref() != Some(viewer_token.as_str()) {
+                        Some("focus rejected because viewer token does not match".to_owned())
+                    } else {
+                        None
+                    };
+                    if let Some(error) = error {
+                        reply.finish(Some(error.clone()));
+                        self.draw_status(
+                            output,
+                            self.viewport()?,
+                            &format!("viewer focus: {error}"),
+                        )?;
+                    } else {
+                        if let Some(task) = self.focus_task.as_ref() {
+                            task.operation.cancel();
+                        }
+                        if let Some(mut waiting) = self.focus_waiting.replace(reply) {
+                            waiting
+                                .finish(Some("focus superseded by a newer focus request".into()));
+                        }
+                    }
+                }
                 Err(error) => {
                     reply.finish(Some(error.to_string()));
                     self.draw_status(
@@ -1977,8 +2050,69 @@ impl App {
                 }
             }
         }
+        self.poll_focus_task(output)?;
         Ok(())
     }
+    fn poll_focus_task(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if let Some(task) = self.focus_task.as_ref() {
+            if task.reply.disconnected()? {
+                task.operation.cancel();
+            }
+            if task.worker.is_finished() {
+                let task = self.focus_task.take().expect("finished focus task");
+                let result = task
+                    .worker
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("viewer focus worker panicked")));
+                let error = if task.operation.is_cancelled() {
+                    Some("focus superseded or client disconnected".to_owned())
+                } else {
+                    result.err().map(|error| error.to_string())
+                };
+                let mut reply = task.reply;
+                reply.finish(error.clone());
+                if let Some(error) = error {
+                    self.draw_status(output, self.viewport()?, &format!("viewer focus: {error}"))?;
+                }
+            }
+        }
+        if self.focus_task.is_none()
+            && let Some(mut reply) = self.focus_waiting.take()
+        {
+            if reply.disconnected()? {
+                reply.finish(Some("focus request disconnected".into()));
+            } else if self.navigation.forward.is_some() {
+                reply.finish(Some(
+                    "focus rejected because a forward request is pending".into(),
+                ));
+            } else {
+                let operation = crate::process::Operation::new(crate::focus::FOCUS_TIMEOUT);
+                let worker_operation = operation.clone();
+                match std::thread::Builder::new()
+                    .name("viewer-focus".into())
+                    .spawn(move || crate::focus::focus_self(&worker_operation))
+                {
+                    Ok(worker) => {
+                        self.focus_task = Some(FocusTask {
+                            operation,
+                            worker,
+                            reply,
+                        })
+                    }
+                    Err(error) => {
+                        reply.finish(Some(format!("could not start viewer focus: {error}")));
+                        self.draw_status(
+                            output,
+                            self.viewport()?,
+                            &format!("viewer focus: {error}"),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn save_screenshot(&self, path: &Path) -> io::Result<()> {
         if self.link_picker.is_some() || self.search_picker.is_some() {
             return Err(io::Error::other(

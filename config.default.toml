@@ -42,7 +42,7 @@ source_context_lines = 4           # Source radius outside Beamer frames, 0–10
 compile = false                    # Run latexmk before forward search
 attach_only = false                # true: require an existing viewer even for explicit split/open commands
 focus_on_inverse = false           # Focus the source terminal after inverse search when available
-focus_on_forward = false           # Focus a plugin-owned viewer after forward search when available
+focus_on_forward = false           # Focus the exact viewer after an acknowledged forward search when available
 executable = ""                    # Runtime override; setup({executable=...}) selects the asynchronous config loader
 
 [nvim.keys]
