@@ -391,6 +391,13 @@ The viewer's submission deadline is 30 seconds; the CLI allows 31 seconds for
 the final reply. These are failure ceilings, not readiness delays. A disconnected
 client is discarded without retaining its pending request.
 
+Successful forward replies also identify the viewer process with a fresh token
+(or the plugin-owned split's launch token). When requested, Neovim focuses a
+manually attached viewer through a second `{"type":"focus","viewer_token":"..."}`
+request to the same socket, after checking that navigation is still current.
+The viewer rejects a different process token or a pending newer forward request
+and focuses only its own terminal. No terminal ID crosses the forward socket.
+
 Incomplete, malformed, non-finite, unknown-field, and oversized requests are
 rejected. Send the complete request and half-close within 100 ms after connecting.
 
@@ -408,6 +415,10 @@ to jump back to its source. Neither direction changes terminal focus by default.
 This works locally and through the SSH bridge described below.
 The PDF needs a matching `.synctex.gz` sidecar and `synctex` must be on `PATH`.
 Keybindings and automatic compilation remain optional.
+
+Before using terminal splits, follow [local Kitty/Ghostty setup](#local-terminal-split-setup).
+For SSH, configure the [client shell hook](#client-ssh-shell-hook) in
+`~/.bashrc` or `~/.zshrc`; plain `ssh` cannot open or focus a client split.
 
 With ordinary SSH, inverse navigation can reposition Neovim's cursor,
 but it cannot focus the remote editor terminal. After the jump, manually return
@@ -471,24 +482,48 @@ listener errors are notifications, not exceptions through the editor's startup.
 The inverse listener opens only on the first navigation or viewer-command action.
 Each editor gets a unique session unless `session` is explicitly supplied.
 
+#### Local terminal split setup
+
 Local navigation captures its source terminal at invocation, before asynchronous
-configuration, builds, or resolution can observe another focused window. It then
-tries the viewer socket. A capture failure does not prevent socket-only attachment.
-`:PdfTermForward` never creates a terminal split; if the viewer is absent it reports
-the missing viewer. `:PdfTermForwardSplit` can launch one using the captured identity
-when `attach_only` is false. Set `focus_on_forward = true` to focus a viewer split
-launched by this Neovim session after the forward frame is submitted. A manually
-started viewer has no terminal handle in the forward socket; its navigation still
-succeeds, but requested focus reports that it is unavailable. Set
-`focus_on_inverse = true` to return to the captured source terminal after inverse
-search. Both options default to false; explicit `setup()` options override `[nvim]`
-values in the TOML configuration.
+configuration, builds, or resolution can observe another focused window. Manual
+`:PdfTermViewerCommand` also captures the editor terminal at invocation, including
+with `attach_only`; it prints its command after capture completes or fails.
+Capture failure still permits socket-only attachment but reports unavailable
+focus when requested. `:PdfTermForward` never creates a terminal split; if the
+viewer is absent it reports the missing viewer. `:PdfTermForwardSplit` can launch
+one using the captured identity when `attach_only` is false.
+Set `focus_on_forward = true` to focus the exact viewer after its forward frame
+is submitted: a plugin-owned split must return its launch token; a manually
+started viewer can focus itself via a separate token-checked socket request.
+A different viewer answering during split launch never focuses an unknown split.
+Set `focus_on_inverse = true` to return to the captured editor terminal after
+inverse search. Both options default to false; explicit `setup()` options
+override `[nvim]` values in the TOML configuration.
 `:PdfTermOpen` does not shift focus, but a split opened there can be focused on a
 later forward search. Both terminals launch a right-hand split beside the captured
 source, in its existing tab and OS window.
-Kitty window control requires remote-control permission.
+Kitty window control requires remote-control permission. If Neovim runs as an
+embedded/headless process without a controlling terminal, `kitten @` also needs
+Kitty's remote-control socket. On macOS, add to `kitty.conf` using a private
+runtime directory (`$TMPDIR` is mode 0700 by default):
+
+```conf
+allow_remote_control yes
+listen_on unix:${TMPDIR}/pdfterm-kitty-{kitty_pid}
+```
+
+On Linux, use `${XDG_RUNTIME_DIR}` when available, or another user-private
+mode-0700 directory; never expose an unrestricted control socket in a shared
+directory. `listen_on` cannot be enabled by reloading `kitty.conf`: save work,
+fully quit and reopen Kitty, then restart Neovim to inherit `KITTY_LISTEN_ON`.
+Without that socket, a detached Neovim process cannot control Kitty via
+`/dev/tty`; the adapter reports the missing socket explicitly. A Neovim
+process with a controlling Kitty terminal can still use tty remote control
+without a socket.
 The adapter selects the source tab's `splits` layout; include `splits` if you
 restrict Kitty's `enabled_layouts` (the standard defaults already include it).
+
+Ghostty does not use Kitty's socket; local splits use macOS AppleScript control.
 Local Ghostty capture and focus share one lazily started JavaScript-for-Automation
 worker per Neovim process. It queries the current front terminal for every capture;
 terminal identities are never cached. Requests have a three-second deadline.
@@ -501,14 +536,20 @@ and window-ownership policy.
 Plain SSH sessions do not control client windows just because terminal identifiers
 were forwarded.
 
-Local `nvim paper.tex` needs no SSH helper. For the same workflow after typing
-`ssh HOST`, add this once to the **client's** Bash/Zsh interactive startup file:
+#### Client SSH shell hook
+
+Local `nvim paper.tex` needs no SSH helper. To keep automatic splits after
+`ssh HOST`, add this to the **client's** `~/.bashrc` (Bash) or `~/.zshrc` (Zsh),
+not the remote machine:
 
 ```sh
 export PATH="/path/to/pdfterm/scripts:$PATH"
 export PDFTERM_SSH_HOSTS="workstation other-host"
 source /path/to/pdfterm/scripts/pdfterm-shell.sh
 ```
+
+If your Bash login shell does not load `~/.bashrc`, source it from
+`~/.bash_profile`. Start a new local shell after editing.
 
 Then use ordinary commands:
 
@@ -600,6 +641,18 @@ clipboard. Run it in a second SSH terminal connected to the same machine. Use
 directly. Activate this command **before** inverse-clicking a separately started
 viewer; no forward search is required. The local terminal must support Kitty
 graphics over SSH. This manual mode needs no client helper or socket forwarding.
+
+With `focus_on_forward = true`, the printed command uses the explicit
+`scripts/pdfterm-viewer` launcher. Run it in the foreground terminal that will
+display the PDF. On local Ghostty it needs Python 3 to capture that terminal's
+AppleScript UUID with a three-second deadline before starting the viewer;
+capture failure stops the launch. Direct `pdfterm` invocation cannot recover that
+UUID with installed Ghostty 1.3.1. Kitty uses its own `KITTY_WINDOW_ID` and
+requires remote-control permission. A viewer in a second wrapped SSH shell
+asks **that shell's own** authenticated bridge to focus its source terminal.
+Plain SSH still navigates but cannot focus either client terminal; forwarded
+terminal environment variables alone never authorize focus. A missing handle,
+bridge token, or exact viewer reply fails explicitly.
 
 Public actions are `open(pdf)`, `forward()`, `forward_split()`, `build()`,
 `set_main(file)`, and `toggle_compile()`. `open(pdf)` opens or selects a PDF at
@@ -746,7 +799,9 @@ python3 tests/terminal_native.py --terminal kitty --to unix:/path/to/kitty-contr
 python3 tests/terminal_native.py --terminal ghostty
 ```
 
-The probe creates and removes its own surfaces. It exercises local Neovim and
-client-side SSH backend control, including right splits, quoted arguments,
-environment, exact focus, liveness and repeated cleanup. It does not connect to an
-SSH host or verify rendered PDF pixels.
+The probe creates and removes its own surfaces. It starts local Neovim in a
+new session without a controlling terminal; Kitty's socket must still launch
+and focus the exact right split. It also checks that removing the socket gives
+an actionable error without changing Kitty surfaces. Both backends check
+client-side SSH control, quoted arguments, environment, liveness and repeated
+cleanup. It does not connect to an SSH host or verify rendered PDF pixels.
