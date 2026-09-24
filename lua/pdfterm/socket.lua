@@ -2,7 +2,19 @@
 local M = {}
 
 function M.request(path, payload, callback, timeout, acknowledge)
-  local pipe = assert(vim.uv.new_pipe(false))
+  local host, port = path:match('^tcp://([^:]+):(%d+)$')
+  local pipe
+  if host then
+    port = tonumber(port)
+    if host ~= '127.0.0.1' or not port or port < 1 or port > 65535 then
+      error('pdfterm: invalid loopback TCP endpoint')
+    end
+    pipe = assert(vim.uv.new_tcp())
+  elseif path:match('^tcp://') then
+    error('pdfterm: invalid loopback TCP endpoint')
+  else
+    pipe = assert(vim.uv.new_pipe(false))
+  end
   local timer = assert(vim.uv.new_timer())
   local chunks, size, done = {}, 0, false
   local offered
@@ -58,7 +70,14 @@ function M.request(path, payload, callback, timeout, acknowledge)
   timer:start(timeout or 31000, 0, function()
     finish('socket connection/reply timed out')
   end)
-  pipe:connect(path, function(error)
+  local connect = function(callback)
+    if host then
+      pipe:connect(host, port, callback)
+    else
+      pipe:connect(path, callback)
+    end
+  end
+  connect(function(error)
     if done then
       return
     end

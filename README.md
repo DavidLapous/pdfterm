@@ -370,6 +370,11 @@ SSH bridge described below.
 The PDF needs a matching `.synctex.gz` sidecar and `synctex` must be on `PATH`.
 Keybindings and automatic compilation remain optional.
 
+With ordinary SSH, inverse navigation can reposition Neovim's cursor,
+but it cannot focus the remote editor terminal. After the jump, manually return
+focus to that Neovim terminal; focusing it requires a supported remote terminal
+control bridge and is not provided by ordinary SSH.
+
 Existing configuration files are never overwritten. If upgrading from the old
 clipboard-only defaults, set `[editor]` to `transport = "socket"` and
 `path = "editor.sock"`, and set `[nvim] focus_on_inverse = true`.
@@ -488,12 +493,16 @@ binary, and TeX tools; its login shell supplies the editor's `PATH`. SSH host
 aliases, users, ports, and proxies come from the SSH configuration.
 
 The wrapper opens a remote login shell (or Neovim when arguments follow the host)
-and creates a private reverse Unix-socket tunnel. The shell exports the bridge
-address so subsequently launched Neovim instances inherit it.
+and allocates a reverse TCP forward bound to the remote loopback address. It
+connects to a private Unix bridge on the client. A fresh 256-bit token, stored
+in a remote mode-0600 file inside a mode-0700 directory, authenticates each
+terminal-control request; the shell exports the bridge address and token-file
+path for Neovim. The remote needs `ss` on Linux or `/usr/sbin/netstat` on macOS
+to verify that the listener is loopback-only before the editor starts.
 The private SSH master shares the interactive session's foreground process group
 and does not request extra confirmation for each multiplexed forwarding request.
-Finite control/bootstrap helpers use null stdin; they never pass the terminal's
-input descriptor to the background master.
+Finite control/bootstrap helpers never pass the terminal's input descriptor
+to the background master.
 On `:PdfTermForwardSplit` or explicit `:PdfTermOpen` when no viewer is running,
 the adapter asks the client helper to open a viewer running **SSH back to the same
 host**, with the same PDF, session, `PATH`, and configuration directory. Both
@@ -516,9 +525,19 @@ closes the offered handle. Exit waits allow 8.5 seconds, including a separate
 two-second cleanup request. Cleanup failures are reported and the bridge retains
 ownership. Update the client wrapper and remote adapter together, then restart
 the SSH session.
-Requests and helper output are bounded. The SSH server must permit reverse Unix-socket forwarding;
-refusal fails explicitly. There is no persistent daemon, TCP listener, or
-automatic change to SSH configuration. `attach_only = true` still forbids launch.
+
+If an existing session reports `missing PDFTERM_LAUNCH_TOKEN_FILE`, its
+terminal-control channel lacks matching credentials. Source navigation can
+still work, but client-terminal focus cannot; restart through the current
+wrapper rather than setting a token path by hand.
+
+Requests and helper output are bounded. The SSH server must permit reverse TCP
+forwarding on loopback; refusal, wildcard binding, or unavailable listener
+inspection fails explicitly. Other users on a shared remote host can connect to
+the loopback port but cannot issue terminal actions without the token; repeated
+unauthenticated connections can still delay legitimate requests. There is no
+persistent daemon or automatic change to SSH configuration. `attach_only = true`
+still forbids launch.
 
 For manual pairing in an ordinary SSH session, keep Neovim and the viewer on the
 same remote machine. In Neovim, use:

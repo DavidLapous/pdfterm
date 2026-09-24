@@ -2,7 +2,30 @@
 local socket = require('pdfterm.socket')
 local M = {}
 
+local function launch_token()
+  local path = vim.env.PDFTERM_LAUNCH_TOKEN_FILE
+  if not path or path == '' then
+    return nil, 'pdfterm: missing PDFTERM_LAUNCH_TOKEN_FILE'
+  end
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok then
+    return nil, 'pdfterm: cannot read launch token file: ' .. tostring(lines)
+  end
+  local token = lines[1]
+  if #lines ~= 1 or not token or #token ~= 64 or not token:match('^%x+$') then
+    return nil, 'pdfterm: invalid launch token file'
+  end
+  return token
+end
+
 local function request(payload, callback, timeout)
+  local token, problem = launch_token()
+  if problem then
+    local result = { code = 1, stdout = '', stderr = problem }
+    callback(result)
+    return { wait = function() return result end }
+  end
+  payload.token = token
   local done, result = false, nil
   local callback_failure
   local cancel = socket.request(
@@ -61,7 +84,12 @@ local function request(payload, callback, timeout)
 end
 
 function M.capture(callback)
-  callback(nil, 'source')
+  local _, problem = launch_token()
+  if problem then
+    callback(problem)
+  else
+    callback(nil, 'source')
+  end
 end
 
 function M.launch(_, argv, callback)

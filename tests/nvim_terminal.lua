@@ -43,6 +43,10 @@ vim.schedule = function(callback)
     end
   end)
 end
+local token_file = vim.fn.getcwd() .. '/target/pdfterm-terminal-token-' .. vim.fn.getpid()
+local token = string.rep('a', 64)
+vim.fn.writefile({ token }, token_file)
+vim.env.PDFTERM_LAUNCH_TOKEN_FILE = token_file
 local terminal = require('pdfterm.terminal')
 local source = { kind = 'ssh', id = 'source' }
 local owned, count = nil, 0
@@ -53,6 +57,7 @@ local successful = terminal.launch_split(source, 'viewer', 'paper.pdf', function
 end, 'session')
 assert(successful:wait(1000).code == 0 and count == 1 and owned.id == 'viewer-7')
 assert(requests[1].argv[3] == '--session' and requests[1].argv[4] == 'session')
+assert(requests[1].token == token, 'SSH launch must authenticate the exact source session')
 terminal.close(owned)
 assert(#requests == 2 and #failures == 0)
 
@@ -79,4 +84,32 @@ end)
 assert(rejected:wait(1000).code ~= 0 and count == 1)
 assert(#requests == 1 and #failures == 0, 'no offered handle means no invented cleanup')
 vim.schedule = schedule
+vim.fn.delete(token_file)
+vim.env.PDFTERM_LAUNCH_TOKEN_FILE = nil
+local capture_error, captured
+require('pdfterm.ssh').capture(function(problem, id)
+  capture_error, captured = problem, id
+end)
+assert(
+  capture_error and capture_error:find('missing PDFTERM_LAUNCH_TOKEN_FILE', 1, true)
+    and captured == nil,
+  'an incomplete SSH bridge must not claim a source terminal'
+)
+local focus_result
+vim.schedule(function()
+  terminal.focus(source, vim.schedule_wrap(function(result)
+    focus_result = result
+  end))
+end)
+assert(
+  vim.wait(1000, function()
+    return focus_result ~= nil
+  end, 10),
+  'inverse focus must report the missing token without throwing in a scheduled callback'
+)
+assert(
+  focus_result.code ~= 0
+    and focus_result.stderr:find('missing PDFTERM_LAUNCH_TOKEN_FILE', 1, true)
+)
+assert(#requests == 1, 'missing authentication must not contact the bridge')
 print('terminal regressions passed: success, callback failure with exact-handle cleanup, repeat wait, transport rejection')

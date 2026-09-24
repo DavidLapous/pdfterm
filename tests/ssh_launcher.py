@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import threading
+import selectors
 import unittest
 from unittest.mock import patch
 
@@ -28,6 +29,7 @@ class Windows:
         self.fail = False
         self.serial = 0
         self.query_fail = False
+        self.focused = []
 
     def launch(self, argv, deadline=None):
         if self.fail:
@@ -40,6 +42,7 @@ class Windows:
     def focus(self, identifier, deadline=None):
         if identifier != self.source and identifier not in self.live:
             raise RuntimeError('window is gone')
+        self.focused.append(identifier)
 
     def existing(self, identifiers, deadline=None):
         if self.query_fail:
@@ -54,15 +57,60 @@ class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix='pdfterm-test-', dir='/tmp')
         self.path = self.directory.name + '/launch.sock'
+        self.token = 'a' * 64
+        self.token_path = Path(self.directory.name) / 'launch.token'
+        self.token_path.write_text(self.token)
+        self.token_path.chmod(0o600)
         self.windows = Windows()
-        self.bridge = Bridge(self.path, ['ssh', 'configured-host'], self.windows)
+        self.bridge = Bridge(self.path, ['ssh', 'configured-host'], self.windows, self.token)
+        self.forward_listener = socket.socket()
+        self.forward_listener.bind(('127.0.0.1', 0))
+        self.forward_listener.listen()
+        self.forward_listener.settimeout(0.1)
+        self.forward_stop = threading.Event()
+        self.forward_thread = threading.Thread(target=self._accept_forward, daemon=True)
+        self.forward_thread.start()
         self.addCleanup(self.directory.cleanup)
         self.addCleanup(self.bridge.close)
+        self.addCleanup(self.close_forward)
 
-    def request(self, payload):
+    def _accept_forward(self):
+        while not self.forward_stop.is_set():
+            try:
+                client, _ = self.forward_listener.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(target=self._relay_forward, args=(client,), daemon=True).start()
+
+    def _relay_forward(self, client):
+        try:
+            with client, socket.socket(socket.AF_UNIX) as backend:
+                backend.connect(self.path)
+                with selectors.DefaultSelector() as pending:
+                    pending.register(client, selectors.EVENT_READ, backend)
+                    pending.register(backend, selectors.EVENT_READ, client)
+                    while pending.get_map():
+                        for key, _ in pending.select(1):
+                            data = key.fileobj.recv(4096)
+                            if not data:
+                                pending.unregister(key.fileobj)
+                                key.data.shutdown(socket.SHUT_WR)
+                            else:
+                                key.data.sendall(data)
+        except OSError:
+            pass
+
+    def close_forward(self):
+        self.forward_stop.set()
+        self.forward_listener.close()
+        self.forward_thread.join(timeout=1)
+
+    def request(self, payload, authenticated=True):
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(6)
             client.connect(self.path)
+            if isinstance(payload, dict):
+                payload = {**payload, **({'token': self.token} if authenticated else {})}
             launching = isinstance(payload, dict) and payload.get('action') == 'launch'
             client.sendall(payload if isinstance(payload, bytes)
                            else json.dumps(payload).encode() + (b'\n' if launching else b''))
@@ -96,7 +144,11 @@ class LauncherTests(unittest.TestCase):
         script.write_text('vim.opt.runtimepath:prepend(' + json.dumps(root) + ')\n' + code)
         result = subprocess.run(
             ['nvim', '--headless', '-u', 'NONE', '-l', str(script)],
-            env={**os.environ, 'PDFTERM_LAUNCH_SOCKET': self.path},
+            env={
+                **os.environ,
+                'PDFTERM_LAUNCH_SOCKET': f'tcp://127.0.0.1:{self.forward_listener.getsockname()[1]}',
+                'PDFTERM_LAUNCH_TOKEN_FILE': str(self.token_path),
+            },
             capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, '', result.stderr)
@@ -245,7 +297,11 @@ error('editor did not exit during launch')
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(2)
             client.connect(self.path)
-            client.sendall(b'{"action":"launch","argv":["viewer","paper.pdf"]}\n')
+            client.sendall(json.dumps({
+                'action': 'launch',
+                'argv': ['viewer', 'paper.pdf'],
+                'token': self.token,
+            }).encode() + b'\n')
             reply = json.loads(client.recv(4096))
             self.assertTrue(reply['ok'])
             self.assertIn(reply['id'], self.windows.live)
@@ -269,7 +325,11 @@ error('editor did not exit during launch')
             self.nvim("""
 local count, result = 0, nil
 require('pdfterm.socket').request(vim.env.PDFTERM_LAUNCH_SOCKET,
-  vim.json.encode({ action = 'launch', argv = { 'viewer', 'paper.pdf' } }),
+  vim.json.encode({
+    action = 'launch',
+    argv = { 'viewer', 'paper.pdf' },
+    token = vim.fn.readfile(vim.env.PDFTERM_LAUNCH_TOKEN_FILE)[1],
+  }),
   function(error, _, reply)
     count = count + 1
     assert(error and error:find('timed out'), tostring(error))
@@ -299,6 +359,31 @@ vim.cmd('qa!')
         finally:
             self.bridge.control.release()
 
+    def test_token_authentication_and_lua_focus_use_loopback_tcp(self):
+        for action in ({'action': 'focus', 'id': 'source'},
+                       {'action': 'launch', 'argv': ['viewer', 'paper.pdf']}):
+            reply = self.request(action, authenticated=False)
+            self.assertFalse(reply['ok'])
+            self.assertIn('unauthorized', reply['error'])
+        bad_token = json.dumps({
+            'action': 'focus',
+            'id': 'source',
+            'token': '0' * 64,
+        }).encode()
+        self.assertFalse(self.request(bad_token)['ok'])
+        self.assertEqual(self.windows.focused, [])
+        self.assertEqual(self.windows.serial, 0)
+        self.nvim("""
+local focused
+require('pdfterm.ssh').focus({ id = 'source' }, function(result)
+  assert(result.code == 0, result.stderr)
+  focused = true
+end)
+assert(vim.wait(1000, function() return focused end))
+vim.cmd('qa!')
+""")
+        self.assertEqual(self.windows.focused, ['editor'])
+
     def test_malformed_requests_do_not_kill_listener_or_control_unowned_windows(self):
         for payload in (b'{', [], {'action': 'close', 'id': []}, {'action': 'close', 'id': 'editor'},
                         {'action': 'launch', 'argv': ['viewer', None]}, b' ' * 32769):
@@ -324,6 +409,43 @@ vim.cmd('qa!')
         self.assertTrue(self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})['ok'])
         self.bridge.close()
         self.assertFalse(self.windows.live)
+
+    def test_forward_bind_parser_accepts_loopback_and_rejects_wildcard(self):
+        parse = launcher['forwarding_bind_addresses']
+        linux, expected = parse(
+            'Linux', 'LISTEN 0 128 127.0.0.1:4567 0.0.0.0:*', 4567
+        )
+        self.assertEqual(linux, [expected])
+        wildcard, expected = parse(
+            'Linux', 'LISTEN 0 128 0.0.0.0:4567 0.0.0.0:*', 4567
+        )
+        self.assertNotEqual(wildcard, [expected])
+        darwin, expected = parse(
+            'Darwin', 'tcp4 0 0 127.0.0.1.4567 *.* LISTEN', 4567
+        )
+        self.assertEqual(darwin, [expected])
+        wildcard, expected = parse(
+            'Darwin', 'tcp4 0 0 *.4567 *.* LISTEN', 4567
+        )
+        self.assertNotEqual(wildcard, [expected])
+
+    def test_dynamic_forward_parses_openssh_stdout(self):
+        parse = launcher['allocated_forward_port']
+        self.assertEqual(parse('58780'), 58780)
+        for reply in ('0', '65536', 'Allocated port 58780', '58780\nunexpected'):
+            with self.subTest(reply=reply), self.assertRaises(RuntimeError):
+                parse(reply)
+
+
+    def test_dynamic_forward_cancellation_reuses_original_specification(self):
+        ssh = ['ssh', '-o', 'ControlPath=/tmp/master', 'remote']
+        specification = '127.0.0.1:0:/tmp/launch.sock'
+        cancel = launcher['forwarding_control_args'](ssh, 'cancel', specification)
+        self.assertEqual(
+            cancel,
+            ['ssh', '-o', 'ControlPath=/tmp/master', '-O', 'cancel',
+             '-R', specification, 'remote'],
+        )
 
     def test_helpers_enforce_deadline_and_output_cap(self):
         with self.assertRaises(subprocess.TimeoutExpired):
