@@ -160,11 +160,15 @@ pub(crate) struct Reply {
     pub ok: bool,
     pub error: Option<String>,
 }
-
+#[derive(Debug)]
+pub enum ViewerRequest {
+    Forward(ForwardRequest),
+    Screenshot(PathBuf),
+}
 pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One terminal reply per connection, including unwinding/normal viewer shutdown.
-pub(crate) struct ForwardReply(Option<UnixStream>);
+pub struct ForwardReply(Option<UnixStream>);
 
 impl ForwardReply {
     pub fn new(stream: UnixStream) -> Self {
@@ -220,9 +224,7 @@ impl ForwardReply {
 
 impl Drop for ForwardReply {
     fn drop(&mut self) {
-        self.finish(Some(
-            "viewer stopped before forward frame submission".into(),
-        ));
+        self.finish(Some("viewer stopped before request completion".into()));
     }
 }
 
@@ -249,6 +251,48 @@ pub fn forward(path: &str, request: &ForwardRequest) -> io::Result<()> {
         ))
     }
 }
+fn validate_screenshot_path(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "screenshot output path must be absolute",
+        ));
+    }
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("screenshot output already exists: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+pub fn screenshot(socket: &str, path: &Path) -> io::Result<()> {
+    validate_screenshot_path(path)?;
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_read_timeout(Some(FORWARD_TIMEOUT + Duration::from_secs(1)))?;
+    serde_json::to_writer(
+        &mut stream,
+        &serde_json::json!({"type": "screenshot", "path": path}),
+    )?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = String::new();
+    stream.take(4097).read_to_string(&mut response)?;
+    if response.len() > 4096 {
+        return Err(io::Error::other("screenshot reply exceeds 4096 bytes"));
+    }
+    let reply: Reply = serde_json::from_str(&response)?;
+    if reply.ok {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            reply
+                .error
+                .unwrap_or_else(|| "screenshot request rejected".into()),
+        ))
+    }
+}
 
 /// Incremental request reads. A slow client never sleeps on the event thread.
 struct Incoming {
@@ -271,7 +315,7 @@ impl Incoming {
                     if self.bytes.len() + n > 4096 {
                         return Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "forward request exceeds 4096 bytes",
+                            "viewer request exceeds 4096 bytes",
                         )));
                     }
                     self.bytes.extend_from_slice(&buffer[..n]);
@@ -284,7 +328,7 @@ impl Incoming {
         (Instant::now() >= self.deadline).then(|| {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "forward request did not reach EOF within 100ms",
+                "viewer request did not reach EOF within 100ms",
             ))
         })
     }
@@ -320,8 +364,7 @@ impl ForwardListener {
         }
         Ok(descriptor.revents & libc::POLLIN != 0)
     }
-    pub fn poll(&mut self) -> io::Result<Vec<(io::Result<ForwardRequest>, ForwardReply)>> {
-        // Bound acceptance and work even when local clients flood the socket.
+    pub fn poll(&mut self) -> io::Result<Vec<(io::Result<ViewerRequest>, ForwardReply)>> {
         for _ in self.clients.len()..16 {
             match self.listener.socket.accept() {
                 Ok((stream, _)) => {
@@ -332,8 +375,8 @@ impl ForwardListener {
                         deadline: Instant::now() + Duration::from_millis(100),
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
             }
         }
         let mut ready = Vec::new();
@@ -341,10 +384,26 @@ impl ForwardListener {
         while index < self.clients.len() {
             if let Some(result) = self.clients[index].poll() {
                 let client = self.clients.remove(index);
-                ready.push((
-                    result.and_then(|payload| parse_forward_request(&payload)),
-                    ForwardReply::new(client.stream),
-                ));
+                let request = result.and_then(|payload| {
+                    let value: serde_json::Value = serde_json::from_str(&payload)?;
+                    if value.get("type").and_then(serde_json::Value::as_str) == Some("screenshot") {
+                        let path = value
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "screenshot request has no path",
+                                )
+                            })?;
+                        let path = PathBuf::from(path);
+                        validate_screenshot_path(&path)?;
+                        Ok(ViewerRequest::Screenshot(path))
+                    } else {
+                        parse_forward_request(&payload).map(ViewerRequest::Forward)
+                    }
+                });
+                ready.push((request, ForwardReply::new(client.stream)));
             } else {
                 index += 1;
             }

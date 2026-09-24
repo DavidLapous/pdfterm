@@ -9,6 +9,7 @@ mod navigation;
 pub mod pdf;
 pub mod process;
 pub mod recent;
+pub mod screenshot;
 pub mod synctex;
 pub mod terminal;
 pub mod theme;

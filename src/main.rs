@@ -44,6 +44,10 @@ struct Cli {
     /// Named viewer/editor session sharing the same configuration.
     #[arg(long)]
     session: Option<String>,
+
+    /// Save the running viewer's visible PDF viewport as a PNG.
+    #[arg(long, conflicts_with_all = ["path", "forward_search", "synctex_view"])]
+    screenshot: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -84,6 +88,25 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+    if let Some(path) = cli.screenshot.as_deref() {
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let socket = config
+                .forward_socket()
+                .ok_or("forward_socket is disabled")?;
+            pdfterm::ipc::screenshot(socket, path)?;
+            Ok(())
+        })();
+        return match result {
+            Ok(()) => {
+                println!("{}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("pdfterm: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if let Some(source) = cli.forward_search.as_ref().or(cli.synctex_view.as_ref()) {
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {

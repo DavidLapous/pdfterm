@@ -1,3 +1,4 @@
+use crate::screenshot::{Badge as ScreenshotBadge, Page as ScreenshotPage, Rect as ScreenshotRect};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -33,7 +34,7 @@ use crate::navigation::{
 };
 use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
-    RenderKey, RenderRequest, RenderWorker, SearchPageMatch, WorkerMessage,
+    RenderKey, RenderRequest, RenderWorker, SearchPageMatch, VisibleMatch, WorkerMessage,
 };
 use crate::synctex::{ForwardRequest, PdfRevision};
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
@@ -159,6 +160,30 @@ pub fn run(
     loop {
         while let Ok(message) = app.worker.try_recv() {
             match message {
+                WorkerMessage::VisibleMatches {
+                    document_id,
+                    request_id,
+                    revision,
+                    matches,
+                } => app.receive_visible_matches(
+                    document_id,
+                    request_id,
+                    revision,
+                    matches,
+                    &mut output,
+                )?,
+                WorkerMessage::VisibleMatchesError {
+                    document_id,
+                    request_id,
+                    revision,
+                    error,
+                } => app.receive_visible_matches_error(
+                    document_id,
+                    request_id,
+                    revision,
+                    error,
+                    &mut output,
+                )?,
                 WorkerMessage::Frame(frame) => app.receive_frame(frame, &mut output)?,
                 WorkerMessage::Error(error) => {
                     app.finish_forward(Some(format!("render failed: {error}")));
@@ -329,7 +354,13 @@ struct App {
     link_picker_geometry: LinkPickerGeometry,
     show_performance: bool,
     theme: Palette,
+    label_input: String,
     themes: Vec<(String, Palette)>,
+    label_query: Option<String>,
+    label_request_id: u64,
+    label_matches: Vec<LabeledMatch>,
+    label_overlay_id: Option<u32>,
+    label_overlay: Option<Vec<u8>>,
     theme_index: usize,
 }
 
@@ -719,6 +750,10 @@ struct VisiblePage {
     top: u16,
     image_id: u32,
 }
+struct LabeledMatch {
+    visible: VisibleMatch,
+    label: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Axis {
@@ -847,7 +882,13 @@ impl App {
             show_performance: false,
             theme: defaults.theme,
             themes: defaults.themes,
+            label_input: String::new(),
             theme_index: defaults.theme_index,
+            label_query: None,
+            label_request_id: 1,
+            label_matches: Vec::new(),
+            label_overlay_id: None,
+            label_overlay: None,
             viewer: defaults.viewer,
         }
     }
@@ -1020,6 +1061,530 @@ impl App {
             SetForegroundColor(theme.fg)
         )?;
         output.flush()
+    }
+    fn begin_label_mode(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.worker.cancel_visible();
+        self.clear_label_overlay(output)?;
+        self.label_query = Some(String::new());
+        self.label_input.clear();
+        self.label_matches.clear();
+        self.label_request_id = self.label_request_id.wrapping_add(1).max(1);
+        self.draw_label_status(output)
+    }
+
+    fn handle_label_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<(), AppError> {
+        if let Some(index) = numbered_tab_index(key) {
+            self.select_tab(index, output)?;
+            return Ok(());
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.worker.cancel_visible();
+                self.label_query = None;
+                self.label_input.clear();
+                self.label_matches.clear();
+                self.clear_label_overlay(output)?;
+                self.redraw_current(output)?;
+            }
+            KeyCode::Backspace if !self.label_input.is_empty() => {
+                self.label_input.pop();
+                self.draw_label_status(output)?;
+            }
+            KeyCode::Backspace => {
+                if let Some(query) = self.label_query.as_mut() {
+                    query.pop();
+                }
+                self.label_matches.clear();
+                self.clear_label_overlay(output)?;
+                self.label_request_id = self.label_request_id.wrapping_add(1).max(1);
+                self.refresh_visible_matches(output)?;
+                self.draw_label_status(output)?;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.zoom_in(output)?
+            }
+            KeyCode::Char('-') | KeyCode::Char('_')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.zoom_out(output)?
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let candidate = format!("{}{}", self.label_input, character);
+                if let Some(target) = self
+                    .label_matches
+                    .iter()
+                    .find(|item| item.label == candidate)
+                {
+                    self.worker.cancel_visible();
+                    let target = (target.visible.key, target.visible.hit);
+                    self.label_query = None;
+                    self.label_input.clear();
+                    self.label_matches.clear();
+                    self.clear_label_overlay(output)?;
+                    self.begin_inverse_at(target.0, target.1, output)?;
+                } else if self
+                    .label_matches
+                    .iter()
+                    .any(|item| item.label.starts_with(&candidate))
+                {
+                    self.label_input = candidate;
+                    self.draw_label_status(output)?;
+                } else {
+                    self.label_input.clear();
+                    if let Some(query) = self.label_query.as_mut().filter(|query| query.len() < 256)
+                    {
+                        query.push(character);
+                    }
+                    self.label_matches.clear();
+                    self.clear_label_overlay(output)?;
+                    self.refresh_visible_matches(output)?;
+                    self.draw_label_status(output)?;
+                }
+            }
+            KeyCode::Down => self.move_view(Axis::Vertical, true, false, true, output)?,
+            KeyCode::Up => self.move_view(Axis::Vertical, false, false, true, output)?,
+            KeyCode::PageDown => self.move_view(Axis::Vertical, true, true, true, output)?,
+            KeyCode::PageUp => self.move_view(Axis::Vertical, false, true, true, output)?,
+            KeyCode::Right => self.move_view(Axis::Horizontal, true, false, true, output)?,
+            KeyCode::Left => self.move_view(Axis::Horizontal, false, false, true, output)?,
+            KeyCode::Tab => self.switch_tab(1, output)?,
+            KeyCode::BackTab => self.switch_tab(-1, output)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn draw_label_status(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let viewport = self.viewport()?;
+        let query = self.label_query.as_deref().unwrap_or_default();
+        let status = format!(
+            "find: {query}  label: {}  (type to search, label to jump, esc to cancel)",
+            self.label_input
+        );
+        self.draw_status(output, viewport, &status)?;
+        Ok(())
+    }
+
+    fn refresh_visible_matches(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.worker.cancel_visible();
+        self.label_input.clear();
+        self.label_matches.clear();
+        self.clear_label_overlay(output)?;
+        let request_id = self.label_request_id;
+        self.label_request_id = request_id.wrapping_add(1).max(1);
+        let Some(query) = self.label_query.clone().filter(|query| !query.is_empty()) else {
+            return Ok(());
+        };
+        let viewport = self.viewport()?;
+        let document_id = self.tab().document_id;
+        let current_key = self.render_key(viewport);
+        let continuous = self.viewer.continuous_scroll
+            && self.link_picker.is_none()
+            && self.search_picker.is_none();
+        let visible = if continuous {
+            self.visible_pages
+                .iter()
+                .filter(|page| same_render_view(page.frame.key, current_key))
+                .map(|page| {
+                    (
+                        page.frame.key,
+                        page.frame.revision,
+                        page.frame.width,
+                        page.frame.height,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.tab()
+                .cache
+                .get(&current_key)
+                .map(|frame| vec![(current_key, frame.revision, frame.width, frame.height)])
+                .unwrap_or_default()
+        };
+        let Some((_, revision, _, _)) = visible.first().copied() else {
+            return Ok(());
+        };
+        if visible
+            .iter()
+            .any(|(_, candidate_revision, _, _)| *candidate_revision != revision)
+        {
+            return Ok(());
+        }
+        let keys = visible
+            .into_iter()
+            .map(|(key, _, width, height)| (key, width, height))
+            .collect::<Vec<_>>();
+        self.worker
+            .find_visible(document_id, request_id, revision, query, keys)
+            .map_err(AppError::Renderer)?;
+        self.draw_label_status(output)
+    }
+
+    fn receive_visible_matches(
+        &mut self,
+        document_id: DocumentId,
+        request_id: u64,
+        revision: crate::synctex::DocumentRevision,
+        mut matches: Vec<VisibleMatch>,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if self.label_query.is_none()
+            || document_id != self.tab().document_id
+            || request_id != self.label_request_id.wrapping_sub(1).max(1)
+        {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let current_key = self.render_key(viewport);
+        let continuous = self.viewer.continuous_scroll
+            && self.link_picker.is_none()
+            && self.search_picker.is_none();
+        let visible = if continuous {
+            self.visible_pages
+                .iter()
+                .filter(|page| same_render_view(page.frame.key, current_key))
+                .map(|page| {
+                    (
+                        page.frame.key,
+                        page.frame.revision,
+                        page.placement,
+                        page.top,
+                        page.frame.width,
+                        page.frame.height,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.tab()
+                .cache
+                .get(&current_key)
+                .map(|frame| {
+                    vec![(
+                        current_key,
+                        frame.revision,
+                        viewport.place(
+                            frame.width,
+                            frame.height,
+                            self.tab().scroll_x,
+                            self.tab().scroll_y,
+                        ),
+                        viewport.top,
+                        frame.width,
+                        frame.height,
+                    )]
+                })
+                .unwrap_or_default()
+        };
+        if visible.is_empty()
+            || visible
+                .iter()
+                .any(|(_, frame_revision, _, _, _, _)| *frame_revision != revision)
+            || matches.iter().any(|matched| {
+                !visible.iter().any(|(key, frame_revision, _, _, _, _)| {
+                    *key == matched.key && *frame_revision == revision
+                })
+            })
+        {
+            return Ok(());
+        }
+        let cw = (u32::from(viewport.pixel_width) / u32::from(viewport.columns).max(1)).max(1);
+        let ch = (u32::from(viewport.pixel_height) / u32::from(viewport.rows).max(1)).max(1);
+        matches.retain_mut(|matched| {
+            visible
+                .iter()
+                .find(|(key, _, _, _, _, _)| *key == matched.key)
+                .and_then(|(_, _, placement, top, width, height)| {
+                    visible_match_points(
+                        &matched.rects,
+                        *placement,
+                        *top,
+                        *width,
+                        *height,
+                        viewport,
+                        (cw, ch),
+                    )
+                })
+                .is_some_and(|(hit, anchor)| {
+                    matched.hit = hit;
+                    matched.anchor = anchor;
+                    true
+                })
+        });
+        let continuations = matches
+            .iter()
+            .filter_map(|matched| matched.next_char)
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let mut alphabet = "asdfghjklqwertyuiopzxcvbnm"
+            .chars()
+            .filter(|character| !continuations.contains(&character.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
+        alphabet.extend(
+            "ASDFGHJKLQWERTYUIOPZXCVBNM"
+                .chars()
+                .filter(|character| !continuations.contains(&character.to_ascii_lowercase())),
+        );
+        alphabet.extend(
+            "!@#$%^&*()[]{};:,.?/\\|"
+                .chars()
+                .filter(|character| !continuations.contains(&character.to_ascii_lowercase())),
+        );
+        let next_label_char = (matches.len() == 1)
+            .then(|| matches[0].next_char)
+            .flatten()
+            .filter(|character| character.is_ascii_alphanumeric() || *character == '_');
+        if alphabet.is_empty() && next_label_char.is_none() && !matches.is_empty() {
+            self.label_matches.clear();
+            self.clear_label_overlay(output)?;
+            self.draw_status(
+                output,
+                self.viewport()?,
+                "matches found, but no label keys avoid query continuations",
+            )?;
+            return Ok(());
+        }
+        let labels = if matches.len() == 1 {
+            vec![
+                next_label_char
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| alphabet[0].to_string()),
+            ]
+        } else {
+            let width = (0..)
+                .find(|width| alphabet.len().saturating_pow(*width as u32) >= matches.len())
+                .unwrap_or(1);
+            (0..matches.len())
+                .map(|mut index| {
+                    let mut label = vec![alphabet[0]; width];
+                    for slot in label.iter_mut().rev() {
+                        *slot = alphabet[index % alphabet.len()];
+                        index /= alphabet.len();
+                    }
+                    label.into_iter().collect()
+                })
+                .collect()
+        };
+        self.label_matches = matches
+            .into_iter()
+            .zip(labels)
+            .map(|(visible, label)| LabeledMatch { visible, label })
+            .collect();
+        self.draw_label_overlay(output)?;
+        self.draw_label_status(output)
+    }
+    fn receive_visible_matches_error(
+        &mut self,
+        document_id: DocumentId,
+        request_id: u64,
+        revision: crate::synctex::DocumentRevision,
+        error: String,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if self.label_query.is_none()
+            || document_id != self.tab().document_id
+            || request_id != self.label_request_id.wrapping_sub(1).max(1)
+        {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let current_key = self.render_key(viewport);
+        let visible_revisions = if self.viewer.continuous_scroll
+            && self.link_picker.is_none()
+            && self.search_picker.is_none()
+        {
+            self.visible_pages
+                .iter()
+                .filter(|page| same_render_view(page.frame.key, current_key))
+                .map(|page| page.frame.revision)
+                .collect::<Vec<_>>()
+        } else {
+            self.tab()
+                .cache
+                .get(&current_key)
+                .map(|frame| vec![frame.revision])
+                .unwrap_or_default()
+        };
+        if visible_revisions.is_empty()
+            || visible_revisions.iter().any(|current| *current != revision)
+        {
+            return Ok(());
+        }
+        self.label_matches.clear();
+        self.label_input.clear();
+        self.clear_label_overlay(output)?;
+        self.draw_status(output, viewport, &format!("visible search: {error}"))?;
+        Ok(())
+    }
+
+    fn clear_label_overlay(&mut self, output: &mut impl Write) -> io::Result<()> {
+        if let Some(id) = self.label_overlay_id.take() {
+            kitty::delete_image(output, id)?;
+        }
+        self.label_overlay = None;
+        Ok(())
+    }
+
+    fn draw_label_overlay(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.clear_label_overlay(output)?;
+        let viewport = self.viewport()?;
+        let mut rects = Vec::new();
+        let mut badges = Vec::new();
+        let cw = (u32::from(viewport.pixel_width) / u32::from(viewport.columns).max(1)).max(1);
+        let ch = (u32::from(viewport.pixel_height) / u32::from(viewport.rows).max(1)).max(1);
+        for labeled in &self.label_matches {
+            let page = self
+                .visible_pages
+                .iter()
+                .find(|page| page.frame.key == labeled.visible.key)
+                .map(|page| {
+                    (
+                        page.placement,
+                        page.top,
+                        page.frame.width,
+                        page.frame.height,
+                    )
+                })
+                .or_else(|| {
+                    self.tab().cache.get(&labeled.visible.key).map(|frame| {
+                        (
+                            viewport.place(
+                                frame.width,
+                                frame.height,
+                                self.tab().scroll_x,
+                                self.tab().scroll_y,
+                            ),
+                            viewport.top,
+                            frame.width,
+                            frame.height,
+                        )
+                    })
+                });
+            let Some((placement, top, frame_width, frame_height)) = page else {
+                continue;
+            };
+            let crop = placement.crop.unwrap_or(crate::kitty::Crop {
+                x: 0,
+                y: 0,
+                width: frame_width,
+                height: frame_height,
+            });
+            if crop.width == 0 || crop.height == 0 {
+                continue;
+            }
+            let screen_point = |point: (u32, u32)| {
+                if point.0 < crop.x
+                    || point.0 >= crop.x.saturating_add(crop.width)
+                    || point.1 < crop.y
+                    || point.1 >= crop.y.saturating_add(crop.height)
+                {
+                    return None;
+                }
+                let native = placement.native_cell.is_some();
+                let x = u32::from(placement.left) * cw
+                    + if native {
+                        point.0 - crop.x
+                    } else {
+                        (point.0 - crop.x) * u32::from(placement.columns) * cw / crop.width
+                    };
+                let page_y = u32::from(top.saturating_sub(viewport.top)) * ch;
+                let y = if native {
+                    page_y + placement.offset_y + (point.1 - crop.y)
+                } else {
+                    page_y + (point.1 - crop.y) * u32::from(placement.rows) * ch / crop.height
+                };
+                Some((x, y))
+            };
+            let anchor_position =
+                screen_point(labeled.visible.anchor).or_else(|| screen_point(labeled.visible.hit));
+            let mut badge_position = None;
+            for rect in &labeled.visible.rects {
+                let x0 = rect.left.max(crop.x);
+                let x1 = rect.right.min(crop.x.saturating_add(crop.width));
+                let y0 = rect.top.max(crop.y);
+                let y1 = rect.bottom.min(crop.y.saturating_add(crop.height));
+                if x0 >= x1 || y0 >= y1 {
+                    continue;
+                }
+                let native = placement.native_cell.is_some();
+                let dst_x = u32::from(placement.left) * cw;
+                let dst_y = u32::from(top.saturating_sub(viewport.top)) * ch;
+                let pixel_x = dst_x
+                    + if native {
+                        x0 - crop.x
+                    } else {
+                        (x0 - crop.x) * u32::from(placement.columns) * cw / crop.width
+                    };
+                let pixel_y = if native {
+                    dst_y + placement.offset_y + (y0 - crop.y)
+                } else {
+                    dst_y + (y0 - crop.y) * u32::from(placement.rows) * ch / crop.height
+                };
+                let width = if native {
+                    x1 - x0
+                } else {
+                    (x1 - x0) * u32::from(placement.columns) * cw / crop.width
+                };
+                let height = if native {
+                    y1 - y0
+                } else {
+                    (y1 - y0) * u32::from(placement.rows) * ch / crop.height
+                };
+                if width > 0 && height > 0 {
+                    rects.push(ScreenshotRect {
+                        x: pixel_x,
+                        y: pixel_y,
+                        width,
+                        height,
+                        color: [255, 215, 0, 96],
+                    });
+                    badge_position = Some((pixel_x.saturating_add(width), pixel_y));
+                }
+            }
+            if let Some((x, rect_y)) = badge_position {
+                let y = anchor_position.map_or(rect_y, |(_, anchor_y)| anchor_y);
+                let badge_width = (labeled.label.chars().count() as u32)
+                    .saturating_mul(8)
+                    .saturating_add(4);
+                let x = x.min(u32::from(viewport.pixel_width).saturating_sub(badge_width));
+                let y = y.min(u32::from(viewport.pixel_height).saturating_sub(10));
+                badges.push(ScreenshotBadge {
+                    x,
+                    y,
+                    text: &labeled.label,
+                    foreground: [0, 0, 0],
+                    background: [255, 215, 0],
+                });
+            }
+        }
+        let rgba = crate::screenshot::overlay(viewport, &rects, &badges)?;
+        let compressed = kitty::compress_rgba(&rgba)?;
+        let id = self.next_image_id;
+        self.next_image_id = id.wrapping_add(1).max(1);
+        let placement = Placement {
+            image_id: id,
+            columns: viewport.columns,
+            rows: viewport.rows,
+            offset_y: 0,
+            z_index: PAGE_IMAGE_Z_INDEX + 10,
+            crop: None,
+        };
+        execute!(output, MoveTo(0, viewport.top))?;
+        kitty::transmit_compressed_rgba(
+            output,
+            &compressed,
+            u32::from(viewport.pixel_width),
+            u32::from(viewport.pixel_height),
+            placement,
+        )?;
+        self.label_overlay_id = Some(id);
+        self.label_overlay = Some(rgba);
+        Ok(())
     }
 
     fn begin_search(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -1386,7 +1951,7 @@ impl App {
             .poll()?;
         for (result, mut reply) in ready {
             match result {
-                Ok(request) => {
+                Ok(crate::ipc::ViewerRequest::Forward(request)) => {
                     self.cancel_forward("forward search superseded by a newer request")?;
                     self.navigation.inverse.take();
                     self.navigation.forward = Some(PendingForward {
@@ -1395,6 +1960,20 @@ impl App {
                         deadline: Instant::now() + crate::ipc::FORWARD_TIMEOUT,
                         stage: ForwardStage::AwaitingDocument,
                     });
+                }
+                Ok(crate::ipc::ViewerRequest::Screenshot(path)) => {
+                    let result = self.save_screenshot(&path);
+                    let error = result.as_ref().err().map(ToString::to_string);
+                    reply.finish(error.clone());
+                    if let Some(error) = error {
+                        self.draw_status(
+                            output,
+                            self.viewport()?,
+                            &format!("screenshot: {error}"),
+                        )?;
+                    } else {
+                        self.draw_status(output, self.viewport()?, "screenshot saved")?;
+                    }
                 }
                 Err(error) => {
                     reply.finish(Some(error.to_string()));
@@ -1407,6 +1986,77 @@ impl App {
             }
         }
         Ok(())
+    }
+    fn save_screenshot(&self, path: &Path) -> io::Result<()> {
+        if self.link_picker.is_some() || self.search_picker.is_some() {
+            return Err(io::Error::other(
+                "screenshot is unavailable while a link or search picker is open",
+            ));
+        }
+        let viewport = self
+            .viewport()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let current_key = self.render_key(viewport);
+        let revision = self.tab().revision;
+        if self.missing_visible_page.is_some() {
+            return Err(io::Error::other(
+                "viewer frame is still rendering; retry the screenshot",
+            ));
+        }
+        let mut pages = self
+            .visible_pages
+            .iter()
+            .filter(|page| {
+                page.frame.revision.pdf == revision && same_render_view(page.frame.key, current_key)
+            })
+            .map(|page| ScreenshotPage {
+                frame: &page.frame,
+                placement: page.placement,
+                row: page.top.saturating_sub(viewport.top),
+            })
+            .collect::<Vec<_>>();
+        if !pages.is_empty() && !pages.iter().any(|page| page.frame.key == current_key) {
+            return Err(io::Error::other(
+                "viewer frame is still rendering; retry the screenshot",
+            ));
+        }
+        if pages.is_empty()
+            && let Some(frame) = self
+                .tab()
+                .cache
+                .get(&current_key)
+                .filter(|frame| frame.revision.pdf == revision)
+        {
+            pages.push(ScreenshotPage {
+                frame,
+                placement: viewport.place(
+                    frame.width,
+                    frame.height,
+                    self.tab().scroll_x,
+                    self.tab().scroll_y,
+                ),
+                row: 0,
+            });
+        }
+        if pages.is_empty() {
+            return Err(io::Error::other(
+                "viewer frame is still rendering; retry the screenshot",
+            ));
+        }
+        let empty_overlay;
+        let overlay = if let Some(overlay) = self.label_overlay.as_deref() {
+            overlay
+        } else {
+            empty_overlay = crate::screenshot::overlay(viewport, &[], &[])?;
+            &empty_overlay
+        };
+        crate::screenshot::save(
+            path,
+            viewport,
+            &pages,
+            overlay,
+            terminal_color_rgb(self.theme.bg),
+        )
     }
 
     fn finish_forward(&mut self, error: Option<String>) {
@@ -2339,11 +2989,18 @@ impl App {
             self.handle_goto_key(key, output)?;
             return Ok(false);
         }
+        if self.label_query.is_some() {
+            self.handle_label_key(key, output)?;
+            return Ok(false);
+        }
         if let Some(index) = numbered_tab_index(key) {
             self.select_tab(index, output)?;
             return Ok(false);
         }
         match key.code {
+            KeyCode::Char('X') if self.session.pending_open.is_none() && !self.link_mode => {
+                self.begin_label_mode(output)?
+            }
             KeyCode::Char('?') => self.open_help(output)?,
             KeyCode::Char('q') if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Char('q') => return self.close_current(output),
@@ -2742,6 +3399,13 @@ impl App {
         self.smooth_scroll_remaining = 0;
         self.missing_visible_page = None;
         self.status_line.clear();
+        if self.label_query.is_some() {
+            self.worker.cancel_visible();
+            self.clear_label_overlay(output)?;
+            self.label_matches.clear();
+            self.label_request_id = self.label_request_id.wrapping_add(1).max(1);
+            self.label_input.clear();
+        }
         if self.viewer.set_window_title && self.title_document != Some(self.tab().document_id) {
             let title: String = self
                 .tab()
@@ -2922,6 +3586,9 @@ impl App {
         synchronized_output(output, |output| {
             self.draw_frame_unsynchronized(frame, viewport, output)
         })?;
+        if self.label_query.is_some() {
+            self.refresh_visible_matches(output)?;
+        }
         let submitted = self.navigation.flash.as_ref().and_then(|flash| {
             let matches = |rendered: &Frame| {
                 rendered.key.document_id == flash.document_id
@@ -3503,7 +4170,6 @@ impl App {
             return Ok(());
         };
         let key = frame.key;
-        let revision = frame.revision;
         let Some(cell) = mouse
             .row
             .checked_sub(image_top)
@@ -3513,20 +4179,45 @@ impl App {
         };
         let pixel_x = cell.x + cell.width / 2;
         let pixel_y = cell.y + cell.height / 2;
-        let (document_id, page) = (key.document_id, key.page);
+        self.begin_inverse_at(key, (pixel_x, pixel_y), output)
+    }
+    fn begin_inverse_at(
+        &mut self,
+        key: RenderKey,
+        pixel: (u32, u32),
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let frame = self
+            .visible_pages
+            .iter()
+            .find(|page| page.frame.key == key)
+            .map(|page| Arc::clone(&page.frame))
+            .or_else(|| self.tab().cache.get(&key).cloned());
+        let Some(frame) = frame else {
+            self.draw_status(
+                output,
+                self.viewport()?,
+                "label target is no longer visible",
+            )?;
+            return Ok(());
+        };
         let request_id = self.navigation.next_request_id;
         self.navigation.next_request_id = request_id.wrapping_add(1);
         self.navigation.inverse = Some(PendingInverse {
-            revision,
+            revision: frame.revision,
             operation: crate::process::Operation::default(),
             stage: InverseStage::HitTest,
-            document_id,
-            page,
+            document_id: key.document_id,
+            page: key.page,
             request_id,
         });
         self.worker
-            .page_point(revision, request_id, pixel_x, pixel_y, key);
-        self.draw_status(output, viewport, "inverse search: resolving location...")?;
+            .page_point(frame.revision, request_id, pixel.0, pixel.1, key);
+        self.draw_status(
+            output,
+            self.viewport()?,
+            "inverse search: resolving location...",
+        )?;
         Ok(())
     }
 
@@ -3682,6 +4373,95 @@ fn link_at_cell(
                 .saturating_add(cell_center_y.abs_diff(link_center_y).saturating_pow(2))
         })
         .map(|link| link.target.clone())
+}
+
+fn same_render_view(a: RenderKey, b: RenderKey) -> bool {
+    a.document_id == b.document_id
+        && a.width == b.width
+        && a.height == b.height
+        && a.zoom == b.zoom
+        && a.fit == b.fit
+        && a.invert == b.invert
+        && a.dark_mode_style == b.dark_mode_style
+}
+
+fn visible_match_points(
+    rects: &[crate::pdf::PixelRect],
+    placement: ImagePlacement,
+    top: u16,
+    frame_width: u32,
+    frame_height: u32,
+    viewport: Viewport,
+    cell_size: (u32, u32),
+) -> Option<((u32, u32), (u32, u32))> {
+    let (cell_width, cell_height) = cell_size;
+    let crop = placement.crop.unwrap_or(crate::kitty::Crop {
+        x: 0,
+        y: 0,
+        width: frame_width,
+        height: frame_height,
+    });
+    if crop.width == 0 || crop.height == 0 {
+        return None;
+    }
+    let crop_right = crop.x.saturating_add(crop.width).min(frame_width);
+    let crop_bottom = crop.y.saturating_add(crop.height).min(frame_height);
+    let mut hit = None;
+    let mut anchor = None;
+    for rect in rects {
+        let x0 = rect.left.max(crop.x);
+        let x1 = rect.right.min(crop_right);
+        let y0 = rect.top.max(crop.y);
+        let y1 = rect.bottom.min(crop_bottom);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        let native = placement.native_cell.is_some();
+        let source_width = x1 - x0;
+        let source_height = y1 - y0;
+        let x = u32::from(placement.left) * cell_width
+            + if native {
+                x0 - crop.x
+            } else {
+                (x0 - crop.x) * u32::from(placement.columns) * cell_width / crop.width
+            };
+        let page_y = u32::from(top.saturating_sub(viewport.top)) * cell_height;
+        let y = if native {
+            page_y + placement.offset_y + (y0 - crop.y)
+        } else {
+            page_y + (y0 - crop.y) * u32::from(placement.rows) * cell_height / crop.height
+        };
+        let width = if native {
+            source_width
+        } else {
+            source_width * u32::from(placement.columns) * cell_width / crop.width
+        };
+        let height = if native {
+            source_height
+        } else {
+            source_height * u32::from(placement.rows) * cell_height / crop.height
+        };
+        if width == 0
+            || height == 0
+            || x >= u32::from(viewport.pixel_width)
+            || y >= u32::from(viewport.pixel_height)
+        {
+            continue;
+        }
+        let visible_right = x.saturating_add(width).min(u32::from(viewport.pixel_width));
+        let visible_bottom = y
+            .saturating_add(height)
+            .min(u32::from(viewport.pixel_height));
+        let screen_x = x + (visible_right - x) / 2;
+        let screen_y = y + (visible_bottom - y) / 2;
+        let point = (
+            x0 + (u64::from(screen_x - x) * u64::from(source_width) / u64::from(width)) as u32,
+            y0 + (u64::from(screen_y - y) * u64::from(source_height) / u64::from(height)) as u32,
+        );
+        hit.get_or_insert(point);
+        anchor = Some(point);
+    }
+    hit.zip(anchor)
 }
 
 fn stale_status_row(previous: Option<u16>, current: u16) -> Option<u16> {
@@ -5673,6 +6453,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("+ / -", "zoom in / out"),
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
+        ("X", "find visible PDF text + SyncTeX jump"),
         ("Alt/Option-click", "word jump + focus"),
         ("S", "toggle smooth scroll"),
         ("p", "performance timings"),
@@ -7689,5 +8470,51 @@ mod tests {
         let floating_output = String::from_utf8(floating_output).expect("terminal output");
         assert!(!floating_output.contains("a=p"));
         assert!(!floating_output.contains("a=T"));
+    }
+    #[test]
+    fn visible_match_targets_only_displayed_glyphs() {
+        use crate::pdf::PixelRect;
+
+        let viewport = Viewport {
+            columns: 10,
+            rows: 2,
+            pixel_width: 100,
+            pixel_height: 20,
+            top: 0,
+            status_row: 2,
+        };
+        let placement = ImagePlacement {
+            left: 0,
+            columns: 10,
+            rows: 2,
+            crop: Some(crate::kitty::Crop {
+                x: 0,
+                y: 10,
+                width: 120,
+                height: 20,
+            }),
+            scroll_x: 0,
+            scroll_y: 10,
+            native_cell: Some((10, 10)),
+            offset_y: 0,
+        };
+        let rects = [
+            PixelRect {
+                left: 10,
+                top: 0,
+                right: 20,
+                bottom: 10,
+            },
+            PixelRect {
+                left: 90,
+                top: 20,
+                right: 110,
+                bottom: 30,
+            },
+        ];
+        assert_eq!(
+            super::visible_match_points(&rects, placement, 0, 120, 40, viewport, (10, 10)),
+            Some(((95, 25), (95, 25)))
+        );
     }
 }

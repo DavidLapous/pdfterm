@@ -253,6 +253,18 @@ pub enum WorkerMessage {
         total: u32,
         complete: bool,
     },
+    VisibleMatches {
+        document_id: DocumentId,
+        request_id: u64,
+        revision: DocumentRevision,
+        matches: Vec<VisibleMatch>,
+    },
+    VisibleMatchesError {
+        document_id: DocumentId,
+        request_id: u64,
+        revision: DocumentRevision,
+        error: String,
+    },
     Frame(Frame),
     Error(String),
 }
@@ -271,6 +283,14 @@ enum WorkerCommand {
         document_id: DocumentId,
         request_id: u64,
         query: String,
+    },
+    VisibleMatches {
+        document_id: DocumentId,
+        request_id: u64,
+        revision: DocumentRevision,
+        query: String,
+        keys: Vec<(RenderKey, u32, u32)>,
+        generation: u64,
     },
     CancelSearch {
         document_id: DocumentId,
@@ -323,6 +343,14 @@ enum WorkerTask {
         document_id: DocumentId,
         request_id: u64,
         query: String,
+    },
+    VisibleMatches {
+        document_id: DocumentId,
+        request_id: u64,
+        revision: DocumentRevision,
+        query: String,
+        keys: Vec<(RenderKey, u32, u32)>,
+        generation: u64,
     },
     CancelSearch {
         document_id: DocumentId,
@@ -381,17 +409,28 @@ pub struct SearchRect {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PixelRect {
-    left: u32,
-    top: u32,
-    right: u32,
-    bottom: u32,
+pub struct PixelRect {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
 }
 
-pub struct CachedPageText {
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisibleMatch {
+    pub key: RenderKey,
+    pub char_index: usize,
+    pub rects: Vec<PixelRect>,
+    pub hit: (u32, u32),
+    pub anchor: (u32, u32),
+    pub next_char: Option<char>,
+}
+#[derive(Clone, Debug)]
+struct CachedPageText {
     raw: String,
     normalized: String,
     source_index_by_byte: Vec<usize>,
+    visible: Option<(String, Vec<(usize, usize)>)>,
 }
 struct WorkerChannels {
     priority_rx: Receiver<RenderRequest>,
@@ -406,6 +445,7 @@ pub struct RenderWorker {
     command_tx: Sender<WorkerCommand>,
     message_rx: Receiver<WorkerMessage>,
     latest_generation: Arc<AtomicU64>,
+    visible_generation: Arc<AtomicU64>,
 }
 
 impl RenderWorker {
@@ -416,6 +456,8 @@ impl RenderWorker {
         let (message_tx, message_rx) = unbounded();
         let latest_generation = Arc::new(AtomicU64::new(0));
         let worker_generation = Arc::clone(&latest_generation);
+        let visible_generation = Arc::new(AtomicU64::new(0));
+        let worker_visible_generation = Arc::clone(&visible_generation);
 
         thread::spawn(move || {
             run_worker(
@@ -429,6 +471,7 @@ impl RenderWorker {
                     message_tx,
                 },
                 worker_generation,
+                worker_visible_generation,
             );
         });
 
@@ -438,6 +481,7 @@ impl RenderWorker {
             command_tx,
             message_rx,
             latest_generation,
+            visible_generation,
         }
     }
 
@@ -452,10 +496,12 @@ impl RenderWorker {
             Ok(
                 WorkerMessage::Opened { .. }
                 | WorkerMessage::OpenError { .. }
+                | WorkerMessage::LinkIndexProgress { .. }
                 | WorkerMessage::Text { .. }
                 | WorkerMessage::SearchProgress { .. }
                 | WorkerMessage::SearchResults { .. }
-                | WorkerMessage::LinkIndexProgress { .. }
+                | WorkerMessage::VisibleMatchesError { .. }
+                | WorkerMessage::VisibleMatches { .. }
                 | WorkerMessage::PagePoint { .. }
                 | WorkerMessage::Frame(_),
             ) => Err("renderer sent a frame before initialization".into()),
@@ -478,12 +524,14 @@ impl RenderWorker {
     }
 
     pub fn open(&self, document_id: DocumentId, path: PathBuf) -> Result<(), String> {
+        self.visible_generation.fetch_add(1, Ordering::AcqRel);
         self.command_tx
             .send(WorkerCommand::Open { document_id, path })
             .map_err(|_| "renderer stopped".into())
     }
 
     pub fn close(&self, document_id: DocumentId) {
+        self.visible_generation.fetch_add(1, Ordering::AcqRel);
         let _ = self.command_tx.send(WorkerCommand::Close(document_id));
     }
 
@@ -540,6 +588,32 @@ impl RenderWorker {
             query,
         });
     }
+    pub fn find_visible(
+        &self,
+        document_id: DocumentId,
+        request_id: u64,
+        revision: DocumentRevision,
+        query: String,
+        keys: Vec<(RenderKey, u32, u32)>,
+    ) -> Result<(), String> {
+        let generation = self
+            .visible_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.command_tx
+            .send(WorkerCommand::VisibleMatches {
+                document_id,
+                request_id,
+                revision,
+                query,
+                keys,
+                generation,
+            })
+            .map_err(|_| "renderer stopped".into())
+    }
+    pub fn cancel_visible(&self) {
+        self.visible_generation.fetch_add(1, Ordering::AcqRel);
+    }
 
     pub fn cancel_search(&self, document_id: DocumentId, request_id: u64) {
         let _ = self.command_tx.send(WorkerCommand::CancelSearch {
@@ -566,6 +640,7 @@ fn run_worker(
     pdfium_library: Option<&Path>,
     channels: WorkerChannels,
     latest_generation: Arc<AtomicU64>,
+    visible_generation: Arc<AtomicU64>,
 ) {
     let WorkerChannels {
         priority_rx,
@@ -726,6 +801,71 @@ fn run_worker(
                                 content,
                             })
                             .map_err(|_| "viewer stopped".to_string())?;
+                    }
+                    continue;
+                }
+                WorkerTask::VisibleMatches {
+                    document_id,
+                    request_id,
+                    revision,
+                    query,
+                    keys,
+                    generation,
+                } => {
+                    if generation != visible_generation.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if revisions.get(&document_id) != Some(&revision) {
+                        if !documents.contains_key(&document_id) {
+                            message_tx
+                                .send(WorkerMessage::VisibleMatchesError {
+                                    document_id,
+                                    request_id,
+                                    revision,
+                                    error: "visible-match document is closed".into(),
+                                })
+                                .map_err(|_| "viewer stopped".to_string())?;
+                        }
+                        continue;
+                    }
+                    let result = (|| -> Result<Option<Vec<VisibleMatch>>, String> {
+                        let document = documents
+                            .get(&document_id)
+                            .ok_or("visible-match document is closed")?;
+                        let cache = text_cache
+                            .get_mut(&document_id)
+                            .ok_or("visible-match document text cache is unavailable")?;
+                        find_visible_matches(
+                            document,
+                            document_id,
+                            &query,
+                            &keys,
+                            cache,
+                            generation,
+                            &visible_generation,
+                        )
+                    })();
+                    if generation != visible_generation.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    match result {
+                        Ok(Some(matches)) => message_tx
+                            .send(WorkerMessage::VisibleMatches {
+                                document_id,
+                                request_id,
+                                revision,
+                                matches,
+                            })
+                            .map_err(|_| "viewer stopped".to_string())?,
+                        Ok(None) => {}
+                        Err(error) => message_tx
+                            .send(WorkerMessage::VisibleMatchesError {
+                                document_id,
+                                request_id,
+                                revision,
+                                error,
+                            })
+                            .map_err(|_| "viewer stopped".to_string())?,
                     }
                     continue;
                 }
@@ -1621,6 +1761,21 @@ impl From<WorkerCommand> for WorkerTask {
             WorkerCommand::ExtractText { document_id, page } => {
                 Self::ExtractText { document_id, page }
             }
+            WorkerCommand::VisibleMatches {
+                document_id,
+                request_id,
+                revision,
+                query,
+                keys,
+                generation,
+            } => Self::VisibleMatches {
+                document_id,
+                request_id,
+                revision,
+                query,
+                keys,
+                generation,
+            },
             WorkerCommand::Search {
                 document_id,
                 request_id,
@@ -1766,6 +1921,211 @@ fn unicode_context(
     Ok((context, offset))
 }
 
+fn overlapping_match_ranges_cancellable(
+    haystack: &str,
+    needle: &str,
+    mut is_current: impl FnMut() -> bool,
+) -> Option<Vec<(usize, usize)>> {
+    if needle.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = haystack.get(offset..)?.find(needle) {
+        if !is_current() {
+            return None;
+        }
+        let start = offset + relative;
+        let first_char = haystack[start..].chars().next()?;
+        ranges.push((start, start + needle.len()));
+        offset = start + first_char.len_utf8();
+    }
+    Some(ranges)
+}
+
+fn find_visible_matches(
+    document: &PdfDocument,
+    document_id: DocumentId,
+    query: &str,
+    keys: &[(RenderKey, u32, u32)],
+    cache: &mut [Option<CachedPageText>],
+    generation: u64,
+    latest_generation: &AtomicU64,
+) -> Result<Option<Vec<VisibleMatch>>, String> {
+    let needle = normalize_search_text(query);
+    if needle.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut matches = Vec::new();
+    for &(key, frame_width, frame_height) in keys {
+        if generation != latest_generation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if key.document_id != document_id {
+            return Err(format!(
+                "render key belongs to document {}, expected {document_id}",
+                key.document_id
+            ));
+        }
+        if frame_width == 0 || frame_height == 0 {
+            return Err(format!(
+                "visible frame for page {} has zero dimensions",
+                u64::from(key.page) + 1
+            ));
+        }
+        let page_index = i32::try_from(key.page).map_err(|_| {
+            format!(
+                "page {} exceeds PDFium's index range",
+                u64::from(key.page) + 1
+            )
+        })?;
+        let page = document.pages().get(page_index).map_err(|error| {
+            format!(
+                "could not load visible page {}: {error}",
+                u64::from(key.page) + 1
+            )
+        })?;
+        let zoom = i32::from(key.zoom.max(1));
+        let target_width = (i32::from(key.width) * zoom / 100).max(1);
+        let target_height = (i32::from(key.height) * zoom / 100).max(1);
+        let config = build_fit_config(PdfRenderConfig::new(), key.fit, target_width, target_height);
+        let Some(cached) =
+            cached_visible_page_text(document, key.page, cache, generation, latest_generation)
+        else {
+            if generation != latest_generation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            return Err(format!(
+                "could not extract visible text from page {}",
+                u64::from(key.page) + 1
+            ));
+        };
+        let Some((normalized, source_index_by_byte)) = cached.visible.as_ref() else {
+            continue;
+        };
+        let Some(occurrences) = overlapping_match_ranges_cancellable(normalized, &needle, || {
+            generation == latest_generation.load(Ordering::Acquire)
+        }) else {
+            return Ok(None);
+        };
+        if occurrences.is_empty() {
+            continue;
+        }
+        let text = page.text().map_err(|error| error.to_string())?;
+        let chars = text.chars();
+        for (start, end) in occurrences {
+            if generation != latest_generation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let Some(source_ranges) = source_index_by_byte.get(start..end) else {
+                continue;
+            };
+            let Some(&(first, _)) = source_ranges.first() else {
+                continue;
+            };
+            let mut rects = Vec::new();
+            let mut visible = true;
+            let mut previous = None;
+            for &(glyph_start, glyph_end) in source_ranges {
+                if generation != latest_generation.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                let glyph_range = (glyph_start, glyph_end);
+                if previous == Some(glyph_range) {
+                    continue;
+                }
+                previous = Some(glyph_range);
+                if chars
+                    .get(glyph_start)
+                    .ok()
+                    .and_then(|character| char::from_u32(character.unicode_value()))
+                    .is_some_and(char::is_whitespace)
+                {
+                    continue;
+                }
+                let previous_rect_count = rects.len();
+                for index in glyph_start..glyph_end {
+                    if generation != latest_generation.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    let Ok(character) = chars.get(index) else {
+                        continue;
+                    };
+                    if char::from_u32(character.unicode_value()).is_some_and(char::is_whitespace) {
+                        continue;
+                    }
+                    let Ok(render_mode) = character.render_mode() else {
+                        continue;
+                    };
+                    if !text_mode_has_visible_paint(
+                        render_mode,
+                        || character.fill_color().ok().map(|color| color.alpha()),
+                        || character.stroke_color().ok().map(|color| color.alpha()),
+                    ) {
+                        continue;
+                    }
+                    let Ok(bounds) = character.tight_bounds() else {
+                        continue;
+                    };
+                    let Some(rect) =
+                        page_rect_to_pixels(&page, &config, frame_width, frame_height, bounds)
+                    else {
+                        continue;
+                    };
+                    if rect.right > rect.left && rect.bottom > rect.top {
+                        rects.push(rect);
+                    }
+                }
+                if rects.len() == previous_rect_count && glyph_start != glyph_end {
+                    visible = false;
+                    break;
+                }
+            }
+            if !visible {
+                continue;
+            }
+            let Some(first_rect) = rects.first() else {
+                continue;
+            };
+            let last_range = *source_ranges
+                .last()
+                .expect("non-empty occurrence source range");
+            let next_char = source_index_by_byte
+                .get(end)
+                .filter(|next_range| **next_range != last_range)
+                .and_then(|&(start, stop)| {
+                    source_range_char(start, stop, |index| {
+                        chars
+                            .get(index)
+                            .ok()
+                            .map(|character| character.unicode_value())
+                    })
+                })
+                .filter(|character| character.is_alphanumeric() || *character == '_');
+            let Some(last_rect) = rects.last() else {
+                continue;
+            };
+            let center = |rect: &PixelRect| {
+                (
+                    rect.left + (rect.right - rect.left) / 2,
+                    rect.top + (rect.bottom - rect.top) / 2,
+                )
+            };
+            let hit = center(first_rect);
+            let anchor = center(last_rect);
+            matches.push(VisibleMatch {
+                key,
+                char_index: first,
+                rects,
+                hit,
+                anchor,
+                next_char,
+            });
+        }
+    }
+    Ok(Some(matches))
+}
+
 fn empty_text_cache(pages: u32) -> Vec<Option<CachedPageText>> {
     (0..pages).map(|_| None).collect()
 }
@@ -1792,9 +2152,167 @@ fn cached_page_text<'a>(
             raw,
             normalized,
             source_index_by_byte,
+            visible: None,
         });
     }
     slot.as_ref()
+}
+fn cached_visible_page_text<'a>(
+    document: &PdfDocument,
+    page: u32,
+    cache: &'a mut [Option<CachedPageText>],
+    generation: u64,
+    latest_generation: &AtomicU64,
+) -> Option<&'a CachedPageText> {
+    let index = usize::try_from(page).ok()?;
+    cached_page_text(document, page, cache)?;
+    let slot = cache.get_mut(index)?.as_mut()?;
+    if slot.visible.is_none() {
+        let page_index = i32::try_from(page).ok()?;
+        let pdf_page = document.pages().get(page_index).ok()?;
+        let (clip_left, clip_bottom, clip_right, clip_top) = effective_page_bounds(&pdf_page)?;
+        let text = pdf_page.text().ok()?;
+        let chars = text.chars();
+        let mut visible_characters = Vec::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if generation != latest_generation.load(Ordering::Acquire) {
+                return None;
+            }
+            let Ok(character) = chars.get(index) else {
+                index += 1;
+                continue;
+            };
+            let first = character.unicode_value();
+            let mut width = 1;
+            let scalar = if (0xd800..=0xdbff).contains(&first) && index + 1 < chars.len() {
+                let second = chars.get(index + 1).ok()?.unicode_value();
+                if (0xdc00..=0xdfff).contains(&second) {
+                    width = 2;
+                    0x10000 + ((first - 0xd800) << 10) + second - 0xdc00
+                } else {
+                    first
+                }
+            } else {
+                first
+            };
+            let end = index + width;
+            let Some(value) = char::from_u32(scalar) else {
+                index = end;
+                continue;
+            };
+            if value.is_whitespace() {
+                // PDFium also inserts whitespace without a text object. Keep those
+                // separators, but not invisible or transparent painted spaces.
+                let visible = character.render_mode().map_or(true, |mode| {
+                    text_mode_has_visible_paint(
+                        mode,
+                        || character.fill_color().ok().map(|color| color.alpha()),
+                        || character.stroke_color().ok().map(|color| color.alpha()),
+                    )
+                });
+                if visible {
+                    visible_characters.push((index, end, value));
+                }
+                index = end;
+                continue;
+            }
+            let mut has_visible_glyph = false;
+            for glyph_index in index..end {
+                let Ok(glyph) = chars.get(glyph_index) else {
+                    continue;
+                };
+                let Ok(render_mode) = glyph.render_mode() else {
+                    continue;
+                };
+                if !text_mode_has_visible_paint(
+                    render_mode,
+                    || glyph.fill_color().ok().map(|color| color.alpha()),
+                    || glyph.stroke_color().ok().map(|color| color.alpha()),
+                ) {
+                    continue;
+                }
+                let Ok(bounds) = glyph.tight_bounds() else {
+                    continue;
+                };
+                if bounds.right().value > clip_left
+                    && bounds.left().value < clip_right
+                    && bounds.top().value > clip_bottom
+                    && bounds.bottom().value < clip_top
+                {
+                    has_visible_glyph = true;
+                    break;
+                }
+            }
+            if has_visible_glyph {
+                visible_characters.push((index, end, value));
+            }
+            index = end;
+        }
+        if generation != latest_generation.load(Ordering::Acquire) {
+            return None;
+        }
+        slot.visible = Some(normalize_visible_search_characters(visible_characters));
+    }
+    Some(slot)
+}
+
+fn effective_page_bounds(page: &PdfPage) -> Option<(f32, f32, f32, f32)> {
+    const WIDTH: i32 = 100_000;
+    let page_width = page.width().value;
+    let page_height = page.height().value;
+    if !page_width.is_finite() || !page_height.is_finite() || page_width <= 0.0 {
+        return None;
+    }
+    let scaled_height = (page_height * WIDTH as f32 / page_width).round();
+    if !scaled_height.is_finite() || !(1.0..=i32::MAX as f32).contains(&scaled_height) {
+        return None;
+    }
+    let height = scaled_height as i32;
+    let config = PdfRenderConfig::new().set_target_width(WIDTH);
+    let points: Vec<_> = [(0, 0), (WIDTH, 0), (0, height), (WIDTH, height)]
+        .into_iter()
+        .map(|(x, y)| page.pixels_to_points(x, y, &config).ok())
+        .collect::<Option<_>>()?;
+    let left = points
+        .iter()
+        .map(|(x, _)| x.value)
+        .fold(f32::INFINITY, f32::min);
+    let right = points
+        .iter()
+        .map(|(x, _)| x.value)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = points
+        .iter()
+        .map(|(_, y)| y.value)
+        .fold(f32::INFINITY, f32::min);
+    let top = points
+        .iter()
+        .map(|(_, y)| y.value)
+        .fold(f32::NEG_INFINITY, f32::max);
+    (left.is_finite() && right.is_finite() && bottom.is_finite() && top.is_finite())
+        .then_some((left, bottom, right, top))
+}
+fn text_mode_has_visible_paint(
+    mode: PdfPageTextRenderMode,
+    fill_alpha: impl FnOnce() -> Option<u8>,
+    stroke_alpha: impl FnOnce() -> Option<u8>,
+) -> bool {
+    use PdfPageTextRenderMode::{
+        FilledThenStroked, FilledThenStrokedClipping, FilledUnstroked, FilledUnstrokedClipping,
+        StrokedUnfilled, StrokedUnfilledClipping,
+    };
+    match mode {
+        FilledUnstroked | FilledUnstrokedClipping => fill_alpha().is_some_and(|alpha| alpha > 0),
+        StrokedUnfilled | StrokedUnfilledClipping => stroke_alpha().is_some_and(|alpha| alpha > 0),
+        FilledThenStroked | FilledThenStrokedClipping => {
+            fill_alpha().is_some_and(|alpha| alpha > 0)
+                || stroke_alpha().is_some_and(|alpha| alpha > 0)
+        }
+        PdfPageTextRenderMode::Unknown
+        | PdfPageTextRenderMode::Invisible
+        | PdfPageTextRenderMode::InvisibleClipping => false,
+    }
 }
 
 fn normalize_search_text(value: &str) -> String {
@@ -1836,6 +2354,68 @@ fn normalize_search_characters(
         }
     }
     (normalized, source_index_by_byte)
+}
+fn normalize_visible_search_characters(
+    characters: impl IntoIterator<Item = (usize, usize, char)>,
+) -> (String, Vec<(usize, usize)>) {
+    let mut normalized = String::new();
+    let mut source_ranges = Vec::new();
+    let mut pending_whitespace = None;
+    for (source_start, source_end, character) in characters {
+        if character.is_whitespace() {
+            pending_whitespace.get_or_insert((source_start, source_end));
+            continue;
+        }
+        if let Some(whitespace_range) = pending_whitespace.take()
+            && !normalized.is_empty()
+        {
+            push_visible_normalized_character(
+                &mut normalized,
+                &mut source_ranges,
+                whitespace_range,
+                ' ',
+            );
+        }
+        for character in character.to_lowercase() {
+            push_visible_normalized_character(
+                &mut normalized,
+                &mut source_ranges,
+                (source_start, source_end),
+                character,
+            );
+        }
+    }
+    (normalized, source_ranges)
+}
+
+fn source_range_char(
+    start: usize,
+    end: usize,
+    mut unit: impl FnMut(usize) -> Option<u32>,
+) -> Option<char> {
+    let first = unit(start)?;
+    let scalar = match end.checked_sub(start)? {
+        1 => first,
+        2 if (0xd800..=0xdbff).contains(&first) => {
+            let second = unit(start + 1)?;
+            if !(0xdc00..=0xdfff).contains(&second) {
+                return None;
+            }
+            0x10000 + ((first - 0xd800) << 10) + second - 0xdc00
+        }
+        _ => return None,
+    };
+    char::from_u32(scalar)
+}
+
+fn push_visible_normalized_character(
+    normalized: &mut String,
+    source_ranges: &mut Vec<(usize, usize)>,
+    source_range: (usize, usize),
+    character: char,
+) {
+    normalized.push(character);
+    source_ranges.extend(std::iter::repeat_n(source_range, character.len_utf8()));
 }
 
 fn push_normalized_character(
@@ -1902,17 +2482,27 @@ fn visible_forward_text(page: &PdfPage) -> Option<String> {
         normalize_search_characters(text.chars().iter().filter_map(|character| {
             let value = character.unicode_char()?;
             if value.is_whitespace() {
-                return Some((character.index(), value));
+                let visible = character.render_mode().map_or(true, |mode| {
+                    text_mode_has_visible_paint(
+                        mode,
+                        || character.fill_color().ok().map(|color| color.alpha()),
+                        || character.stroke_color().ok().map(|color| color.alpha()),
+                    )
+                });
+                return visible.then_some((character.index(), value));
             }
             let bounds = character.tight_bounds().ok()?;
             let within_crop = bounds.right().value > crop.left().value
                 && bounds.left().value < crop.right().value
                 && bounds.top().value > crop.bottom().value
                 && bounds.bottom().value < crop.top().value;
-            let painted = !matches!(
-                character.render_mode(),
-                Ok(PdfPageTextRenderMode::Invisible | PdfPageTextRenderMode::InvisibleClipping)
-            );
+            let painted = character.render_mode().ok().is_some_and(|mode| {
+                text_mode_has_visible_paint(
+                    mode,
+                    || character.fill_color().ok().map(|color| color.alpha()),
+                    || character.stroke_color().ok().map(|color| color.alpha()),
+                )
+            });
             (within_crop && painted).then_some((character.index(), value))
         }));
     Some(normalized)
@@ -2510,25 +3100,24 @@ fn page_rect_to_pixels(
         (bounds.left().value, bounds.bottom().value),
         (bounds.right().value, bounds.bottom().value),
     ];
-    let pixels: Vec<_> = corners
-        .into_iter()
-        .filter_map(|(x, y)| {
-            page.points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), config)
-                .ok()
-        })
-        .collect();
-    if pixels.len() != corners.len() {
-        return None;
+    let mut left = i32::MAX;
+    let mut right = i32::MIN;
+    let mut top = i32::MAX;
+    let mut bottom = i32::MIN;
+    for (x, y) in corners {
+        let (x, y) = page
+            .points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), config)
+            .ok()?;
+        left = left.min(x);
+        right = right.max(x);
+        top = top.min(y);
+        bottom = bottom.max(y);
     }
-    let min_x = pixels.iter().map(|(x, _)| *x).min()?;
-    let max_x = pixels.iter().map(|(x, _)| *x).max()?;
-    let min_y = pixels.iter().map(|(_, y)| *y).min()?;
-    let max_y = pixels.iter().map(|(_, y)| *y).max()?;
     Some(PixelRect {
-        left: min_x.saturating_sub(1).clamp(0, width as i32) as u32,
-        right: max_x.saturating_add(2).clamp(0, width as i32) as u32,
-        top: min_y.saturating_sub(1).clamp(0, height as i32) as u32,
-        bottom: max_y.saturating_add(2).clamp(0, height as i32) as u32,
+        left: left.saturating_sub(1).clamp(0, width as i32) as u32,
+        right: right.saturating_add(2).clamp(0, width as i32) as u32,
+        top: top.saturating_sub(1).clamp(0, height as i32) as u32,
+        bottom: bottom.saturating_add(2).clamp(0, height as i32) as u32,
     })
 }
 
@@ -2889,6 +3478,156 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visible_search_finds_overlapping_unicode_occurrences() {
+        assert_eq!(
+            super::overlapping_match_ranges_cancellable("banana", "ana", || true).unwrap(),
+            [(1, 4), (3, 6)]
+        );
+        assert_eq!(
+            super::overlapping_match_ranges_cancellable("ééé", "éé", || true).unwrap(),
+            [(0, 4), (2, 6)]
+        );
+    }
+    #[test]
+    fn visible_source_ranges_decode_characters_without_reusing_the_next_glyph() {
+        let units = [b'S' as u32, b'e' as u32, 0xd83d, 0xde00, b'!' as u32];
+        let decode = |start, end| super::source_range_char(start, end, |i| units.get(i).copied());
+        assert_eq!(decode(1, 2), Some('e'));
+        assert_eq!(decode(2, 4), Some('😀'));
+        assert_eq!(decode(1, 3), None);
+    }
+
+    #[test]
+    fn effective_page_bounds_respect_crops_inheritance_and_rotation() {
+        let pdfium = super::load_pdfium(None).unwrap();
+        let cases = [
+            (
+                synthetic_bounds_pdf("[100 200 500 600]", "[150 250 450 550]", 90, false),
+                (150.0, 250.0, 450.0, 550.0),
+            ),
+            (
+                synthetic_bounds_pdf("[100 200 500 600]", "[50 150 550 650]", 270, false),
+                (100.0, 200.0, 500.0, 600.0),
+            ),
+            (
+                synthetic_bounds_pdf("[100 200 500 600]", "[150 250 450 550]", 270, true),
+                (150.0, 250.0, 450.0, 550.0),
+            ),
+        ];
+        for (pdf, expected) in cases {
+            let document = pdfium.load_pdf_from_byte_vec(pdf, None).unwrap();
+            let page = document.pages().get(0).unwrap();
+            let actual = super::effective_page_bounds(&page).unwrap();
+            for (actual, expected) in [actual.0, actual.1, actual.2, actual.3]
+                .into_iter()
+                .zip([expected.0, expected.1, expected.2, expected.3])
+            {
+                assert!(
+                    (actual - expected).abs() < 0.1,
+                    "effective page bound {actual} differs from expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_visible_page_reports_an_error_without_stopping_the_renderer() {
+        let pdf = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            pdf.path(),
+            synthetic_bounds_pdf("[0 0 200 100]", "[0 0 200 100]", 0, false),
+        )
+        .unwrap();
+        let worker = super::RenderWorker::spawn(1, pdf.path().to_path_buf(), None);
+        assert_eq!(worker.wait_until_ready().unwrap().0, 1);
+        let revision = super::DocumentRevision::read(pdf.path()).unwrap();
+        let key = super::RenderKey {
+            document_id: 1,
+            page: u32::MAX,
+            width: 100,
+            height: 100,
+            zoom: 100,
+            fit: super::FitMode::Page,
+            invert: false,
+            dark_mode_style: super::DarkModeStyle::new([0; 3], [255; 3]),
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [255, 255, 0],
+            selected_link_ordinal: None,
+        };
+        worker
+            .find_visible(1, 1, revision, "a".into(), vec![(key, 100, 100)])
+            .unwrap();
+        let reply = worker
+            .message_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let super::WorkerMessage::VisibleMatchesError { error, .. } = reply else {
+            panic!("invalid page did not return a scoped error");
+        };
+        assert!(error.contains("4294967296"), "{error}");
+        worker
+            .find_visible(
+                1,
+                2,
+                revision,
+                "".into(),
+                vec![(super::RenderKey { page: 0, ..key }, 100, 100)],
+            )
+            .unwrap();
+        let reply = worker
+            .message_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            reply,
+            super::WorkerMessage::VisibleMatches { request_id: 2, .. }
+        ));
+    }
+
+    fn synthetic_bounds_pdf(
+        media_box: &str,
+        crop_box: &str,
+        rotation: i32,
+        inherited: bool,
+    ) -> Vec<u8> {
+        let boxes = format!("/MediaBox {media_box} /CropBox {crop_box}");
+        let (parent_boxes, page_boxes) = if inherited {
+            (boxes, String::new())
+        } else {
+            (String::new(), boxes)
+        };
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {parent_boxes} >>"),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /Rotate {rotation} {page_boxes} /Resources << >> /Contents 4 0 R >>"
+            ),
+            "<< /Length 0 >>\nstream\n\nendstream".to_string(),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
     #[test]
     fn forward_words_match_tex_accents_in_pdf_text() {
         assert!(super::same_forward_word("Čech", "Cech"));

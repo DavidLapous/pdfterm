@@ -47,6 +47,17 @@ pdfterm document.pdf
 
 Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page N` to open at a specific page.
 
+`pdfterm --screenshot /absolute/path.png [--session NAME]` asks the
+already-running viewer to save its rendered viewport as a PNG for agent visual
+checks. The absolute output path must not already exist; `--session` selects
+which viewer to capture.
+The PNG contains the currently visible rendered PDF page crops and viewer
+highlights/labels, but not terminal text, status rows, or terminal fonts. It
+captures only pages already visible in the viewer, not the full document or a
+terminal/compositor screenshot; the viewer must be running with its forward
+socket available. Requests fail while a search/link picker is open or a newly
+selected render is still pending; retry after the current PDF frame appears.
+
 ### Keys
 
 | Key | Action |
@@ -64,6 +75,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `0` | reset zoom to the fitted size |
 | `i` | toggle Polaris-style dark mode |
 | `S` | toggle smooth scrolling for the current session |
+| `X` | find visible PDF text and jump to its source with SyncTeX |
 | `Alt`/`Option` + click | resolve the clicked location via SyncTeX and jump to its source; no toggle |
 | `p` | toggle detailed render-performance timings |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
@@ -93,6 +105,24 @@ results (`Tab` toggles focus); `/` starts a new search and `Esc` closes the pane
 The search is case-insensitive, treats runs of whitespace as a single space, and
 highlights matches using the active theme. Image-only PDFs require OCR and are
 reported as having no matches.
+
+Press `X` to find text only on the currently visible page or pages; type a query
+to update matching highlights and labels as you go, then type a displayed label
+to run inverse SyncTeX and deliver the resulting source location to the configured
+editor. `Esc` exits; `Backspace` removes label input first, then edits the query.
+Labels avoid characters that would extend a current match. An exact label takes
+precedence over another query character; once only one match remains, its label
+is the next ASCII word character when available, or a regular label otherwise.
+When one-key labels cannot identify every match, labels use short multi-key
+sequences so every highlighted location remains selectable.
+This is a viewport search, not a document-wide scan: arrows and PageUp/PageDown
+scroll; `Ctrl-+` / `Ctrl--` zoom without leaving the mode; resizing, switching
+tabs, or reloading updates the visible matches. It requires selectable PDF text
+and a working SyncTeX/editor setup; it does not guess a source location when
+SyncTeX cannot resolve the match.
+PDF text extraction excludes invisible and transparent glyphs but cannot detect
+glyphs covered by later opaque drawing. Like `/` and text copy, `X` is not a
+redaction check: sanitize PDFs before using it on sensitive covered content.
 
 Click a PDF hyperlink to follow it; no mode toggle is required. Mouse capture stays
 enabled while the viewer runs, including outside `L` mode. Use `y` to copy
