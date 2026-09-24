@@ -4,7 +4,26 @@ local M = {}
 local function remote(arguments, callback)
   local command = { 'kitten', '@' }
   vim.list_extend(command, arguments)
-  return vim.system(command, { text = true, timeout = 3000 }, callback)
+  local socket = vim.env.KITTY_LISTEN_ON
+  local function check(result)
+    if result.code ~= 0 and (not socket or socket == '')
+      and (result.stderr or ''):find('open /dev/tty', 1, true)
+    then
+      result.stderr = 'Kitty control requires a listen_on socket when Neovim has no controlling terminal; set listen_on in kitty.conf and restart Kitty: '
+        .. result.stderr
+    end
+    if callback then
+      callback(result)
+    end
+    return result
+  end
+  if callback then
+    return vim.system(command, { text = true, timeout = 3000 }, check)
+  end
+  local process = vim.system(command, { text = true, timeout = 3000 })
+  return { wait = function(_, timeout)
+    return check(process:wait(timeout))
+  end }
 end
 
 function M.launch(source, argv, callback)

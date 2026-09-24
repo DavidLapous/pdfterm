@@ -97,18 +97,28 @@ elseif action == 'close' then
   terminal.close(source); finish({code=0})
 else error('unknown native test action') end
 assert(vim.wait(5000,function() return done end,10),'terminal callback timed out')
-assert(result.code == 0,result.stderr)
+if vim.env.PDFTERM_EXPECT_KITTY_TTY_FAILURE == '1' then
+  assert(result.code ~= 0 and result.stderr:find('requires a listen_on socket',1,true),result.stderr)
+else
+  assert(result.code == 0,result.stderr)
+end
 io.write(vim.json.encode(result), '\\n')
 ''')
 
-        def local(action, identifier, *argv):
+        def local(action, identifier, *argv, no_socket=False):
+            environment = os.environ.copy()
+            if no_socket:
+                environment.pop('KITTY_LISTEN_ON', None)
+                environment['PDFTERM_EXPECT_KITTY_TTY_FAILURE'] = '1'
             result = subprocess.run(['nvim', '--headless', '-u', 'NONE', '-i', 'NONE',
                                      '-l', str(lua), action, identifier, *argv],
                                     stdin=subprocess.DEVNULL, capture_output=True,
-                                    text=True, timeout=8)
+                                    text=True, timeout=8, start_new_session=True,
+                                    env=environment)
             assert result.returncode == 0, result.stderr or result.stdout
             assert not result.stderr, result.stderr
-            return json.loads(result.stdout).get('stdout', '').strip()
+            reply = json.loads(result.stdout)
+            return reply['stderr'] if no_socket else reply.get('stdout', '').strip()
 
         for route in ('local', 'ssh'):
             source = (run(['kitten', '@', 'launch', '--type=os-window', '/bin/sleep', '60'])
@@ -131,6 +141,13 @@ return id of s'''))
                 assert backend.source == source
                 assert local('capture', source) == source
                 token = "session ' λ"
+                if route == 'local' and args.terminal == 'kitty':
+                    before = snapshot('kitty')
+                    assert 'requires a listen_on socket' in local(
+                        'launch', source, sys.executable, str(reader), token, no_socket=True)
+                    assert snapshot('kitty') == before, 'failed control changed Kitty surfaces'
+                    assert not (directory / 'ready.json').exists(), 'failed control launched a reader'
+                    print('kitty/local: detached Neovim without socket rejected before split')
                 viewer = (local('launch', source, sys.executable, str(reader), token)
                           if route == 'local' else backend.launch(
                               ['env', 'PATH=' + os.environ['PATH'],
