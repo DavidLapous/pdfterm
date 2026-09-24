@@ -1875,6 +1875,107 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
     .map(Some)
 }
 
+/// Resolve newline-delimited PDF-point clicks without starting the viewer.
+/// PDFium and the document stay open for the full batch; each point owns its
+/// own resolver deadline and failure record.
+pub fn synctex_edit_batch(
+    pdf: &Path,
+    library: Option<&Path>,
+    settings: &crate::config::ViewerSettings,
+    input: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Point {
+        page: u32,
+        x: f32,
+        y: f32,
+    }
+
+    let pdfium = load_pdfium(library)?;
+    let document = pdfium
+        .load_pdf_from_file(pdf, None)
+        .map_err(|error| format!("could not open {}: {error}", pdf.display()))?;
+    let mut cached_page: Option<(u32, PdfPage<'_>)> = None;
+    for (line_number, line) in input.lines().enumerate() {
+        let input_line = line.as_ref().ok().cloned();
+        let result = (|| -> Result<serde_json::Value, String> {
+            let line = line.map_err(|error| error.to_string())?;
+            let point: Point = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+            if point.page == 0 || !point.x.is_finite() || !point.y.is_finite() {
+                return Err("page must be positive and coordinates finite".into());
+            }
+            if cached_page.as_ref().map(|(page, _)| *page) != Some(point.page) {
+                let page_index =
+                    i32::try_from(point.page - 1).map_err(|error| error.to_string())?;
+                let page = document
+                    .pages()
+                    .get(page_index)
+                    .map_err(|error| format!("could not load page {}: {error}", point.page))?;
+                cached_page = Some((point.page, page));
+            }
+            let page = &cached_page.as_ref().expect("current page is cached").1;
+            let height = page.height().value;
+            let width = page.width().value;
+            if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                return Err("PDFium returned invalid page dimensions".into());
+            }
+            if point.x < 0.0 || point.x > width || point.y < 0.0 || point.y > height {
+                return Err("point is outside the PDF page".into());
+            }
+            let (context, offset) = match clicked_text(page, point.x, height - point.y) {
+                Ok(Some(context)) => context,
+                Ok(None) => return Err("PDFium found no text near point".into()),
+                Err(error) => return Err(format!("PDFium text hit-test failed: {error}")),
+            };
+            let resolution = crate::synctex::resolve_inverse(
+                pdf,
+                crate::synctex::InversePoint {
+                    page: point.page,
+                    x: point.x,
+                    y_from_top: point.y,
+                    page_height_pt: height,
+                },
+                settings.word_precision.then_some((&context, offset)),
+                settings.source_context_lines as u32,
+                &crate::process::Operation::new(std::time::Duration::from_secs(30)),
+            )
+            .map_err(|error| error.to_string())?;
+            let pdf_word = words(&context).into_iter().find_map(|(start, word)| {
+                (start <= offset && offset < start + word.len()).then(|| word.to_owned())
+            });
+            Ok(serde_json::json!({
+                "ok": true,
+                "page": point.page,
+                "x": point.x,
+                "y": point.y,
+                "location": resolution.location,
+                "warning": resolution.warning,
+                "error": null,
+                "pdf_word": pdf_word,
+            }))
+        })();
+        let json = match result {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "line": line_number + 1,
+                "input": input_line,
+                "location": null,
+                "warning": null,
+                "error": error,
+            }),
+        };
+        serde_json::to_writer(&mut output, &json).map_err(|error| error.to_string())?;
+        output.write_all(b"\n").map_err(|error| error.to_string())?;
+        if line_number % 32 == 31 {
+            output.flush().map_err(|error| error.to_string())?;
+        }
+    }
+    output.flush().map_err(|error| error.to_string())
+}
+
 /// PDFium may expose either Unicode scalars or separate UTF-16 surrogate units.
 /// Both halves of a pair must select the same UTF-8 glyph, including at the
 /// neighborhood boundary. Invalid units are errors, never adjacent-glyph jumps.

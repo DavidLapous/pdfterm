@@ -106,9 +106,12 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
     );
     let inverse = synctex::resolve_inverse(
         &pdf,
-        request.page,
-        point.0,
-        point.1,
+        synctex::InversePoint {
+            page: request.page,
+            x: point.0,
+            y_from_top: point.1,
+            page_height_pt: 792.0,
+        },
         Some(("target zephyr", 7)),
         4,
         &Operation::default(),
@@ -128,9 +131,12 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
     assert!(synctex::resolve_forward(&pdf, &source, 6, 1).is_err());
     let coarse = synctex::resolve_inverse(
         &pdf,
-        request.page,
-        point.0,
-        point.1,
+        synctex::InversePoint {
+            page: request.page,
+            x: point.0,
+            y_from_top: point.1,
+            page_height_pt: 792.0,
+        },
         Some(("zephyr", 0)),
         4,
         &Operation::default(),
@@ -156,9 +162,12 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
         assert!(synctex::resolve_forward(&pdf, &source, 6, 1).is_err());
         let result = synctex::resolve_inverse(
             &pdf,
-            request.page,
-            point.0,
-            point.1,
+            synctex::InversePoint {
+                page: request.page,
+                x: point.0,
+                y_from_top: point.1,
+                page_height_pt: 792.0,
+            },
             Some(("zephyr", 0)),
             4,
             &Operation::default(),

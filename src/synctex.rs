@@ -331,17 +331,29 @@ fn run(operation: &Operation, args: &[&str]) -> io::Result<String> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+#[derive(Clone, Copy)]
+pub struct InversePoint {
+    pub page: u32,
+    pub x: f32,
+    pub y_from_top: f32,
+    pub page_height_pt: f32,
+}
+
 pub fn resolve_inverse(
     pdf: &Path,
-    page: u32,
-    x: f32,
-    y_from_top: f32,
+    point: InversePoint,
     word: Option<(&str, usize)>,
     radius: u32,
     operation: &Operation,
 ) -> io::Result<InverseResolution> {
     let pdf = std::path::absolute(pdf)?;
-    let spec = format!("{page}:{x:.2}:{y_from_top:.2}:{}", pdf.display());
+    let spec = format!(
+        "{}:{:.2}:{:.2}:{}",
+        point.page,
+        point.x,
+        point.y_from_top,
+        pdf.display()
+    );
     let stdout = run(operation, &["edit", "-o", &spec])?;
     let mut target = parse_synctex_edit(&stdout)
         .ok_or_else(|| io::Error::other("synctex edit returned no match"))?;
@@ -384,7 +396,17 @@ pub fn resolve_inverse(
             let mut location = source_word_location(&source, target.line, context, offset, radius);
             if let Some((file, original, line, byte, score)) =
                 document_metadata_word_location(&pdf, context, offset)
-                && (location.is_none() || score >= 6)
+                && (location.is_none()
+                    || score >= 6
+                        && metadata_beats_frame(
+                            &source,
+                            target.line,
+                            context,
+                            offset,
+                            point.y_from_top,
+                            point.page_height_pt,
+                            score,
+                        ))
             {
                 target.file = file;
                 source = original;
@@ -411,6 +433,25 @@ pub fn resolve_inverse(
         location: target,
         warning,
     })
+}
+
+/// A frame title and the running document title may contain the same words.
+/// Preserve a local frame hit except when a footer has stronger metadata context.
+fn metadata_beats_frame(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    y_from_top: f32,
+    page_height_pt: f32,
+    metadata_score: isize,
+) -> bool {
+    let Some(frame) = source_frame_range(source, line) else {
+        return true;
+    };
+    y_from_top >= page_height_pt / 2.0
+        && source_prose_scored_location(source, line, context, offset, frame, true)
+            .is_some_and(|(_, _, local_score)| metadata_score >= local_score)
 }
 
 fn read_source(path: &Path) -> io::Result<String> {
@@ -1165,6 +1206,92 @@ mod tests {
         assert!(found.0.ends_with("preamble.tex"));
         assert_eq!((found.2, found.3), (2, 19));
         assert!(document_metadata_word_location(&pdf, "Report", 0).is_none());
+    }
+
+    #[test]
+    fn inverse_frame_title_beats_same_words_in_document_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("slides.pdf");
+        let source = "\\title{Persistent Homology and Applications in Topological Data Analysis}\n\
+                      \\begin{document}\n\
+                      \\begin{frame}{Topological Data Analysis}{Cell cycle TDA application}\n\
+                      \\begin{figure}\\includegraphics{cycle.png}\\end{figure}\n\
+                      \\end{frame}\n";
+        fs::write(pdf.with_extension("tex"), source).unwrap();
+        let title = "Topological Data Analysis\nCell cycle TDA application\n\
+                     Persistent Homology and Applications in Topological Data Analysis";
+        let title_offset = title.find("Data").unwrap();
+        let metadata_score = document_metadata_word_location(&pdf, title, title_offset)
+            .unwrap()
+            .4;
+        assert!(metadata_score >= 6);
+        assert_eq!(
+            source_word_location(source, 5, title, title_offset, 4),
+            Some((3, source.lines().nth(2).unwrap().find("Data").unwrap()))
+        );
+        assert!(!metadata_beats_frame(
+            source,
+            5,
+            title,
+            title_offset,
+            10.0,
+            272.0,
+            metadata_score
+        ));
+        let footer = "Topological Data Analysis\nCell cycle TDA application\n\
+                      Persistent Homology and Applications in Topological Data Analysis";
+        let footer_offset = footer.rfind("Data").unwrap();
+        let footer_score = document_metadata_word_location(&pdf, footer, footer_offset)
+            .unwrap()
+            .4;
+        assert!(metadata_beats_frame(
+            source,
+            5,
+            footer,
+            footer_offset,
+            228.0,
+            272.0,
+            footer_score
+        ));
+    }
+
+    #[test]
+    fn inverse_identical_running_title_uses_click_height_for_tie() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("slides.pdf");
+        let source = "\\title{Topological Data Analysis}\n\
+                      \\begin{frame}{Topological Data Analysis}\n\
+                      \\end{frame}\n";
+        fs::write(pdf.with_extension("tex"), source).unwrap();
+        let context = "Topological Data Analysis";
+        let offset = context.find("Data").unwrap();
+        let metadata_score = document_metadata_word_location(&pdf, context, offset)
+            .unwrap()
+            .4;
+        assert_eq!(
+            metadata_score,
+            source_prose_scored_location(source, 3, context, offset, 1..3, true)
+                .unwrap()
+                .2
+        );
+        assert!(!metadata_beats_frame(
+            source,
+            3,
+            context,
+            offset,
+            10.0,
+            272.0,
+            metadata_score
+        ));
+        assert!(metadata_beats_frame(
+            source,
+            3,
+            context,
+            offset,
+            228.0,
+            272.0,
+            metadata_score
+        ));
     }
 
     #[test]

@@ -97,9 +97,12 @@ impl InverseTask {
         };
         let mut result = synctex::resolve_inverse(
             &self.path,
-            self.page + 1,
-            self.click.pdf_x,
-            self.click.page_height_pt - self.click.pdf_y,
+            synctex::InversePoint {
+                page: self.page + 1,
+                x: self.click.pdf_x,
+                y_from_top: self.click.page_height_pt - self.click.pdf_y,
+                page_height_pt: self.click.page_height_pt,
+            },
             word,
             self.radius,
             &self.operation,

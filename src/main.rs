@@ -1,3 +1,4 @@
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -48,8 +49,12 @@ struct Cli {
     #[arg(long, hide = true)]
     focus_token: Option<String>,
 
+    /// Read newline-delimited PDF-point clicks and emit inverse SyncTeX JSON.
+    #[arg(long, conflicts_with_all = ["forward_search", "synctex_view", "screenshot"])]
+    synctex_edit_batch: bool,
+
     /// Save the running viewer's visible PDF viewport as a PNG.
-    #[arg(long, conflicts_with_all = ["path", "forward_search", "synctex_view"])]
+    #[arg(long, conflicts_with_all = ["path", "forward_search", "synctex_view", "synctex_edit_batch"])]
     screenshot: Option<PathBuf>,
 }
 
@@ -60,6 +65,29 @@ fn main() -> ExitCode {
             &mut std::io::stdout().lock(),
             include_bytes!(concat!(env!("OUT_DIR"), "/pdfium-notices.txt")),
         ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("pdfterm: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if cli.synctex_edit_batch {
+        let result = (|| -> Result<(), String> {
+            let pdf = cli
+                .path
+                .as_deref()
+                .ok_or("a PDF path is required for --synctex-edit-batch")?;
+            let config = pdfterm::config::Config::load().map_err(|error| error.to_string())?;
+            pdfterm::pdf::synctex_edit_batch(
+                pdf,
+                cli.pdfium_library.as_deref(),
+                &config.viewer,
+                io::stdin().lock(),
+                io::stdout().lock(),
+            )
+        })();
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("pdfterm: {error}");
