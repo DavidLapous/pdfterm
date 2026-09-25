@@ -3143,6 +3143,11 @@ impl App {
             KeyCode::Esc if self.clear_search(output)? => {}
             KeyCode::Esc => return Ok(true),
             KeyCode::Char('f') => self.open_picker(output)?,
+            KeyCode::Char('D')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.duplicate_tab(output)?
+            }
             KeyCode::Tab => self.switch_tab(1, output)?,
             KeyCode::BackTab => self.switch_tab(-1, output)?,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -6597,6 +6602,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("s / a", "cycle / auto layout"),
         ("b", "back from link"),
         ("f", "open PDF in new tab"),
+        ("D", "duplicate tab at current view"),
         ("q", "leave mode / close tab"),
         ("Esc", "leave mode / clear / exit"),
         ("?", "open help"),

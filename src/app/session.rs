@@ -129,6 +129,13 @@ impl FileWatcher {
     }
 }
 
+pub(super) struct TabView {
+    position: ViewPosition,
+    fit: FitMode,
+    zoom: u16,
+    invert: bool,
+}
+
 pub(super) enum PendingOpen {
     Reload {
         document_id: DocumentId,
@@ -137,6 +144,7 @@ pub(super) enum PendingOpen {
     Selection {
         document_id: DocumentId,
         path: PathBuf,
+        view: Option<TabView>,
     },
 }
 
@@ -211,6 +219,7 @@ impl App {
             PendingOpen::Selection {
                 document_id: expected,
                 path,
+                view,
             } if expected == document_id => {
                 crate::recent::record(&path);
                 let watcher = FileWatcher::new(&path)?;
@@ -239,7 +248,17 @@ impl App {
                     pending_destination: None,
                     link_index: LinkIndexState::new(pages),
                 });
+                if let Some(view) = view {
+                    let tab = self.session.tabs.last_mut().expect("new tab");
+                    tab.page = view.position.page.min(pages - 1);
+                    tab.scroll_x = view.position.scroll_x;
+                    tab.scroll_y = view.position.scroll_y;
+                    tab.fit = view.fit;
+                    tab.zoom = view.zoom;
+                    tab.invert = view.invert;
+                }
                 self.session.active_tab = self.session.tabs.len() - 1;
+                self.clear_viewer(output)?;
                 self.reset_render_state();
                 self.ensure_link_index();
                 self.request_current(output)?;
@@ -282,12 +301,44 @@ impl App {
         path: PathBuf,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        self.open_tab(path, None, output)
+    }
+
+    pub(super) fn duplicate_tab(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.session.pending_open.is_some() {
+            return Ok(());
+        }
+        let tab = self.tab();
+        let view = TabView {
+            position: ViewPosition {
+                page: tab.page,
+                scroll_x: tab.scroll_x,
+                scroll_y: tab.scroll_y,
+            },
+            fit: tab.fit,
+            zoom: tab.zoom,
+            invert: tab.invert,
+        };
+        self.open_tab(tab.path.clone(), Some(view), output)
+    }
+
+    fn open_tab(
+        &mut self,
+        path: PathBuf,
+        view: Option<TabView>,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        self.navigation.inverse.take();
         let document_id = self.session.next_document_id;
         self.session.next_document_id = self.session.next_document_id.wrapping_add(1).max(1);
         self.worker
             .open(document_id, path.clone())
             .map_err(AppError::Renderer)?;
-        self.session.pending_open = Some(PendingOpen::Selection { document_id, path });
+        self.session.pending_open = Some(PendingOpen::Selection {
+            document_id,
+            path,
+            view,
+        });
         let viewport = self.prepare_viewport(output)?;
         self.draw_status(output, viewport, "opening")?;
         Ok(())

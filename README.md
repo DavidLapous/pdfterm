@@ -85,11 +85,19 @@ selected render is still pending; retry after the current PDF frame appears.
 | `L` | toggle annotation highlights and open the link browser |
 | `b` | return to the view before the last followed internal link |
 | `f` | open a PDF in a new tab |
+| `D` | duplicate the current PDF in a new tab, keeping its view |
 | `Tab` / `Shift-Tab` | switch tabs |
 | `Alt-1` … `Alt-9` | select a numbered tab directly |
 | `?` | open the keybinding help menu |
 | `q` | leave link mode when active; otherwise close the current tab |
 | `Esc` | leave link mode; otherwise close a pane, clear search, or exit |
+
+Press `D` (`Shift-d`) to open an independent copy of the current document and
+switch to it. The new tab keeps the page, fit mode, zoom, horizontal/vertical
+scroll position, and dark-mode setting. Scrolling or closing either tab does not
+affect the other. The first extra tab adds a tab bar, reducing the available
+viewport height by one terminal row; fit modes still adapt to that space.
+Opening a PDF through `f` continues to select an existing tab for that file.
 
 Vertical scrolling shows adjacent pages together, separated by one terminal row,
 in every fit mode. Links and inverse search target the page under the pointer,
