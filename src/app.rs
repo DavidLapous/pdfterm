@@ -3466,9 +3466,16 @@ impl App {
         if zoom == self.tab().zoom {
             return Ok(());
         }
-        self.tab_mut().zoom = zoom;
-        self.tab_mut().scroll_x = 0;
-        self.tab_mut().scroll_y = 0;
+        let tab = self.tab_mut();
+        // Offsets are rendered pixels; retain their position in document space.
+        let old_zoom = u64::from(tab.zoom);
+        let scale = |offset: u32| {
+            ((u64::from(offset) * u64::from(zoom) + old_zoom / 2) / old_zoom)
+                .min(u64::from(u32::MAX)) as u32
+        };
+        tab.scroll_x = scale(tab.scroll_x);
+        tab.scroll_y = scale(tab.scroll_y);
+        tab.zoom = zoom;
         self.request_current(output)
     }
 

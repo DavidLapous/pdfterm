@@ -115,6 +115,9 @@ Automatic PDF reloads preserve the current page and horizontal/vertical scroll
 offsets. If the rebuilt document has fewer pages or smaller page dimensions,
 the viewport is clamped to the remaining page and its available scroll range.
 
+Zoom in, zoom out, and reset preserve the document position at the viewport's
+upper-left by scaling scroll offsets with the zoom level, subject to page bounds.
+
 Vertical scrolling shows adjacent pages together, separated by one terminal row,
 in every fit mode. Links and inverse search target the page under the pointer,
 not just the first visible page. The `h`/`l` keys and left/right arrows scroll
