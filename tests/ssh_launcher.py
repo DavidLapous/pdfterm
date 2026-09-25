@@ -311,6 +311,32 @@ error('editor did not exit during launch')
         self.assertNotIn(reply['id'], self.bridge.owned)
         self.assertTrue(self.bridge.thread.is_alive())
 
+    def test_wezterm_failed_rollback_retains_exact_pane_for_bridge_cleanup(self):
+        wezterm = launcher['WezTermTerminal'].__new__(launcher['WezTermTerminal'])
+        wezterm.source, wezterm.socket_path = '11', 'owned.sock'
+        listings = [{'11': (1, 2)}, {'11': (1, 2), '19': (1, 2)}]
+        cleanup = {'fail': True, 'closed': False}
+
+        def close(identifier, deadline=None):
+            self.assertEqual(identifier, '19')
+            if cleanup['fail']:
+                raise RuntimeError('cleanup unavailable')
+            cleanup['closed'] = True
+
+        self.bridge.windows = wezterm
+        with patch.object(wezterm, '_panes', side_effect=listings), \
+                patch.object(wezterm, '_cli', return_value='19'), \
+                patch.object(wezterm, 'focus', side_effect=RuntimeError('source refocus failed')), \
+                patch.object(wezterm, 'close', side_effect=close):
+            reply = self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})
+            self.assertFalse(reply['ok'])
+            self.assertIn('cleanup unavailable', reply['error'])
+            self.assertEqual(self.bridge.owned, {'19'})
+            cleanup['fail'] = False
+            self.assertTrue(self.request({'action': 'close', 'id': '19'})['ok'])
+            self.assertTrue(cleanup['closed'])
+            self.assertFalse(self.bridge.owned)
+
     def test_lua_timeout_during_launch_rolls_back_without_retry(self):
         launch = self.windows.launch
         finished = threading.Event()

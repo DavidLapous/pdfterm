@@ -225,11 +225,10 @@ local function launch(id, source, source_error, callback)
       vim.schedule(function()
         if exiting then
           complete('editor stopped')
+        elseif result.code ~= 0 or not split then
+          complete('terminal split failed: ' .. (result.stderr or 'missing ID'))
         else
-          complete(
-            not split and ('terminal split failed: ' .. (result.stderr or 'missing ID')) or nil,
-            split
-          )
+          complete(nil, split)
         end
       end)
     end,

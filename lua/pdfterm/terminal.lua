@@ -1,10 +1,16 @@
--- Terminal control, not graphics: Kitty and Ghostty both render Kitty protocol.
+-- Terminal control, not graphics: Kitty, Ghostty, and WezTerm render Kitty protocol.
 -- Handles identify exact surfaces; closing a handle gracefully quits its reader.
 local platform = require('pdfterm.platform')
 local ghostty_control = require('pdfterm.ghostty')
 local M = {}
-local ghostty = {}
-local adapters = { kitty = require('pdfterm.kitty'), ghostty = ghostty, ssh = require('pdfterm.ssh') }
+local ghostty, neovide = {}, {}
+local adapters = {
+  kitty = require('pdfterm.kitty'),
+  ghostty = ghostty,
+  wezterm = require('pdfterm.wezterm'),
+  ssh = require('pdfterm.ssh'),
+  neovide = neovide,
+}
 
 local split_script = [[
 on run argv
@@ -58,6 +64,56 @@ end run
   end
 end
 
+-- Neovide cannot render Kitty graphics in :terminal. Give its viewer a real
+-- Ghostty surface, without treating an inherited terminal ID as the GUI.
+function neovide.capture(callback)
+  callback(nil, tostring(vim.fn.getpid()))
+end
+
+function neovide.launch(_, argv, callback)
+  return platform.applescript(
+    [[
+on run argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set command of cfg to item 1 of argv
+    set wait after command of cfg to false
+    set environment variables of cfg to {"PATH=" & (item 2 of argv), "XDG_CONFIG_HOME=" & (item 3 of argv)}
+    set viewerWindow to new window with configuration cfg
+    return id of focused terminal of selected tab of viewerWindow
+  end tell
+end run
+]],
+    {
+      table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' '),
+      vim.env.PATH,
+      vim.env.XDG_CONFIG_HOME or '',
+    },
+    vim.schedule_wrap(function(result)
+      local ok, failure = xpcall(callback, debug.traceback, result)
+      if not ok then
+        -- The OS window exists before its handle is recorded. Roll back only
+        -- that exact surface if the ownership callback fails.
+        if result.code == 0 and result.stdout and vim.trim(result.stdout) ~= '' then
+          local closed, close_error = pcall(ghostty.close, { id = vim.trim(result.stdout) })
+          if not closed then
+            error(failure .. '; could not close unowned Ghostty window: ' .. tostring(close_error))
+          end
+        end
+        error(failure)
+      end
+    end)
+  )
+end
+
+function neovide.focus(_, callback)
+  callback({ code = 1, stderr = 'Neovide source focus is unavailable; disable focus_on_inverse' })
+end
+
+function neovide.close()
+  error('pdfterm: a Neovide source is not an owned viewer')
+end
+
 local function adapter(handle)
   local result = adapters[handle.kind]
   if not result or type(handle.id) ~= 'string' or handle.id == '' then
@@ -85,10 +141,14 @@ end
 
 function M.capture_source(callback)
   local kind = (vim.env.PDFTERM_LAUNCH_SOCKET or '') ~= '' and 'ssh'
-    or vim.env.KITTY_WINDOW_ID and 'kitty'
+    or vim.g.neovide and 'neovide'
+    or vim.env.TERM_PROGRAM == 'WezTerm' and 'wezterm'
     or vim.env.TERM_PROGRAM == 'ghostty' and 'ghostty'
+    or vim.env.KITTY_WINDOW_ID and 'kitty'
   if not kind then
-    callback('terminal launch/focus requires Kitty or Ghostty')
+    callback(
+      'automatic split requires Kitty, Ghostty, or WezTerm control; use :PdfTermViewerCommand to launch in another Kitty-graphics-compatible terminal'
+    )
     return
   end
   local ok, error = pcall(adapters[kind].capture, function(problem, id)
@@ -116,13 +176,15 @@ function M.launch_split(source, executable, pdf, callback, session, focus_token)
   local done, reply, callback_failure = false, nil, nil
   adapter(source).launch(source, argv, function(result)
     local ok, failure = xpcall(function()
-      local id = vim.trim(result.stdout)
-      callback(result, result.code == 0 and id ~= '' and { kind = source.kind, id = id } or nil)
+      local id = vim.trim(result.stdout or '')
+      local kind = source.kind == 'neovide' and 'ghostty' or source.kind
+      -- Failed rollback still transfers the exact provisional handle for exit cleanup.
+      callback(result, (result.code == 0 or result.unclosed) and id ~= '' and { kind = kind, id = id } or nil)
     end, debug.traceback)
     done, reply = true, result
     if not ok then
       -- wait() must not report transport success when ownership recording failed.
-      -- Rethrow as well: the SSH backend owns rollback of the offered handle.
+      -- Rethrow as well: backends with provisional handles roll them back.
       callback_failure = failure
       error(failure)
     end

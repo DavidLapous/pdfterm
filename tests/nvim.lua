@@ -718,7 +718,7 @@ local ok, failure = xpcall(function()
   assert(focused == 'new', 'superseded capture changed inverse focus')
   -- Ordinary forward only attaches; explicit split launches and then delivers.
   server:close()
-  local launches, notices = 0, {}
+  local launches, notices, closed_splits = 0, {}, {}
   terminal.launch_split = function(_, _, _, callback, _, token)
     launches = launches + 1
     viewer_reply_token = token
@@ -732,7 +732,8 @@ local ok, failure = xpcall(function()
     callback(nil, { kind = 'ghostty', id = 'source' })
   end
   terminal.close = function(split)
-    assert(split.id == 'viewer' or split.id == 'viewer2')
+    assert(split.id == 'viewer' or split.id == 'viewer2' or split.id == 'viewer3')
+    closed_splits[split.id] = (closed_splits[split.id] or 0) + 1
   end
   vim.notify = function(message, level)
     notices[#notices + 1] = { message = message, level = level }
@@ -800,6 +801,32 @@ local ok, failure = xpcall(function()
       and notices[#notices].message:find('viewer focus unavailable', 1, true)
   end)
   assert(focused == nil and launches == 2, 'racing viewer stole focus from the actual responder')
+  -- Failure after splitting must report failure even when failed rollback
+  -- transfers a live provisional handle for editor-exit cleanup.
+  server:close()
+  terminal.launch_split = function(_, _, _, callback)
+    launches = launches + 1
+    vim.schedule(function()
+      callback({ code = 1, stderr = 'source refocus and rollback failed', unclosed = true },
+        { kind = 'ghostty', id = 'viewer3' })
+    end)
+    return { wait = function() end }
+  end
+  before = #notices
+  local delivered = #requests
+  vim.cmd('PdfTermForwardSplit')
+  wait(function()
+    for i = before + 1, #notices do
+      if notices[i].level == vim.log.levels.ERROR
+        and notices[i].message:find('source refocus and rollback failed', 1, true)
+      then
+        return true
+      end
+    end
+    return false
+  end)
+  assert(#requests == delivered, 'failed split was reported as usable')
+  receive()
 
   -- Reinitialize through the plugin's cleanup path: setup itself is intentionally idempotent.
   -- A relative compiler argument must resolve in the inferred root cwd, not the editor/source cwd.
@@ -850,6 +877,9 @@ local ok, failure = xpcall(function()
   vim.notify = original_notify
   for _, output_folder in ipairs({ '.', 'output' }) do
     vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
+    if output_folder == '.' then
+      assert(closed_splits.viewer3 == 1, 'failed rollback lost its owned viewer')
+    end
     wait(function()
       return not vim.uv.fs_lstat(config.editor.path)
     end)
