@@ -1,6 +1,9 @@
 # pdfterm
 
-`pdfterm` is a low-latency PDF viewer for Kitty terminals. It renders on the machine where the command runs, compresses each page once, and sends the bitmap through Kitty's graphics protocol. Direct SSH sessions need no local helper.
+`pdfterm` is a low-latency PDF viewer for terminals implementing the Kitty
+graphics protocol. It renders on the machine where the command runs, compresses
+each page once, and sends the bitmap through that protocol. Direct SSH sessions
+need no local helper.
 
 This is an experimental fork of [jrf/pdfterm](https://github.com/jrf/pdfterm),
 adding continuous animated scrolling and editor-neutral SyncTeX integration.
@@ -10,12 +13,19 @@ It is not a sandboxed viewer for hostile PDFs.
 
 The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top and remain searchable alongside recursively discovered PDFs. Picker searches match filenames and parent directories, with filename matches ranked first. Press `/` to filter a picker; `Esc` clears an active query before closing it.
 
+One viewer's forward socket serves all its PDF tabs: forwarding to a different
+PDF opens or selects that tab, and `Tab` / `Shift-Tab` switches among open PDFs.
+To run independent viewers, give each a distinct `--session NAME`; a second
+viewer cannot bind an occupied session socket. `--screenshot` captures the
+selected viewer's active tab, not a PDF chosen by path.
+
 You can fit pages to the terminal width or height and scroll through the overflow, zoom in and out beyond the fitted size in discrete steps, jump around with the outline (table of contents) or a go-to-page prompt, follow annotated links, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line shows one total render time by default; press `p` to expand it into rendering, dark-mode conversion, compression, and transfer timings.
 
 ## Requirements
 
-- Rust 1.88 or newer
-- Kitty 0.20 or newer
+- Rust 1.88 or newer to build from source
+- A terminal implementing the Kitty graphics protocol (for example, Kitty
+  0.20+, Ghostty, or WezTerm 20240203-110809-5046fc22 on macOS)
 - macOS arm64, Linux x86_64, or Linux aarch64
 
 Native rendering and editor integration are verified on macOS. Linux runtime
@@ -97,7 +107,9 @@ switch to it. The new tab keeps the page, fit mode, zoom, horizontal/vertical
 scroll position, and dark-mode setting. Scrolling or closing either tab does not
 affect the other. The first extra tab adds a tab bar, reducing the available
 viewport height by one terminal row; fit modes still adapt to that space.
-Opening a PDF through `f` continues to select an existing tab for that file.
+Opening a PDF through `f` or forward search selects the active tab when it
+already displays that file, otherwise an existing matching tab, before opening
+a new one.
 
 Automatic PDF reloads preserve the current page and horizontal/vertical scroll
 offsets. If the rebuilt document has fewer pages or smaller page dimensions,
@@ -418,11 +430,14 @@ the final reply. These are failure ceilings, not readiness delays. A disconnecte
 client is discarded without retaining its pending request.
 
 Successful forward replies also identify the viewer process with a fresh token
-(or the plugin-owned split's launch token). When requested, Neovim focuses a
-manually attached viewer through a second `{"type":"focus","viewer_token":"..."}`
-request to the same socket, after checking that navigation is still current.
-The viewer rejects a different process token or a pending newer forward request
-and focuses only its own terminal. No terminal ID crosses the forward socket.
+(or the plugin-owned split's launch token). When requested, Neovim sends a
+manually attached viewer a separate `{"type":"focus","viewer_token":"..."}`
+request on the same socket, after checking that navigation is still current.
+The viewer rejects a different process token or a pending newer forward
+request. It focuses its own terminal only when it has an exact control
+backend: Kitty, Ghostty with the foreground launcher, or the wrapped SSH
+bridge. An externally attached WezTerm viewer reports focus unavailable;
+navigation still succeeds. No terminal ID crosses the forward socket.
 
 Incomplete, malformed, non-finite, unknown-field, and oversized requests are
 rejected. Send the complete request and half-close within 100 ms after connecting.
@@ -442,7 +457,7 @@ This works locally and through the SSH bridge described below.
 The PDF needs a matching `.synctex.gz` sidecar and `synctex` must be on `PATH`.
 Keybindings and automatic compilation remain optional.
 
-Before using terminal splits, follow [local Kitty/Ghostty setup](#local-terminal-split-setup).
+Before using terminal splits, follow [local Kitty/Ghostty/WezTerm setup](#local-terminal-split-setup).
 For SSH, configure the [client shell hook](#client-ssh-shell-hook) in
 `~/.bashrc` or `~/.zshrc`; plain `ssh` cannot open or focus a client split.
 
@@ -555,15 +570,34 @@ focus when requested. `:PdfTermForward` never creates a terminal split; if the
 viewer is absent it reports the missing viewer. `:PdfTermForwardSplit` can launch
 one using the captured identity when `attach_only` is false.
 Set `focus_on_forward = true` to focus the exact viewer after its forward frame
-is submitted: a plugin-owned split must return its launch token; a manually
-started viewer can focus itself via a separate token-checked socket request.
+is submitted: a plugin-owned split must return its launch token; an externally
+started viewer needs a supported exact terminal-focus backend (Kitty, Ghostty
+with its foreground launcher, or wrapped SSH, not standalone WezTerm).
 A different viewer answering during split launch never focuses an unknown split.
 Set `focus_on_inverse = true` to return to the captured editor terminal after
 inverse search. Both options default to false; explicit `setup()` options
 override `[nvim]` values in the TOML configuration.
-`:PdfTermOpen` does not shift focus, but a split opened there can be focused on a
-later forward search. Both terminals launch a right-hand split beside the captured
-source, in its existing tab and OS window.
+`:PdfTermOpen` does not shift focus for a terminal split, but a split opened
+there can be focused on a later forward search. In terminal Neovim, Kitty,
+Ghostty, and WezTerm launch a right-hand split beside the captured source,
+in its existing tab and OS window.
+
+Neovide is not a Kitty-graphics terminal; its `:terminal` buffers cannot display
+the viewer. On macOS with `attach_only = false` and no viewer running,
+`:PdfTermForwardSplit` and `:PdfTermOpen` instead open an owned Ghostty OS window
+(Ghostty must be installed). The new window may take OS focus even when
+`focus_on_forward` is false. Viewer focus uses the exact Ghostty window handle;
+inverse navigation moves Neovide's cursor, but
+`focus_on_inverse` cannot focus the original Neovide window and reports that
+limitation if requested. Leaving Neovide closes only the owned viewer.
+On other systems, use manual pairing instead of automatic GUI launch.
+
+The viewer itself has no terminal-brand check: launch `pdfterm document.pdf`
+directly in any interactive Kitty-graphics-compatible terminal. For Neovim in
+other terminal emulators, automatic splits require terminal-control support,
+not just image rendering. Run `:PdfTermViewerCommand` and paste its printed
+command into another compatible terminal; `:PdfTermForward` attaches to it.
+
 Kitty window control requires remote-control permission. If Neovim runs as an
 embedded/headless process without a controlling terminal, `kitten @` also needs
 Kitty's remote-control socket. On macOS, add to `kitty.conf` using a private
@@ -595,6 +629,16 @@ worker. Viewer launch/close retain one-shot helpers. Kitty captures its native
 window ID without a subprocess and uses the compiled `kitten` client for control.
 Its backend lives in `lua/pdfterm/kitty.lua`; `terminal.lua` owns shared launch
 and window-ownership policy.
+
+WezTerm requires `wezterm` on Neovim's `PATH` and the inherited
+`TERM_PROGRAM=WezTerm`, `WEZTERM_PANE`, and `WEZTERM_UNIX_SOCKET` from the
+source pane. The adapter verifies that pane in the captured GUI socket before
+splitting it to the right; every focus and cleanup operation uses that exact
+socket and pane ID. Missing or stale identifiers fail instead of selecting the
+currently active GUI. A plugin-owned viewer can be focused after forward
+navigation; manually launched WezTerm viewers can navigate over the socket
+but do not currently support the standalone viewer's terminal-focus request.
+
 Plain SSH sessions do not control client windows just because terminal identifiers
 were forwarded.
 
@@ -635,9 +679,10 @@ pdfterm-ssh HOST paper.tex       # start remote Neovim directly
 pdfterm-ssh -F ./ssh-config HOST # shell using an alternate SSH configuration
 ```
 
-The client needs Python 3.11+, OpenSSH, and Kitty with remote control enabled, or
-Ghostty on macOS with AppleScript control available. Run outside tmux and outside
-an existing SSH session. The remote needs Neovim, the pdfterm adapter, the viewer
+The client needs Python 3.11+, OpenSSH, and Kitty with remote control enabled,
+WezTerm with its `wezterm` CLI and inherited GUI socket, or Ghostty on macOS
+with AppleScript control available. Run outside tmux and outside an existing
+SSH session. The remote needs Neovim, the pdfterm adapter, the viewer
 binary, and TeX tools; its login shell supplies the editor's `PATH`. SSH host
 aliases, users, ports, and proxies come from the SSH configuration.
 
@@ -654,10 +699,10 @@ Finite control/bootstrap helpers never pass the terminal's input descriptor
 to the background master.
 On `:PdfTermForwardSplit` or explicit `:PdfTermOpen` when no viewer is running,
 the adapter asks the client helper to open a viewer running **SSH back to the same
-host**, with the same PDF, session, `PATH`, and configuration directory. Both
-Kitty and Ghostty split the original source terminal to the right, within the
-same tab and OS window. The PDF, SyncTeX data, and editor/viewer sockets stay
-remote; Kitty graphics travel over the viewer's SSH connection. Ordinary
+host**, with the same PDF, session, `PATH`, and configuration directory. Kitty,
+Ghostty, and WezTerm split the original source terminal to the right, within
+the same tab and OS window. The PDF, SyncTeX data, and editor/viewer sockets
+stay remote; Kitty graphics travel over the viewer's SSH connection. Ordinary
 `:PdfTermForward` attaches to an existing viewer without creating a terminal.
 Inverse-focus, if enabled, returns to the original client source terminal.
 
@@ -859,11 +904,14 @@ probe. With the relevant terminal running and automation authorized:
 ```console
 python3 tests/terminal_native.py --terminal kitty --to unix:/path/to/kitty-control.sock
 python3 tests/terminal_native.py --terminal ghostty
+python3 tests/terminal_native.py --terminal wezterm
 ```
 
 The probe creates and removes its own surfaces. It starts local Neovim in a
 new session without a controlling terminal; Kitty's socket must still launch
 and focus the exact right split. It also checks that removing the socket gives
-an actionable error without changing Kitty surfaces. Both backends check
-client-side SSH control, quoted arguments, environment, liveness and repeated
-cleanup. It does not connect to an SSH host or verify rendered PDF pixels.
+an actionable error without changing Kitty surfaces. WezTerm starts an isolated
+GUI unless given `--to /path/to/owned/gui.sock`; it checks right adjacency and
+pane activation. All three backends check client-side SSH control, quoted
+arguments, environment, liveness and repeated cleanup. The probe does not
+connect to an SSH host or verify rendered PDF pixels.
