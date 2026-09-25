@@ -953,7 +953,7 @@ impl App {
         match pick_pdf(directory, output, self.theme, || self.forward_waiting())? {
             Some(path) => {
                 let path = path.canonicalize()?;
-                if let Some(index) = self.session.tabs.iter().position(|tab| tab.path == path) {
+                if let Some(index) = self.tab_index_for_path(&path) {
                     self.session.active_tab = index;
                     self.reset_render_state();
                     self.request_current(output)?;
@@ -2224,7 +2224,7 @@ impl App {
                 return Ok(());
             }
             let pdf = fs::canonicalize(&pending.request.pdf)?;
-            let Some(index) = self.session.tabs.iter().position(|tab| tab.path == pdf) else {
+            let Some(index) = self.tab_index_for_path(&pdf) else {
                 self.begin_open(pdf, output)?;
                 return Ok(());
             };
@@ -2244,7 +2244,7 @@ impl App {
             // Take the connection while positioning so internal tab/scroll transitions
             // cannot acknowledge an older cached frame.
             let mut pending = self.navigation.forward.take().unwrap();
-            match self.apply_forward_request(&pending.request, output) {
+            match self.apply_forward_request(&pending.request, index, output) {
                 Ok(()) => {
                     pending.stage = ForwardStage::AwaitingFrame;
                     self.navigation.forward = Some(pending);
@@ -2272,20 +2272,12 @@ impl App {
     fn apply_forward_request(
         &mut self,
         request: &ForwardRequest,
+        index: usize,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         if self.session.pending_open.is_some() {
             return Err(io::Error::other("viewer is still opening a document").into());
         }
-        let pdf = fs::canonicalize(&request.pdf)?;
-        let index = self
-            .session
-            .tabs
-            .iter()
-            .position(|tab| fs::canonicalize(&tab.path).ok().as_ref() == Some(&pdf))
-            .ok_or_else(|| {
-                io::Error::other(format!("PDF is not open in this viewer: {}", pdf.display()))
-            })?;
         if request.page > self.session.tabs[index].page_count {
             return Err(io::Error::other("forward page is outside the document").into());
         }
@@ -7590,6 +7582,25 @@ mod tests {
             link_count: 5,
         };
         assert_eq!(snapshot.status(false, true), "render 71ms  5 page links");
+    }
+
+    #[test]
+    fn path_navigation_prefers_the_active_duplicate_then_any_matching_tab() {
+        let (mut app, _, _file) = continuous_app();
+        let (mut other, _, other_file) = continuous_app();
+        let path = app.tab().path.clone();
+        let mut duplicate = other.session.tabs.pop().unwrap();
+        duplicate.document_id += 1;
+        duplicate.path = path.clone();
+        app.session.tabs.push(duplicate);
+
+        app.session.active_tab = 1;
+        assert_eq!(app.tab_index_for_path(&path), Some(1));
+        app.session.active_tab = 0;
+        assert_eq!(app.tab_index_for_path(&path), Some(0));
+
+        app.session.tabs[0].path = other_file.path().to_owned();
+        assert_eq!(app.tab_index_for_path(&path), Some(1));
     }
 
     #[test]

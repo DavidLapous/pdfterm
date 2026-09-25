@@ -406,4 +406,13 @@ impl App {
             .iter()
             .position(|tab| tab.document_id == document_id)
     }
+
+    pub(super) fn tab_index_for_path(&self, path: &Path) -> Option<usize> {
+        self.session
+            .tabs
+            .get(self.session.active_tab)
+            .filter(|tab| tab.path == path)
+            .map(|_| self.session.active_tab)
+            .or_else(|| self.session.tabs.iter().position(|tab| tab.path == path))
+    }
 }
