@@ -90,6 +90,35 @@ function M.run(argv, cwd, timeout, callback, on_output)
   end
 end
 
+-- TeXShop root directives name the owning document, not the source cursor.
+local function root_source(source)
+  local visited = {}
+  while vim.fn.filereadable(source) == 1 do
+    local identity = vim.uv.fs_realpath(source) or source
+    assert(not visited[identity], 'pdfterm: cyclic TeX root directive at ' .. source)
+    visited[identity] = true
+    local target
+    for _, line in ipairs(vim.fn.readfile(source, '', 20)) do
+      target = line:match('^%s*%%%s*!%s*[Tt][Ee][Xx]%s+[Rr][Oo][Oo][Tt]%s*=%s*(.-)%s*$')
+      if target then
+        break
+      end
+    end
+    if not target then
+      return source
+    end
+    target = target:match('^"(.*)"$') or target:match("^'(.*)'$") or target
+    assert(target:match('%.tex$'), 'pdfterm: TeX root directive must name a .tex file in ' .. source)
+    if not vim.startswith(target, '/') then
+      target = vim.fs.dirname(source) .. '/' .. target
+    end
+    target = assert(vim.uv.fs_realpath(target), 'pdfterm: TeX root file does not exist: ' .. target)
+    assert(vim.fn.filereadable(target) == 1, 'pdfterm: TeX root file is not readable: ' .. target)
+    source = target
+  end
+  return source
+end
+
 function M.describe(config, main)
   local p = config or {}
   local source = p.main or main
@@ -97,12 +126,15 @@ function M.describe(config, main)
     type(source) == 'string' and source:match('%.tex$'),
     'pdfterm: select a main TeX file with :PdfTermMain or project.main'
   )
-  local cwd = vim.fn.fnamemodify(p.cwd or vim.fn.fnamemodify(source, ':p:h'), ':p')
-  cwd = assert(vim.uv.fs_realpath(cwd), 'pdfterm: project working directory does not exist')
   if p.cwd and not vim.startswith(source, '/') then
-    source = cwd .. '/' .. source
+    source = vim.fn.fnamemodify(p.cwd, ':p') .. '/' .. source
   end
   source = vim.fs.normalize(vim.fn.fnamemodify(source, ':p'))
+  if not p.main then
+    source = root_source(source)
+  end
+  local cwd = vim.fn.fnamemodify(p.cwd or vim.fs.dirname(source), ':p')
+  cwd = assert(vim.uv.fs_realpath(cwd), 'pdfterm: project working directory does not exist')
   local pdf = p.pdf or source:gsub('%.tex$', '.pdf')
   if not vim.startswith(pdf, '/') then
     pdf = cwd .. '/' .. pdf

@@ -483,6 +483,26 @@ and its Enter-to-retry mapping. Disable competing PDF buffer handlers in your
 configuration. Personal paths and keybindings stay in your plugin specification;
 builds, sessions, navigation, terminal control, and cleanup belong to the plugin.
 
+For multi-file LaTeX documents, put a TeXShop-style root directive in the first
+20 lines of each included file:
+
+```tex
+% !TEX root = ../main.tex
+```
+
+The path is relative to the file containing the directive, not Neovim's working
+directory. Use `main.tex` for an include beside the main file, `../main.tex` for
+an include one directory below it, or an absolute path. Paths with spaces are
+supported, with or without surrounding quotes. Root directives can be chained;
+cycles and missing root files report an error.
+
+Forward search uses the root document's PDF while preserving the included
+file's cursor location. Builds and `:PdfTermViewerCommand` use the same root.
+An explicit `project.main` or `:PdfTermMain` selection takes precedence over
+directives; `project.cwd`, `project.pdf`, and `project.build` still override
+their defaults. Without a directive or explicit main selection, the current
+file remains the main document. Inverse search is unchanged.
+
 For an explicit LaTeX command, add `project` inside `opts`:
 
 ```lua

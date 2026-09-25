@@ -128,6 +128,65 @@ local ok, failure = xpcall(function()
   end)
   assert(result.code ~= 0 and result.stderr:find('1 MiB'))
 
+  -- Root comments select the build/PDF project, not the included source being edited.
+  local root_directory = directory .. '/root project'
+  vim.fn.mkdir(root_directory .. '/chapters/deep', 'p')
+  local root_source = root_directory .. '/Main Root.tex'
+  vim.fn.writefile({ '\\documentclass{article}' }, root_source)
+  local function root_file(name, lines)
+    local path = root_directory .. '/' .. name
+    vim.fn.writefile(lines, path)
+    return path
+  end
+  local sibling = root_file('sibling.tex', { '  %  !tEx   RoOt = "Main Root.tex"  ' })
+  local nested = root_file('chapters/deep/child.tex', { '% !TEX root = ../parent.tex' })
+  root_file('chapters/parent.tex', { "% !TEX root = '../Main Root.tex'" })
+  local absolute = root_file('absolute.tex', { '% !TEX root = ' .. root_source })
+  assert(vim.uv.fs_symlink(root_directory .. '/chapters/deep', root_directory .. '/linked'))
+  local linked = root_file('linked-child.tex', { '% !TEX root = linked/../../Main Root.tex' })
+  local boundary_lines = {}
+  for index = 1, 19 do
+    boundary_lines[index] = '% header'
+  end
+  boundary_lines[20] = '% !TEX root = Main Root.tex'
+  local boundary = root_file('boundary.tex', boundary_lines)
+  for _, child in ipairs({ sibling, nested, absolute, linked, boundary }) do
+    local described = project.describe(nil, child)
+    assert(described.main == vim.uv.fs_realpath(root_source), 'included file remained the build root')
+    assert(described.cwd == vim.uv.fs_realpath(root_directory), 'root did not determine working directory')
+    assert(described.pdf == root_source:gsub('%.tex$', '.pdf'), 'included file selected its own PDF')
+    assert(described.build[#described.build] == described.main, 'default build did not target root')
+  end
+  table.insert(boundary_lines, 1, '% header')
+  local late = root_file('late.tex', boundary_lines)
+  assert(project.describe(nil, late).main == late, 'root comment beyond line 20 was followed')
+
+  local missing = root_file('missing.tex', { '% !TEX root = absent.tex' })
+  local wrong_type = root_file('wrong-type.tex', { '% !TEX root = notes.txt' })
+  root_file('notes.txt', { 'Not a TeX project.' })
+  local cycle = root_file('cycle.tex', { '% !TEX root = chapters/cycle.tex' })
+  root_file('chapters/cycle.tex', { '% !TEX root = ../cycle-alias.tex' })
+  assert(vim.uv.fs_symlink(cycle, root_directory .. '/cycle-alias.tex'))
+  for _, invalid in ipairs({ missing, wrong_type, cycle }) do
+    local accepted, error = pcall(project.describe, nil, invalid)
+    assert(not accepted and type(error) == 'string', 'invalid root project was accepted: ' .. invalid)
+  end
+
+  vim.fn.mkdir(root_directory .. '/output')
+  local custom_build = { 'pdflatex', '-output-directory=output', root_source }
+  for _, explicit in ipairs({ false, true }) do
+    local described = project.describe({
+      main = explicit and '../Main Root.tex' or nil,
+      cwd = root_directory .. '/output',
+      pdf = 'custom.pdf',
+      build = custom_build,
+    }, explicit and missing or nested)
+    assert(described.main == vim.uv.fs_realpath(root_source), 'explicit main did not override root comment')
+    assert(described.cwd == vim.uv.fs_realpath(root_directory .. '/output'), 'configured cwd was replaced')
+    assert(described.pdf == root_directory .. '/output/custom.pdf', 'configured PDF directory was lost')
+    assert(vim.deep_equal(described.build, custom_build), 'configured build command was replaced')
+  end
+
   vim.fn.writefile(
     { 'forward_socket="forward.sock"', '[editor]', 'transport="socket"', 'path="editor.sock"' },
     directory .. '/pdfterm/config.toml'
@@ -535,8 +594,89 @@ local ok, failure = xpcall(function()
       and notices[#notices].message:find('viewer focus unavailable', 1, true)
   end)
   assert(focused == nil and launches == 2, 'racing viewer stole focus from the actual responder')
+
+  -- Reinitialize through the plugin's cleanup path: setup itself is intentionally idempotent.
+  -- Resolve real included text on distinct pages, both beside the root and in an output folder.
+  local included_directory = directory .. '/included project'
+  vim.fn.mkdir(included_directory .. '/chapters/deep', 'p')
+  vim.fn.mkdir(included_directory .. '/output')
+  local included_main = included_directory .. '/main.tex'
+  vim.fn.writefile({
+    '\\documentclass{article}',
+    '\\pagestyle{empty}',
+    '\\begin{document}',
+    'Root page is not an included source target.',
+    '\\newpage',
+    '\\input{same}',
+    '\\newpage',
+    '\\input{chapters/deep/nested}',
+    '\\end{document}',
+  }, included_main)
+  vim.fn.writefile({ '% !TEX root = ../main.tex' }, included_directory .. '/chapters/root.tex')
+  local included_cases = {
+    { file = 'same.tex', directive = 'main.tex', page = 2, word = 'zephyr' },
+    { file = 'chapters/deep/nested.tex', directive = '../root.tex', page = 3, word = 'quartz' },
+  }
+  for _, case in ipairs(included_cases) do
+    case.path = included_directory .. '/' .. case.file
+    case.text = 'The caf' .. string.char(195, 169) .. ' contains the distinct target ' .. case.word .. '.'
+    vim.fn.writefile({
+      '% !TEX root = ' .. case.directive,
+      '',
+      'A different paragraph must not become the cursor target.',
+      '',
+      case.text,
+    }, case.path)
+  end
+  vim.notify = original_notify
+  for _, output_folder in ipairs({ '.', 'output' }) do
+    vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
+    wait(function()
+      return not vim.uv.fs_lstat(config.editor.path)
+    end)
+    package.loaded['pdfterm'] = nil
+    adapter = require('pdfterm')
+    local included_pdf = included_directory
+      .. (output_folder == '.' and '/main.pdf' or '/output/main.pdf')
+    adapter.setup({
+      executable = binary,
+      session = 'adapter',
+      attach_only = true,
+      focus_on_inverse = false,
+      focus_on_forward = false,
+      compile = true,
+      project = {
+        pdf = output_folder == 'output' and 'output/main.pdf' or nil,
+        build = {
+          'pdflatex',
+          '-interaction=nonstopmode',
+          '-halt-on-error',
+          '-synctex=1',
+          '-output-directory=' .. output_folder,
+          included_main,
+        },
+      },
+    })
+    for _, case in ipairs(included_cases) do
+      vim.cmd.edit(vim.fn.fnameescape(case.path))
+      local byte_column = assert(case.text:find(case.word, 1, true)) + #case.word - 2
+      vim.api.nvim_win_set_cursor(0, { 5, byte_column })
+      local previous = #requests
+      adapter.forward()
+      wait(function()
+        return #requests == previous + 1
+      end)
+      local request = requests[#requests]
+      assert(request.pdf == vim.uv.fs_realpath(included_pdf), 'forward opened an included-file PDF')
+      assert(request.page == case.page, 'forward lost the included source page')
+      assert(
+        request.word and request.word.words[request.word.selected + 1] == case.word,
+        'forward lost the original included text or Unicode cursor column'
+      )
+    end
+  end
   print(
-    'adapter regressions passed: builds, timeouts, bootstrap, sessions, forward focus, inverse focus, split ownership; event ticks='
+    'adapter regressions passed: builds, timeouts, bootstrap, sessions, root projects, included forward, forward focus, inverse focus, split ownership; event ticks='
       .. ticks
   )
 end, debug.traceback)
