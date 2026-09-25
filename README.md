@@ -99,6 +99,10 @@ affect the other. The first extra tab adds a tab bar, reducing the available
 viewport height by one terminal row; fit modes still adapt to that space.
 Opening a PDF through `f` continues to select an existing tab for that file.
 
+Automatic PDF reloads preserve the current page and horizontal/vertical scroll
+offsets. If the rebuilt document has fewer pages or smaller page dimensions,
+the viewport is clamped to the remaining page and its available scroll range.
+
 Vertical scrolling shows adjacent pages together, separated by one terminal row,
 in every fit mode. Links and inverse search target the page under the pointer,
 not just the first visible page. The `h`/`l` keys and left/right arrows scroll

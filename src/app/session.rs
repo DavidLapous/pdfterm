@@ -201,8 +201,6 @@ impl App {
                 tab.revision = revision;
                 tab.page_count = pages;
                 tab.page = tab.page.min(pages - 1);
-                tab.scroll_x = 0;
-                tab.scroll_y = 0;
                 tab.outline = Arc::new(outline);
                 tab.cache.clear();
                 tab.search = SearchState::default();

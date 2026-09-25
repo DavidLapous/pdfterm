@@ -3921,6 +3921,8 @@ impl App {
             // height + cell. This is the inclusive clamp for that half-open span.
             frame.height + cell - 1
         };
+        let max_x = frame.width.saturating_sub(u32::from(viewport.pixel_width));
+        self.tab_mut().scroll_x = self.tab().scroll_x.min(max_x);
         self.tab_mut().scroll_y = self.tab().scroll_y.min(max_y);
         let old_pages = std::mem::take(&mut self.visible_pages);
         if old_pages.is_empty()
@@ -7335,6 +7337,51 @@ mod tests {
         app.tab_mut().cache.retain(|key, _| key.page != 1);
         app.pending.insert(target);
         (app, viewport, file)
+    }
+
+    #[test]
+    fn continuous_redraw_clamps_retained_offsets_to_smaller_page() {
+        let (mut app, mut viewport, _file) = continuous_app();
+        viewport.pixel_width = 60;
+        app.tab_mut().page_count = 1;
+        app.tab_mut().scroll_x = 37;
+        app.tab_mut().scroll_y = 123;
+        let revision = app.tab().watcher.accepted;
+        let key = app.page_key(0, viewport);
+        let frame = continuous_frame(key, revision, false);
+        app.tab_mut().cache.insert(key, frame.clone());
+        app.draw_continuous(&frame, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!((app.tab().scroll_x, app.tab().scroll_y), (20, 40));
+    }
+
+    #[test]
+    fn reload_preserves_view_and_clamps_removed_pages() {
+        let (mut app, _, _file) = continuous_app();
+        let (mut other, _, _other_file) = continuous_app();
+        let mut other_tab = other.session.tabs.pop().unwrap();
+        other_tab.document_id += 1;
+        app.session.tabs.push(other_tab);
+        app.session.active_tab = 1;
+        for pages in [2, 1] {
+            let tab = &mut app.session.tabs[0];
+            tab.page = 1;
+            tab.scroll_x = 37;
+            tab.scroll_y = 123;
+            tab.zoom = 150;
+            let document_id = tab.document_id;
+            let revision = tab.revision;
+            app.session.pending_open = Some(super::session::PendingOpen::Reload {
+                document_id,
+                fingerprint: tab.watcher.accepted,
+            });
+            app.finish_open(document_id, pages, Vec::new(), revision, &mut Vec::new())
+                .unwrap();
+            let tab = &app.session.tabs[0];
+            assert_eq!(tab.page, pages - 1);
+            assert_eq!((tab.scroll_x, tab.scroll_y, tab.zoom), (37, 123, 150));
+            assert!(tab.cache.is_empty());
+        }
     }
 
     #[test]
