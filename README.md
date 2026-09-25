@@ -494,7 +494,8 @@ The path is relative to the file containing the directive, not Neovim's working
 directory. Use `main.tex` for an include beside the main file, `../main.tex` for
 an include one directory below it, or an absolute path. Paths with spaces are
 supported, with or without surrounding quotes. Root directives can be chained;
-cycles and missing root files report an error.
+a root directive pointing to its own file ends resolution successfully. Loops
+through different files and missing root files report an error.
 
 Forward search uses the root document's PDF while preserving the included
 file's cursor location. Builds and `:PdfTermViewerCommand` use the same root.

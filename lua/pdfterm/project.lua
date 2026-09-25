@@ -114,6 +114,9 @@ local function root_source(source)
     end
     target = assert(vim.uv.fs_realpath(target), 'pdfterm: TeX root file does not exist: ' .. target)
     assert(vim.fn.filereadable(target) == 1, 'pdfterm: TeX root file is not readable: ' .. target)
+    if target == identity then
+      return target
+    end
     source = target
   end
   return source

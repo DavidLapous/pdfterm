@@ -157,6 +157,17 @@ local ok, failure = xpcall(function()
     assert(described.pdf == root_source:gsub('%.tex$', '.pdf'), 'included file selected its own PDF')
     assert(described.build[#described.build] == described.main, 'default build did not target root')
   end
+  for _, directive in ipairs({ 'Main Root.tex', './Main Root.tex', 'self-alias.tex' }) do
+    if directive == 'self-alias.tex' then
+      assert(vim.uv.fs_symlink(root_source, root_directory .. '/self-alias.tex'))
+    end
+    vim.fn.writefile({ '% !TEX root = ' .. directive }, root_source)
+    for _, child in ipairs({ root_source, nested }) do
+      local described = project.describe(nil, child)
+      assert(described.main == vim.uv.fs_realpath(root_source), 'self-root did not terminate resolution')
+      assert(described.pdf == root_source:gsub('%.tex$', '.pdf'), 'self-root selected the wrong PDF')
+    end
+  end
   table.insert(boundary_lines, 1, '% header')
   local late = root_file('late.tex', boundary_lines)
   assert(project.describe(nil, late).main == late, 'root comment beyond line 20 was followed')
@@ -602,6 +613,7 @@ local ok, failure = xpcall(function()
   vim.fn.mkdir(included_directory .. '/output')
   local included_main = included_directory .. '/main.tex'
   vim.fn.writefile({
+    '% !TEX root = main.tex',
     '\\documentclass{article}',
     '\\pagestyle{empty}',
     '\\begin{document}',
