@@ -483,8 +483,22 @@ and its Enter-to-retry mapping. Disable competing PDF buffer handlers in your
 configuration. Personal paths and keybindings stay in your plugin specification;
 builds, sessions, navigation, terminal control, and cleanup belong to the plugin.
 
-For multi-file LaTeX documents, put a TeXShop-style root directive in the first
-20 lines of each included file:
+For multi-file LaTeX documents, the plugin automatically finds the main file
+through literal `\input`, `\include`, and `\subfile` references, including
+transitive includes and files in subdirectories. No root directives are needed
+for these projects. It checks `.tex` files in the source directory and then its
+ancestors for a `\documentclass` and an inclusion path to the current file.
+The nearest directory with a matching document wins; multiple matches report
+an error instead of choosing a PDF. Discovery stops at the nearest `.git`/`.jj`
+boundary, the home directory, or the filesystem root, and does not search
+unrelated subdirectories.
+
+Include paths are relative to the main file's directory (or `project.cwd`),
+including paths inside nested includes. Discovery reads current source files,
+so it also works before the first build. It does not evaluate TeX macros,
+conditionals, or package search paths. For projects needing those features,
+select `project.main` / `:PdfTermMain`, or put a TeXShop-style root directive in
+the first 20 lines of an included file:
 
 ```tex
 % !TEX root = ../main.tex
@@ -500,9 +514,10 @@ through different files and missing root files report an error.
 Forward search uses the root document's PDF while preserving the included
 file's cursor location. Builds and `:PdfTermViewerCommand` use the same root.
 An explicit `project.main` or `:PdfTermMain` selection takes precedence over
-directives; `project.cwd`, `project.pdf`, and `project.build` still override
-their defaults. Without a directive or explicit main selection, the current
-file remains the main document. Inverse search is unchanged.
+directives, which take precedence over automatic discovery. `project.cwd`,
+`project.pdf`, and `project.build` still override their defaults. If no main
+file can be found, the current file remains the main document. Inverse search
+is unchanged.
 
 For an explicit LaTeX command, add `project` inside `opts`:
 

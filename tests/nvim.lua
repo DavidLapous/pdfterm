@@ -198,6 +198,201 @@ local ok, failure = xpcall(function()
     assert(vim.deep_equal(described.build, custom_build), 'configured build command was replaced')
   end
 
+  -- Ownership requires a literal inclusion path, not merely a nearby TeX document.
+  local automatic_directory = directory .. '/automatic roots'
+  local automatic_cases = {
+    {
+      name = 'same directory',
+      source = 'body.tex',
+      main = 'main.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\input body' },
+        ['body.tex'] = { 'Included without a root directive.' },
+      },
+    },
+    {
+      name = 'dotted input basename',
+      source = 'sections/chapter.1.tex',
+      main = 'main.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\input{sections/chapter.1}' },
+        ['sections/chapter.1'] = { 'The .tex candidate takes precedence over this exact name.' },
+        ['sections/chapter.1.tex'] = { 'A dotted basename with the .tex extension omitted.' },
+      },
+    },
+    {
+      name = 'exact input fallback',
+      source = 'body.tex',
+      main = 'main.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\input{bridge.inc}' },
+        ['bridge.inc'] = { '\\input{body}' },
+        ['body.tex'] = { 'The exact include name is used when no .tex candidate exists.' },
+      },
+    },
+    {
+      name = 'root relative graph',
+      source = 'figures/background example.tex',
+      main = 'main.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\include{sections/introduction.tex}' },
+        ['sections/introduction.tex'] = { '\\subfile{sections/appendix}' },
+        ['sections/appendix.tex'] = { '\\input{sections/introduction}', '\\input{figures/background example}' },
+        ['figures/background example.tex'] = { 'A transitive figure.' },
+      },
+    },
+    {
+      name = 'configured compilation directory',
+      source = 'work/body.tex',
+      main = 'main.tex',
+      cwd = 'work',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\input{body}' },
+        ['work/body.tex'] = { 'Resolved from the configured compilation directory.' },
+      },
+    },
+    {
+      name = 'absolute include',
+      source = 'child.tex',
+      main = 'main.tex',
+      files = {
+        ['main.tex'] = {
+          '\\documentclass{article}',
+          '\\input{' .. automatic_directory .. '/absolute include/child.tex}',
+        },
+        ['child.tex'] = { 'An absolute literal path with spaces.' },
+      },
+    },
+    {
+      name = 'nearest owner',
+      source = 'nested/body.tex',
+      main = 'nested/local.tex',
+      files = {
+        ['outer.tex'] = { '\\documentclass{article}', '\\input{nested/body}' },
+        ['nested/local.tex'] = { '\\documentclass{article}', '\\input{body}' },
+        ['nested/body.tex'] = { 'The nearest owner wins.' },
+      },
+    },
+    {
+      name = 'standalone source',
+      source = 'nested/body.tex',
+      main = 'nested/body.tex',
+      files = {
+        ['outer.tex'] = { '\\documentclass{article}', '\\input{nested/body}' },
+        ['nested/body.tex'] = { '\\documentclass{article}' },
+      },
+    },
+    {
+      name = 'not included',
+      source = 'body.tex',
+      main = 'body.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\input{other}' },
+        ['other.tex'] = { 'Not the source.' },
+        ['body.tex'] = { 'An unrelated source.' },
+        ['archive/old.tex'] = { '\\documentclass{article}', '\\input{../body}' },
+      },
+    },
+    {
+      name = 'ignored commands',
+      source = 'body.tex',
+      main = 'body.tex',
+      files = {
+        ['main.tex'] = {
+          '\\documentclass{article}',
+          '% \\input{body}',
+          '\\\\input{body}',
+          '\\\\include{body}',
+          '\\verb|\\input{body}|',
+          '\\verb*+\\include{body}+',
+          '\\begin{verbatim}',
+          '\\input{body}',
+          '\\end{verbatim}',
+          '\\input{\\target}',
+          '\\input{body\\suffix}',
+          '\\input{body#1}',
+        },
+        ['fake-root.tex'] = { '% \\documentclass{article}', '\\input{body}' },
+        ['escaped-root.tex'] = { '\\\\documentclass{article}', '\\input{body}' },
+        ['body.tex'] = { 'No real inclusion command reaches this source.' },
+      },
+    },
+    {
+      name = 'dynamic path',
+      source = 'body#1.tex',
+      main = 'body#1.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\input{body#1}' },
+        ['body#1.tex'] = { 'A macro parameter is not a literal path, even if a matching file exists.' },
+      },
+    },
+    {
+      name = 'escaped percent',
+      source = 'body.tex',
+      main = 'main.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\% \\input% comment before path', '{body}' },
+        ['body.tex'] = { 'An escaped percent is not a comment.' },
+      },
+    },
+    {
+      name = 'vcs boundary',
+      source = 'nested/body.tex',
+      main = 'nested/body.tex',
+      files = {
+        ['main.tex'] = { '\\documentclass{article}', '\\input{nested/body}' },
+        ['nested/.jj/marker'] = {},
+        ['nested/body.tex'] = { 'An outer repository must not own this source.' },
+      },
+    },
+  }
+  for _, case in ipairs(automatic_cases) do
+    local base = automatic_directory .. '/' .. case.name
+    vim.fn.mkdir(base .. '/.git', 'p')
+    for name, lines in pairs(case.files) do
+      vim.fn.mkdir(vim.fs.dirname(base .. '/' .. name), 'p')
+      vim.fn.writefile(lines, base .. '/' .. name)
+    end
+    local options = case.cwd and { cwd = base .. '/' .. case.cwd } or nil
+    local described = project.describe(options, base .. '/' .. case.source)
+    local expected_main = assert(vim.uv.fs_realpath(base .. '/' .. case.main))
+    assert(described.main == expected_main, case.name .. ': incorrect source owner')
+    assert(
+      described.cwd == vim.uv.fs_realpath(case.cwd and base .. '/' .. case.cwd or vim.fs.dirname(expected_main)),
+      case.name .. ': incorrect compilation directory'
+    )
+    assert(described.pdf == expected_main:gsub('%.tex$', '.pdf'), case.name .. ': incorrect PDF')
+    assert(described.build[#described.build] == expected_main, case.name .. ': default compiler targets the wrong source')
+  end
+
+  local graph_directory = automatic_directory .. '/changing graph'
+  vim.fn.mkdir(graph_directory .. '/.git', 'p')
+  local graph_main, graph_other, graph_child = graph_directory .. '/main.tex',
+    graph_directory .. '/other.tex', graph_directory .. '/child.tex'
+  vim.fn.writefile({ '\\documentclass{article}', '\\input{cycle}', '\\input{child}' }, graph_main)
+  vim.fn.writefile({ '\\input{main-alias}' }, graph_directory .. '/cycle.tex')
+  vim.fn.writefile({ 'The graph contains a canonical-path cycle.' }, graph_child)
+  assert(vim.uv.fs_symlink(graph_main, graph_directory .. '/main-alias.tex'))
+  assert(project.describe(nil, graph_child).main == graph_main, 'symlink cycle or duplicate owner broke discovery')
+  vim.fn.writefile({ '\\documentclass{article}' }, graph_main)
+  assert(project.describe(nil, graph_child).main == graph_child, 'removed inclusion remained cached')
+  vim.fn.writefile({ '\\documentclass{article}', '\\input{child}' }, graph_other)
+  assert(project.describe(nil, graph_child).main == graph_other, 'new inclusion was not discovered')
+  vim.fn.writefile({ '\\documentclass{article}', '\\input{child}' }, graph_main)
+  local accepted, ambiguity = pcall(project.describe, nil, graph_child)
+  assert(not accepted and type(ambiguity) == 'string', 'ambiguous owners silently selected a root')
+  assert(
+    ambiguity:find(graph_main, 1, true) and ambiguity:find(graph_other, 1, true)
+      and ambiguity:find(':PdfTermMain', 1, true) and ambiguity:find('project.main', 1, true),
+    'ambiguous owners did not identify candidates and explicit selection'
+  )
+  assert(project.describe({ main = graph_other }, graph_child).main == graph_other, 'explicit main did not resolve ambiguity')
+  vim.fn.writefile({ '% !TEX root = main.tex' }, graph_child)
+  assert(project.describe(nil, graph_child).main == graph_main, 'root directive did not override automatic ambiguity')
+  assert(project.describe({ main = graph_other }, graph_child).main == graph_other, 'explicit main lost to a root directive')
+  vim.fn.writefile({ '% !TEX root = child.tex' }, graph_child)
+  assert(project.describe(nil, graph_child).main == graph_child, 'self-root lost to automatic ownership')
+
   vim.fn.writefile(
     { 'forward_socket="forward.sock"', '[editor]', 'transport="socket"', 'path="editor.sock"' },
     directory .. '/pdfterm/config.toml'
@@ -607,13 +802,14 @@ local ok, failure = xpcall(function()
   assert(focused == nil and launches == 2, 'racing viewer stole focus from the actual responder')
 
   -- Reinitialize through the plugin's cleanup path: setup itself is intentionally idempotent.
-  -- Resolve real included text on distinct pages, both beside the root and in an output folder.
+  -- A relative compiler argument must resolve in the inferred root cwd, not the editor/source cwd.
   local included_directory = directory .. '/included project'
   vim.fn.mkdir(included_directory .. '/chapters/deep', 'p')
-  vim.fn.mkdir(included_directory .. '/output')
+  vim.fn.mkdir(included_directory .. '/output/chapters', 'p')
+  vim.fn.mkdir(included_directory .. '/figures')
   local included_main = included_directory .. '/main.tex'
   vim.fn.writefile({
-    '% !TEX root = main.tex',
+    '% Included sources below exercise independent root-selection paths.',
     '\\documentclass{article}',
     '\\pagestyle{empty}',
     '\\begin{document}',
@@ -622,10 +818,21 @@ local ok, failure = xpcall(function()
     '\\input{same}',
     '\\newpage',
     '\\input{chapters/deep/nested}',
+    '\\newpage',
+    '\\input{automatic}',
+    '\\include{chapters/chain}',
     '\\end{document}',
   }, included_main)
   vim.fn.writefile({ '% !TEX root = ../main.tex' }, included_directory .. '/chapters/root.tex')
+  vim.fn.writefile({
+    '\\input{chapters/deep/automatic.1}',
+    '\\newpage',
+    '\\input{figures/transitive}',
+  }, included_directory .. '/chapters/chain.tex')
   local included_cases = {
+    { file = 'automatic.tex', page = 4, word = 'saffron' },
+    { file = 'chapters/deep/automatic.1.tex', page = 5, word = 'cobalt' },
+    { file = 'figures/transitive.tex', page = 6, word = 'azimuth' },
     { file = 'same.tex', directive = 'main.tex', page = 2, word = 'zephyr' },
     { file = 'chapters/deep/nested.tex', directive = '../root.tex', page = 3, word = 'quartz' },
   }
@@ -633,7 +840,7 @@ local ok, failure = xpcall(function()
     case.path = included_directory .. '/' .. case.file
     case.text = 'The caf' .. string.char(195, 169) .. ' contains the distinct target ' .. case.word .. '.'
     vim.fn.writefile({
-      '% !TEX root = ' .. case.directive,
+      case.directive and '% !TEX root = ' .. case.directive or '% No root directive.',
       '',
       'A different paragraph must not become the cursor target.',
       '',
@@ -650,6 +857,7 @@ local ok, failure = xpcall(function()
     adapter = require('pdfterm')
     local included_pdf = included_directory
       .. (output_folder == '.' and '/main.pdf' or '/output/main.pdf')
+    assert(not vim.uv.fs_stat(included_pdf), 'integration reused an already-built output PDF')
     adapter.setup({
       executable = binary,
       session = 'adapter',
@@ -665,7 +873,7 @@ local ok, failure = xpcall(function()
           '-halt-on-error',
           '-synctex=1',
           '-output-directory=' .. output_folder,
-          included_main,
+          'main.tex',
         },
       },
     })

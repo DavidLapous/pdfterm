@@ -92,7 +92,7 @@ end
 
 -- TeXShop root directives name the owning document, not the source cursor.
 local function root_source(source)
-  local visited = {}
+  local visited, explicit = {}, false
   while vim.fn.filereadable(source) == 1 do
     local identity = vim.uv.fs_realpath(source) or source
     assert(not visited[identity], 'pdfterm: cyclic TeX root directive at ' .. source)
@@ -105,8 +105,9 @@ local function root_source(source)
       end
     end
     if not target then
-      return source
+      return source, explicit
     end
+    explicit = true
     target = target:match('^"(.*)"$') or target:match("^'(.*)'$") or target
     assert(target:match('%.tex$'), 'pdfterm: TeX root directive must name a .tex file in ' .. source)
     if not vim.startswith(target, '/') then
@@ -115,9 +116,217 @@ local function root_source(source)
     target = assert(vim.uv.fs_realpath(target), 'pdfterm: TeX root file does not exist: ' .. target)
     assert(vim.fn.filereadable(target) == 1, 'pdfterm: TeX root file is not readable: ' .. target)
     if target == identity then
-      return target
+      return target, true
     end
     source = target
+  end
+  return source, explicit
+end
+
+-- This is a literal source graph, not a TeX interpreter. In particular, macro
+-- filenames, conditionals, search paths and catcode changes are not evaluated.
+local function tex_includes(path)
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok then
+    return { inputs = {} }
+  end
+  local text, inputs, document = table.concat(lines, '\n'), {}, false
+  local function after_comment(pos)
+    local newline = text:find('\n', pos, true)
+    return newline and newline + 1 or #text + 1
+  end
+  local function whitespace(pos)
+    while pos <= #text do
+      local char = text:sub(pos, pos)
+      if char == '%' then
+        pos = after_comment(pos)
+      elseif char:match('%s') then
+        pos = pos + 1
+      else
+        break
+      end
+    end
+    return pos
+  end
+  local function argument(pos, unbraced)
+    pos = whitespace(pos)
+    local first, value = text:sub(pos, pos), {}
+    if first == '{' then
+      local depth = 1
+      pos = pos + 1
+      while pos <= #text do
+        local char = text:sub(pos, pos)
+        if char == '%' then
+          pos = after_comment(pos)
+        elseif char == '\\' then
+          value[#value + 1] = text:sub(pos, pos + 1)
+          pos = pos + 2
+        else
+          if char == '{' then
+            depth = depth + 1
+          elseif char == '}' then
+            depth = depth - 1
+            if depth == 0 then
+              return table.concat(value), pos + 1
+            end
+          end
+          value[#value + 1] = char
+          pos = pos + 1
+        end
+      end
+    elseif unbraced then
+      if first == '"' then
+        local finish = text:find('"', pos + 1, true)
+        if finish then
+          return text:sub(pos + 1, finish - 1), finish + 1
+        end
+      else
+        local finish = text:find('[%s%%{}]', pos)
+        finish = finish or #text + 1
+        return text:sub(pos, finish - 1), finish
+      end
+    end
+    return nil, pos
+  end
+  local pos = 1
+  while pos <= #text do
+    local char = text:sub(pos, pos)
+    if char == '%' then
+      pos = after_comment(pos)
+    elseif char == '\\' then
+      local _, finish, command = text:find('^([%a@]+)', pos + 1)
+      if not command then
+        -- A control symbol consumes both characters: \\input is not \input.
+        pos = pos + 2
+      else
+        pos = finish + 1
+        if command == 'verb' then
+          if text:sub(pos, pos) == '*' then
+            pos = pos + 1
+          end
+          local delimiter = text:sub(pos, pos)
+          local close = delimiter ~= '' and text:find(delimiter, pos + 1, true)
+          local newline = text:find('\n', pos, true)
+          pos = math.min(close or #text, newline or #text) + 1
+        elseif command == 'begin' then
+          local environment
+          environment, pos = argument(pos, false)
+          if environment == 'verbatim' or environment == 'verbatim*' or environment == 'Verbatim' then
+            local _, close = text:find('\\end{' .. environment .. '}', pos, true)
+            pos = close and close + 1 or #text + 1
+          end
+        elseif command == 'documentclass' then
+          document = true
+        elseif command == 'input' or command == 'include' or command == 'subfile' then
+          local name
+          name, pos = argument(pos, command == 'input')
+          if name then
+            name = vim.trim(name)
+            name = name:match('^"(.*)"$') or name
+            if name ~= '' and not name:find('[\\{}#$&^~%%"\r\n%z]') then
+              inputs[#inputs + 1] = name
+            end
+          end
+        end
+      end
+    else
+      pos = pos + 1
+    end
+  end
+  return { inputs = inputs, document = document }
+end
+
+local function automatic_root(source, configured_cwd)
+  local target = vim.uv.fs_realpath(source) or source
+  local home = vim.uv.os_homedir()
+  home = home and (vim.uv.fs_realpath(home) or home)
+  local parsed, directories = {}, {}
+  local function scan(path)
+    local identity = vim.uv.fs_realpath(path)
+    if not identity then
+      return nil
+    end
+    if not parsed[identity] then
+      parsed[identity] = tex_includes(identity)
+    end
+    return parsed[identity], identity
+  end
+  local function owns(candidate)
+    local root, identity = scan(candidate)
+    if not root or not root.document then
+      return false
+    end
+    local cwd = configured_cwd or vim.fs.dirname(candidate)
+    local pending, visited = { identity }, {}
+    while #pending > 0 do
+      local path = table.remove(pending)
+      if path == target then
+        return true
+      end
+      if not visited[path] then
+        visited[path] = true
+        local node = scan(path)
+        for _, name in ipairs(node and node.inputs or {}) do
+          if not vim.startswith(name, '/') then
+            name = cwd .. '/' .. name
+          end
+          local child
+          if not name:match('%.tex$') then
+            child = vim.uv.fs_realpath(name .. '.tex')
+          end
+          child = child or vim.uv.fs_realpath(name)
+          if child and not visited[child] then
+            pending[#pending + 1] = child
+          end
+        end
+      end
+    end
+    return false
+  end
+  local directory = vim.fs.dirname(source)
+  while directory do
+    local identity = vim.uv.fs_realpath(directory) or directory
+    if directories[identity] then
+      break
+    end
+    directories[identity] = true
+    local owners, seen = {}, {}
+    local entries = vim.uv.fs_scandir(directory)
+    if entries then
+      while true do
+        local name = vim.uv.fs_scandir_next(entries)
+        if not name then
+          break
+        end
+        if name:match('%.tex$') then
+          local candidate = vim.fs.normalize(directory .. '/' .. name)
+          local canonical = vim.uv.fs_realpath(candidate)
+          if canonical and not seen[canonical] then
+            seen[canonical] = true
+            if owns(canonical) then
+              owners[#owners + 1] = canonical
+            end
+          end
+        end
+      end
+    end
+    if #owners > 0 then
+      table.sort(owners)
+      assert(
+        #owners == 1,
+        'pdfterm: multiple TeX roots include ' .. source .. ': ' .. table.concat(owners, ', ')
+          .. '; select one with :PdfTermMain or project.main'
+      )
+      return owners[1]
+    end
+    if identity == home or vim.uv.fs_stat(directory .. '/.git') or vim.uv.fs_stat(directory .. '/.jj') then
+      break
+    end
+    local parent = vim.fs.dirname(directory)
+    if parent == directory then
+      break
+    end
+    directory = parent
   end
   return source
 end
@@ -134,7 +343,12 @@ function M.describe(config, main)
   end
   source = vim.fs.normalize(vim.fn.fnamemodify(source, ':p'))
   if not p.main then
-    source = root_source(source)
+    local explicit
+    source, explicit = root_source(source)
+    if not explicit then
+      local cwd = p.cwd and vim.fs.normalize(vim.fn.fnamemodify(p.cwd, ':p'))
+      source = automatic_root(source, cwd)
+    end
   end
   local cwd = vim.fn.fnamemodify(p.cwd or vim.fs.dirname(source), ':p')
   cwd = assert(vim.uv.fs_realpath(cwd), 'pdfterm: project working directory does not exist')
