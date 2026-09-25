@@ -124,8 +124,19 @@ is the next ASCII word character when available, or a regular label otherwise.
 When one-key labels cannot identify every match, labels use short multi-key
 sequences so every highlighted location remains selectable.
 
-Match highlights use translucent blue so PDF text stays legible; labels use the
-magenta and pale text of the current Neovim Flash palette.
+Match highlights use translucent blue so PDF text stays legible. Jump labels
+default to pale text (`#c0caf5`) on deep violet (`#5b21b6`). Configure them in
+`~/.config/pdfterm/config.toml` (or under `$XDG_CONFIG_HOME`):
+
+```toml
+[viewer]
+flash_label_foreground = "#c0caf5"
+flash_label_background = "#5b21b6"
+```
+
+Both colors require `#RRGGBB` values and are independent of the selected theme.
+Restart the viewer after editing; invalid colors stop startup with a config error.
+
 Badge glyphs scale with the matched text height (minimum 8 pixels for
 readability), use antialiased glyphs from `viewer.flash_label_font` (default
 `monospace`), and sit beside the final visible glyph. Set an installed family
@@ -190,7 +201,7 @@ ranges, and file-access errors stop startup with the configuration path.
 - Top level: fit, colors, link-browser layout, SyncTeX, and socket paths.
 - `[editor]`: inverse-search delivery: `none`, `command`, or `socket`.
 - `[viewer]`: continuous/smooth scrolling, adjacent-page prefetch, animation
-  interval/easing, forward-search centering, flash duration and label font,
+  interval/easing, forward-search centering, flash duration and label font/colors,
   word matching and source-context radius.
 
 Restart the viewer after editing its configuration. `?` shows controls and the

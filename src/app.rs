@@ -1586,8 +1586,8 @@ impl App {
                     y,
                     layout,
                     text: &labeled.label,
-                    foreground: [0xc0, 0xca, 0xf5],
-                    background: [0xff, 0x00, 0x7c],
+                    foreground: self.viewer.flash_label_foreground,
+                    background: self.viewer.flash_label_background,
                 });
             }
         }
@@ -6674,6 +6674,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
             Line::from("[viewer]: smooth_scroll, scroll_frame_ms, scroll_ease_divisor"),
             Line::from("[viewer]: continuous_scroll, prefetch_pages, set_window_title, center_forward_search"),
             Line::from("[viewer]: flash_duration_ms, flash_label_font, word_precision, source_context_lines"),
+            Line::from("[viewer]: flash_label_foreground, flash_label_background (#RRGGBB)"),
             Line::from("[nvim]: focus_on_forward, focus_on_inverse, compile; [nvim.keys]: editor keys"),
             Line::from("Commented defaults on first launch. Edit config, then restart."),
         ])

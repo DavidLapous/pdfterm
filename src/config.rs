@@ -257,6 +257,10 @@ pub struct ViewerSettings {
     pub center_forward_search: bool,
     pub flash_duration_ms: u64,
     pub flash_label_font: String,
+    #[serde(with = "rgb_hex")]
+    pub flash_label_foreground: [u8; 3],
+    #[serde(with = "rgb_hex")]
+    pub flash_label_background: [u8; 3],
     pub word_precision: bool,
     pub source_context_lines: u64,
 }
@@ -274,10 +278,30 @@ impl Default for ViewerSettings {
             set_window_title: true,
             center_forward_search: true,
             flash_label_font: "monospace".into(),
+            flash_label_foreground: [0xc0, 0xca, 0xf5],
+            flash_label_background: [0x5b, 0x21, 0xb6],
             flash_duration_ms: 1000,
             word_precision: true,
             source_context_lines: 4,
         }
+    }
+}
+
+mod rgb_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 3], D::Error> {
+        let value = String::deserialize(deserializer)?;
+        crate::theme::parse_rgb("label color", &value).map_err(serde::de::Error::custom)
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        rgb: &[u8; 3],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]))
     }
 }
 
@@ -337,6 +361,41 @@ mod tests {
         let configured: Config =
             toml::from_str("[viewer]\nflash_label_font = \"Menlo\"\n").expect("config");
         assert_eq!(configured.viewer.flash_label_font, "Menlo");
+    }
+
+    #[test]
+    fn label_colors_accept_hex_and_round_trip_as_strings() {
+        let config: Config = toml::from_str(
+            "[viewer]\nflash_label_foreground = '#Ab12EF'\nflash_label_background = '#102030'\n",
+        )
+        .unwrap();
+        assert_eq!(config.viewer.flash_label_foreground, [0xab, 0x12, 0xef]);
+        assert_eq!(config.viewer.flash_label_background, [0x10, 0x20, 0x30]);
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["viewer"]["flash_label_foreground"], "#ab12ef");
+        assert_eq!(json["viewer"]["flash_label_background"], "#102030");
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.viewer.flash_label_foreground, [0xab, 0x12, 0xef]);
+        assert_eq!(restored.viewer.flash_label_background, [0x10, 0x20, 0x30]);
+    }
+
+    #[test]
+    fn label_colors_reject_invalid_values_without_panicking() {
+        for field in ["flash_label_foreground", "flash_label_background"] {
+            for value in [
+                "'123456'",
+                "'#123'",
+                "'#gg1122'",
+                "'#a€bc'",
+                "'#+f0000'",
+                "42",
+                "[1,2,3]",
+            ] {
+                let error = toml::from_str::<Config>(&format!("[viewer]\n{field} = {value}\n"))
+                    .expect_err("invalid label color");
+                assert!(error.to_string().contains(field), "{error}");
+            }
+        }
     }
 
     #[test]
