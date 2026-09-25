@@ -3939,10 +3939,21 @@ impl App {
         let mut y = -i64::from(self.tab().scroll_y);
         while y < i64::from(viewport.pixel_height) && page < self.tab().page_count {
             let key = self.page_key(page, viewport);
-            let Some(rendered) = self.tab().cache.get(&key).cloned() else {
-                self.missing_visible_page = Some(key);
+            let rendered = if let Some(rendered) = self.tab().cache.get(&key).cloned() {
+                rendered
+            } else {
+                self.missing_visible_page.get_or_insert(key);
                 self.request_visible_page(key)?;
-                break;
+                // Overlay expiry can evict a frame that is still on screen. Keep
+                // its image until the replacement arrives, but only for this
+                // document revision and exact render settings. Run placement
+                // normally so scrolling still updates crops and removes pages.
+                let Some(old) = old_pages.iter().find(|old| {
+                    old.frame.key == key && old.frame.revision.pdf == self.tab().revision
+                }) else {
+                    break;
+                };
+                Arc::clone(&old.frame)
             };
             let offset = (-y).max(0) as u32;
             let top = y.max(0) as u32;
@@ -7246,6 +7257,200 @@ mod tests {
     use std::fs;
     use std::io::{self, Write};
     use std::time::Instant;
+
+    fn continuous_frame(
+        key: crate::pdf::RenderKey,
+        revision: crate::synctex::DocumentRevision,
+        highlighted: bool,
+    ) -> std::sync::Arc<crate::pdf::Frame> {
+        std::sync::Arc::new(crate::pdf::Frame {
+            key,
+            revision,
+            width: 80,
+            height: 240,
+            compressed_rgba: crate::kitty::compress_rgba(&[255; 80 * 240 * 4]).unwrap(),
+            render_elapsed: std::time::Duration::ZERO,
+            dark_mode_elapsed: None,
+            highlight_elapsed: None,
+            compression_elapsed: std::time::Duration::ZERO,
+            generation: 0,
+            links: Vec::new(),
+            flash: highlighted.then_some(crate::pdf::ForwardHighlight {
+                rect: crate::pdf::SearchRect {
+                    bottom: 10.0,
+                    left: 10.0,
+                    top: 20.0,
+                    right: 20.0,
+                },
+                page_height_pt: 240.0,
+                word_precise: true,
+                error: None,
+            }),
+        })
+    }
+
+    fn continuous_app() -> (super::App, Viewport, tempfile::NamedTempFile) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+        // These draw tests supply completed frames and an already-pending
+        // replacement. A stopped worker keeps them independent of PDFium.
+        let worker = crate::pdf::RenderWorker::spawn(
+            super::INITIAL_DOCUMENT_ID,
+            file.path().to_owned(),
+            Some(file.path().join("missing-pdfium")),
+        );
+        assert!(worker.wait_until_ready().is_err());
+        let config = toml::from_str("").unwrap();
+        let defaults = super::AppDefaults::from_config(&config, None).unwrap();
+        let mut app = super::App::new(
+            worker,
+            2,
+            0,
+            file.path().to_owned(),
+            FileWatcher::new(file.path()).unwrap(),
+            (Vec::new(), revision.pdf),
+            defaults,
+        );
+        let viewport = Viewport {
+            columns: 8,
+            rows: 20,
+            pixel_width: 80,
+            pixel_height: 200,
+            top: 1,
+            status_row: 21,
+        };
+        app.tab_mut().scroll_y = 100;
+        for page in 0..2 {
+            let key = app.page_key(page, viewport);
+            app.tab_mut()
+                .cache
+                .insert(key, continuous_frame(key, revision, page == 1));
+        }
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        app.draw_continuous(&primary, viewport, &mut Vec::new())
+            .unwrap();
+        // Match flash expiry: evict the highlighted page while its clean
+        // replacement is pending, leaving its terminal image visible.
+        let target = app.page_key(1, viewport);
+        app.tab_mut().cache.retain(|key, _| key.page != 1);
+        app.pending.insert(target);
+        (app, viewport, file)
+    }
+
+    #[test]
+    fn continuous_redraw_retains_expired_flash_until_replacement_upload() {
+        let (mut app, viewport, _file) = continuous_app();
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        let target = app.page_key(1, viewport);
+        let highlighted = app.visible_pages[1].frame.clone();
+        let old_id = app.visible_pages[1].image_id;
+        let delete = format!("\x1b_Ga=d,d=I,i={old_id},q=2\x1b\\");
+
+        app.generation += 1;
+        app.tab_mut().scroll_y = 115;
+        let mut output = Vec::new();
+        app.draw_continuous(&primary, viewport, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(app.missing_visible_page, Some(target));
+        assert!(app.pending.contains(&target));
+        assert!(!app.tab().cache.contains_key(&target));
+        assert_eq!(app.visible_pages.len(), 2);
+        let retained = &app.visible_pages[1];
+        assert!(std::sync::Arc::ptr_eq(&retained.frame, &highlighted));
+        assert_eq!(retained.image_id, old_id);
+        assert_eq!(retained.top, 14);
+        assert_eq!(retained.placement.offset_y, 5);
+        assert_eq!(retained.placement.crop.unwrap().height, 65);
+        assert!(output.contains(&format!("\x1b_Ga=p,i={old_id},")));
+        assert!(!output.contains("\x1b_Ga=T,"));
+        assert!(!output.contains(&delete));
+
+        let clean = continuous_frame(target, highlighted.revision, false);
+        app.tab_mut().cache.insert(target, clean.clone());
+        app.pending.remove(&target);
+        let new_id = app.next_image_id;
+        let mut output = Vec::new();
+        app.draw_continuous(&primary, viewport, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let upload = output
+            .find(&format!("\x1b_Ga=T,f=32,s=80,v=240,i={new_id},"))
+            .unwrap();
+        let upload_end = upload + output[upload..].find("\x1b\\").unwrap() + 2;
+        assert!(upload_end <= output.find(&delete).unwrap());
+        assert_eq!(app.missing_visible_page, None);
+        assert!(std::sync::Arc::ptr_eq(&app.visible_pages[1].frame, &clean));
+        assert_eq!(app.visible_pages[1].image_id, new_id);
+        assert!(app.visible_pages[1].frame.flash.is_none());
+    }
+
+    #[test]
+    fn continuous_redraw_removes_offscreen_cache_miss() {
+        let (mut app, viewport, _file) = continuous_app();
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        let old_id = app.visible_pages[1].image_id;
+        app.tab_mut().scroll_y = 0;
+        let mut output = Vec::new();
+        app.draw_continuous(&primary, viewport, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(app.visible_pages.len(), 1);
+        assert_eq!(app.visible_pages[0].frame.key.page, 0);
+        assert_eq!(app.missing_visible_page, None);
+        assert!(output.contains(&format!("\x1b_Ga=d,d=I,i={old_id},q=2\x1b\\")));
+        assert!(!output.contains(&format!("\x1b_Ga=p,i={old_id},")));
+    }
+
+    #[test]
+    fn continuous_redraw_rejects_incompatible_visible_frames() {
+        let (mut app, viewport, _file) = continuous_app();
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        let target = app.page_key(1, viewport);
+        let revision = app.visible_pages[1].frame.revision;
+        let other_file = tempfile::NamedTempFile::new().unwrap();
+        let other_revision = crate::synctex::DocumentRevision::read(other_file.path()).unwrap();
+        let mut incompatible = Vec::new();
+        let changes: [fn(&mut crate::pdf::RenderKey); 13] = [
+            |key: &mut crate::pdf::RenderKey| key.document_id += 1,
+            |key: &mut crate::pdf::RenderKey| key.page += 1,
+            |key: &mut crate::pdf::RenderKey| key.width += 1,
+            |key: &mut crate::pdf::RenderKey| key.height += 1,
+            |key: &mut crate::pdf::RenderKey| key.zoom += 1,
+            |key: &mut crate::pdf::RenderKey| key.fit = crate::pdf::FitMode::Height,
+            |key: &mut crate::pdf::RenderKey| key.invert = !key.invert,
+            |key: &mut crate::pdf::RenderKey| key.dark_mode_style.background[0] ^= 1,
+            |key: &mut crate::pdf::RenderKey| key.search_request_id += 1,
+            |key: &mut crate::pdf::RenderKey| key.search_highlight[0] ^= 1,
+            |key: &mut crate::pdf::RenderKey| key.link_mode = !key.link_mode,
+            |key: &mut crate::pdf::RenderKey| key.link_highlight[0] ^= 1,
+            |key: &mut crate::pdf::RenderKey| key.selected_link_ordinal = Some(1),
+        ];
+        for change in changes {
+            let mut key = target;
+            change(&mut key);
+            incompatible.push((key, revision));
+        }
+        incompatible.push((target, other_revision));
+        for (key, incompatible_revision) in incompatible {
+            app.tab_mut()
+                .cache
+                .insert(target, continuous_frame(target, revision, true));
+            app.draw_continuous(&primary, viewport, &mut Vec::new())
+                .unwrap();
+            app.tab_mut().cache.remove(&target);
+            let old_id = app.visible_pages[1].image_id;
+            app.visible_pages[1].frame = continuous_frame(key, incompatible_revision, true);
+            let mut output = Vec::new();
+            app.draw_continuous(&primary, viewport, &mut output)
+                .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(app.visible_pages.len(), 1, "{key:?}");
+            assert_eq!(app.missing_visible_page, Some(target));
+            assert!(output.contains(&format!("\x1b_Ga=d,d=I,i={old_id},q=2\x1b\\")));
+            assert!(!output.contains(&format!("\x1b_Ga=p,i={old_id},")));
+        }
+    }
 
     #[test]
     fn synchronized_output_closes_successful_and_failed_updates() {

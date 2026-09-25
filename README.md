@@ -399,7 +399,10 @@ The viewer reloads a different revision **before** validating page count, positi
 the target, and replies `{"ok":true,"error":null}` only after submitting the
 matching rendered frame to the terminal and flushing output. This does not wait
 for terminal compositor completion. The highlight lifetime starts at that
-submission, not while loading or rendering.
+submission, not while loading or rendering. In continuous view, the visible page
+stays in place while the unhighlighted replacement renders, including during
+same-size resize events; the old image is retired only after its replacement is
+submitted.
 
 Each connection receives one terminal reply and closes; no status polling or
 request IDs are needed. Changed-again PDFs, unreadable documents, out-of-range pages,
