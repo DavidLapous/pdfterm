@@ -826,6 +826,9 @@ shell wrappers, page filtering, and unsupported flags still build normally but
 warn and open page one rather than use potentially wrong coordinates. Missing
 Tinymist or an unrendered cursor position has the same fallback; resolution
 times out after 30 seconds. A failed initial compile stops navigation.
+Cursor positions refer to the character under Neovim's cursor, including the
+first character of a word or line and multibyte characters. Place the cursor on
+rendered text; comments, whitespace, and non-rendered code may have no position.
 Repeated source instances select the first mapped occurrence. Typst inverse
 search is not supported. The preview protocol was exercised with Tinymist 0.15.8.
 

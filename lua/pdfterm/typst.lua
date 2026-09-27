@@ -243,8 +243,11 @@ function M.resolve(project, file, line, byte_column, callback)
     local args, root = compile_args(project)
     local source = vim.fn.readfile(file, '', line)[line]
     assert(source and byte_column >= 0 and byte_column <= #source, 'cursor is outside the saved Typst source')
-    -- Preview's line_column_to_byte counts Unicode scalars, unlike LSP UTF-16.
+    -- Preview counts Unicode scalars and looks up the leaf BEFORE its position.
+    -- Neovim's normal-mode cursor is ON a character: pass its trailing boundary,
+    -- otherwise a word/line start resolves to preceding whitespace, not text.
     local character = vim.fn.strchars(source:sub(1, byte_column))
+      + (byte_column < #source and 1 or 0)
     local before = revision(project.pdf)
     temporary = canonical(assert(vim.uv.fs_mkdtemp(vim.fs.dirname(project.pdf) .. '/.pdfterm-XXXXXX')),
       project.cwd)

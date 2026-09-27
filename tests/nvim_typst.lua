@@ -33,7 +33,7 @@ local ok, failure = xpcall(function()
     '#pagebreak()',
     '#include "chapter.typ"',
   }, directory .. '/main.typ')
-  vim.fn.writefile({ '= Third page', 'Included source anchor on page three.' }, directory .. '/chapter.typ')
+  vim.fn.writefile({ '= Third page', 'λ Included source anchor on page three.' }, directory .. '/chapter.typ')
   local p = project.describe({ main = 'main.typ', cwd = directory, pdf = 'custom output.pdf' })
   local built
   project.build(p, project.next(), function(result) built = result end)
@@ -44,7 +44,11 @@ local ok, failure = xpcall(function()
   assert(second.pdf == p.pdf and second.h >= 30 and second.v >= 30, vim.inspect(second))
   local stat = assert(vim.uv.fs_stat(p.pdf))
   assert(second.revision.length == stat.size and second.revision.inode == stat.ino)
-  local third = resolve(p, directory .. '/chapter.typ', 2, 9)
+  -- Normal-mode cursors at line starts must address the character under them,
+  -- including a multibyte character, rather than the preceding newline.
+  local line_start = resolve(p, p.main, 6, 0)
+  assert(line_start.page == 2, vim.inspect(line_start))
+  local third = resolve(p, directory .. '/chapter.typ', 2, 0)
   assert(third.page == 3, vim.inspect(third))
   assert(third.pdf == p.pdf and third.v >= 30, vim.inspect(third))
 
