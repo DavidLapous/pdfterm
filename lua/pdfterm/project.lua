@@ -335,14 +335,15 @@ function M.describe(config, main)
   local p = config or {}
   local source = p.main or main
   assert(
-    type(source) == 'string' and source:match('%.tex$'),
-    'pdfterm: select a main TeX file with :PdfTermMain or project.main'
+    type(source) == 'string' and (source:match('%.tex$') or source:match('%.typ$')),
+    'pdfterm: select a main TeX or Typst file with :PdfTermMain or project.main'
   )
   if p.cwd and not vim.startswith(source, '/') then
     source = vim.fn.fnamemodify(p.cwd, ':p') .. '/' .. source
   end
   source = vim.fs.normalize(vim.fn.fnamemodify(source, ':p'))
-  if not p.main then
+  local typst = source:match('%.typ$') ~= nil
+  if not typst and not p.main then
     local explicit
     source, explicit = root_source(source)
     if not explicit then
@@ -352,16 +353,19 @@ function M.describe(config, main)
   end
   local cwd = vim.fn.fnamemodify(p.cwd or vim.fs.dirname(source), ':p')
   cwd = assert(vim.uv.fs_realpath(cwd), 'pdfterm: project working directory does not exist')
-  local pdf = p.pdf or source:gsub('%.tex$', '.pdf')
+  local pdf = p.pdf or source:gsub(typst and '%.typ$' or '%.tex$', '.pdf')
   if not vim.startswith(pdf, '/') then
     pdf = cwd .. '/' .. pdf
   end
-  local argv = p.build or { 'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1', source }
+  pdf = vim.fs.normalize(pdf)
+  local argv = p.build
+    or (typst and { 'typst', 'compile', source, pdf })
+    or { 'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1', source }
   assert(type(argv) == 'table' and #argv > 0, 'pdfterm: project.build must be a nonempty argument vector')
   for _, arg in ipairs(argv) do
     assert(type(arg) == 'string' and not arg:find('%z'), 'pdfterm: invalid build argument')
   end
-  return { main = source, pdf = vim.fs.normalize(pdf), cwd = cwd, build = argv }
+  return { main = source, pdf = pdf, cwd = cwd, build = argv }
 end
 
 function M.build(project, id, callback)

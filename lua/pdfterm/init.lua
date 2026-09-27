@@ -407,10 +407,10 @@ function M.set_main(file)
   file = file or vim.api.nvim_buf_get_name(0)
   intent()
   ready(function()
-    assert(file:match('%.tex$'), 'main document must be a TeX file')
+    assert(file:match('%.tex$') or file:match('%.typ$'), 'main document must be a TeX or Typst file')
     main_file = vim.fn.fnamemodify(file, ':p')
     options.project = vim.tbl_extend('force', options.project or {}, { main = main_file })
-    vim.notify('Set current latex file to ' .. main_file)
+    vim.notify('Set current main file to ' .. main_file)
   end)
 end
 function M.toggle_compile()
@@ -485,37 +485,42 @@ local function forward(allow_launch)
         if not alive(id) then
           return
         end
-        cancel_resolution = project.run(
-          command({
-            p.pdf,
-            '--synctex-view',
-            file,
-            '--line',
-            tostring(cursor[1]),
-            '--column',
-            tostring(column),
-          }),
-          p.cwd,
-          11000,
-          function(result)
-            if not alive(id) then
-              return
-            end
-            cancel_resolution = nil
-            if result.code ~= 0 then
-              vim.notify(
-                'pdfterm: SyncTeX failed; opening PDF at page 1 without source positioning.\n'
-                  .. vim.trim(result.stderr):gsub('^pdfterm:%s*', ''),
-                vim.log.levels.WARN
-              )
-              open_pdf(p.pdf, id, source, source_error, allow_launch, true)
-              return
-            end
-            deliver(p.pdf, result.stdout, id, source, source_error, allow_launch, true)
+        local function resolved(result)
+          if not alive(id) then
+            return
           end
-        )
+          cancel_resolution = nil
+          if result.code ~= 0 then
+            vim.notify(
+              'pdfterm: Source navigation failed; opening PDF at page 1 without source positioning.\n'
+                .. vim.trim(result.stderr):gsub('^pdfterm:%s*', ''),
+              vim.log.levels.WARN
+            )
+            open_pdf(p.pdf, id, source, source_error, allow_launch, true)
+            return
+          end
+          deliver(p.pdf, result.stdout, id, source, source_error, allow_launch, true)
+        end
+        if p.main:match('%.typ$') then
+          cancel_resolution = require('pdfterm.typst').resolve(p, file, cursor[1], cursor[2], resolved)
+        else
+          cancel_resolution = project.run(
+            command({
+              p.pdf,
+              '--synctex-view',
+              file,
+              '--line',
+              tostring(cursor[1]),
+              '--column',
+              tostring(column),
+            }),
+            p.cwd,
+            11000,
+            resolved
+          )
+        end
       end
-      if options.compile then
+      if options.compile or p.main:match('%.typ$') then
         project.build(p, id, function(result)
           if result.code == 0 then
             resolve()
@@ -561,21 +566,22 @@ function M.setup(opts)
   install_mappings = function()
     local keys = (options or setup_options).keys or {}
     map(keys.forward, M.forward, { desc = 'pdfterm forward search' })
-    map(keys.main_file, M.set_main, { desc = 'pdfterm set main TeX file' })
+    map(keys.main_file, M.set_main, { desc = 'pdfterm set main document' })
     map(keys.compile, M.toggle_compile, { desc = 'pdfterm toggle compilation' })
     vim.api.nvim_clear_autocmds({ group = 'pdfterm', event = 'FileType' })
     local function build_map(buffer)
-      map(keys.build, M.build, { buffer = buffer, desc = 'pdfterm build TeX' })
+      map(keys.build, M.build, { buffer = buffer, desc = 'pdfterm build document' })
     end
     vim.api.nvim_create_autocmd('FileType', {
       group = 'pdfterm',
-      pattern = { 'tex', 'latex' },
+      pattern = { 'tex', 'latex', 'typst' },
       callback = function(event)
         build_map(event.buf)
       end,
     })
     for _, buffer in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.bo[buffer].filetype == 'tex' or vim.bo[buffer].filetype == 'latex' then
+      if vim.bo[buffer].filetype == 'tex' or vim.bo[buffer].filetype == 'latex'
+        or vim.bo[buffer].filetype == 'typst' then
         build_map(buffer)
       end
     end

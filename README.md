@@ -766,8 +766,8 @@ bridge token, or exact viewer reply fails explicitly.
 
 Public actions are `open(pdf)`, `forward()`, `forward_split()`, `build()`,
 `set_main(file)`, and `toggle_compile()`. `open(pdf)` opens or selects a PDF at
-page one using the same local/SSH session; it needs neither TeX sources nor a
-SyncTeX sidecar. If `forward()` or `forward_split()` cannot resolve a SyncTeX
+page one using the same local/SSH session; it needs neither source files nor a
+SyncTeX sidecar. If `forward()` or `forward_split()` cannot resolve a source
 location, it warns and navigates to page one without source positioning.
 A failed compile-before-forward build still stops navigation rather than opening
 stale output.
@@ -793,16 +793,46 @@ instead of appending a separate message on each refresh.
 `project.cwd` with the same serialized queue, progress reporting, output bound,
 and timeout as the default LaTeX build. Use an explicit shell invocation only when
 shell syntax is required. The configured command must produce `project.pdf` and,
-for source navigation, its SyncTeX sidecar. This plugin currently supports LaTeX;
-Typst and other generators are not implemented.
+for LaTeX source navigation, its SyncTeX sidecar.
 
 Without a project descriptor, the selected/current TeX file, its directory,
 adjacent PDF, and `latexmk -pdf -interaction=nonstopmode -synctex=1` are used.
 
+Typst `.typ` files use `typst compile <main> <pdf>` instead. Forward commands
+always save and compile Typst before navigating, independently of the LaTeX
+`compile` toggle. Install both `typst` (PDF compilation) and `tinymist`
+(cursor-to-PDF positions) on the machine running Neovim. The existing
+`:PdfTermForwardSplit` mapping works for both languages without configuration
+changes. `:PdfTermBuild` and `:PdfTermMain` also accept Typst.
+
+For an included Typst file, select its entry point with `:PdfTermMain path/to/main.typ`
+or `project.main` first; automatic TeX-root discovery does not apply to Typst.
+The resolver starts a temporary Tinymist preview service on loopback, without
+opening a browser, and uses compiler source spans to locate the cursor. It
+exports to a private temporary file, replacing the PDF only when a valid
+position is available and neither the PDF nor the saved project inputs changed.
+The resolver scans the effective Typst root (including symlink targets) before
+and after resolution; source or asset changes abort positioning. External
+package and font resources must remain stable during the request. Large project
+roots increase scan cost. The effective root follows the compiler's `--root`,
+`TYPST_ROOT`, then entry-directory precedence, not the Neovim workspace root.
+This second compilation keeps the displayed PDF consistent with Tinymist's
+compiler even when the installed `typst` version differs. Cancellation and
+completion stop the service and remove its temporary output before returning.
+
+Typst source navigation supports direct `typst compile` / `tinymist compile`
+build vectors and common root, input, font, package, and PDF options. Custom
+shell wrappers, page filtering, and unsupported flags still build normally but
+warn and open page one rather than use potentially wrong coordinates. Missing
+Tinymist or an unrendered cursor position has the same fallback; resolution
+times out after 30 seconds. A failed initial compile stops navigation.
+Repeated source instances select the first mapped occurrence. Typst inverse
+search is not supported. The preview protocol was exercised with Tinymist 0.15.8.
+
 No editor keybindings are installed by default. Set `opts.keys` in your plugin
 specification or `[nvim.keys]` in TOML: `forward` saves and forward-searches,
-`build` builds the main TeX file in TeX buffers, `main_file` selects the current
-TeX file as main, and `compile` toggles compilation before forward search.
+`build` builds the main document in TeX and Typst buffers, `main_file` selects the
+current document as main, and `compile` toggles LaTeX compilation before forward search.
 Empty or omitted keys remain unmapped. Explicit Lua keys are available immediately,
 including when the executable or TOML is broken; actions report the failure.
 TOML-only mappings appear after background configuration finishes. `opts.keys`
