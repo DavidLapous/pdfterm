@@ -398,13 +398,19 @@ checked before and after SyncTeX resolution. This is local filesystem identity,
 not a cryptographic content digest. Geometry is in points, with `h` the left edge
 and `v` the bottom edge measured down from the page top.
 
-The resolver also sends optional `word` context, for example
+The SyncTeX resolver also sends optional `word` context, for example
 `{"words":["a","navigation","anchor"],"selected":1}` (`selected` is zero-based).
 It uses the saved UTF-8 source, bounded to a regular file of at most 2 MiB;
 unreadable or unsupported source files fail resolution explicitly. Command names,
 comments, and positions outside a literal word supply no word hint.
 Hints contain at most seven words of at most 128 UTF-8 bytes each. Letters,
 numbers, and attached Unicode combining marks form words.
+Adapters may instead send a literal UTF-8 excerpt and zero-based byte offset,
+for example `{"text":"a navigation anchor","byte_column":2}`. The viewer applies
+the same Unicode tokenization and context limits; whitespace and punctuation
+produce no hint, and offsets inside a multibyte character are rejected. This
+literal form does not interpret TeX or Typst syntax. Both forms remain subject
+to the 4096-byte limit for the complete request.
 
 Within the selected SyncTeX region, the viewer matches complete PDF words using
 case/compatibility normalization and neighboring-word context. A unique best match
@@ -831,6 +837,17 @@ first character of a word or line and multibyte characters. Place the cursor on
 rendered text; comments, whitespace, and non-rendered code may have no position.
 Repeated source instances select the first mapped occurrence. Typst inverse
 search is not supported. The preview protocol was exercised with Tinymist 0.15.8.
+
+Typst forward search also flashes the literal word under the cursor, using the
+same Unicode-aware PDF word matching as LaTeX. The adapter sends at most 512
+bytes of the saved source line around the cursor. Tinymist supplies a point at
+the start of a source span, so PDF font changes or soft wrapping can put the
+word away from that point. Matching across text runs requires all available
+neighboring words to agree, with at least two neighbors; otherwise the word
+must belong to the text run and baseline at the mapped point. Equal best
+matches, missing words, and unsupported glyph mappings retain the mapped point
+rather than highlight a guessed word. Matching stays on Tinymist's selected
+page and does not expand generated text or math.
 
 No editor keybindings are installed by default. Set `opts.keys` in your plugin
 specification or `[nvim.keys]` in TOML: `forward` saves and forward-searches,

@@ -2650,8 +2650,9 @@ pub(crate) fn first_visible_forward_page(
     Ok(None)
 }
 
-/// Match complete PDF words inside the SyncTeX region, never an arbitrary nearest
-/// glyph. Equal context scores are ambiguous and retain the coarse region.
+/// Match complete PDF words inside the SyncTeX region. Point-only anchors also
+/// allow a unique complete source-context match across text runs and wrapped
+/// lines; weak context stays in the anchored run. Ties retain the coarse region.
 fn forward_word_rect(
     page: &PdfPage,
     cached: &CachedPageText,
@@ -2660,6 +2661,17 @@ fn forward_word_rect(
 ) -> Result<Option<SearchRect>, String> {
     let tokens = words(&cached.normalized);
     let text = page.text().map_err(|e| e.to_string())?;
+    let point_only = region.left == region.right && region.top == region.bottom;
+    let complete_context_score = (point_only && hint.words.len() >= 3).then(|| {
+        hint.words
+            .iter()
+            .enumerate()
+            .map(|(index, _)| match index.abs_diff(hint.selected) {
+                distance @ 1..=3 => 4 - distance as u32,
+                _ => 0,
+            })
+            .sum::<u32>()
+    });
     let mut best = None;
     let mut tied = false;
     for (index, &(start, word)) in tokens.iter().enumerate() {
@@ -2687,14 +2699,33 @@ fn forward_word_rect(
         let bounds = segment.bounds();
         let x = (bounds.left().value + bounds.right().value) * 0.5;
         let y = (bounds.bottom().value + bounds.top().value) * 0.5;
-        if x < region.left - 2.0
+        let score = forward_neighbor_score(&tokens, hint, index);
+        if point_only {
+            // Typst anchors a source span's first glyph, even if the selected
+            // word follows a font switch or a soft wrap. Complete context is
+            // evidence across those boundaries; without it, require the
+            // actual PDF text run and baseline rather than an arbitrary radius.
+            if complete_context_score != Some(score) {
+                let character = text.chars().get(first).map_err(|e| e.to_string())?;
+                let object = character.text_object().map_err(|e| e.to_string())?;
+                let run = object.bounds().map_err(|e| e.to_string())?.to_rect();
+                let origin = object.matrix().map_err(|e| e.to_string())?;
+                let baseline = character.origin_y().map_err(|e| e.to_string())?.value;
+                if region.left < run.left().value.min(origin.e()) - 2.0
+                    || region.left > run.right().value.max(origin.e()) + 2.0
+                    || region.top < bounds.bottom().value.min(baseline) - 2.0
+                    || region.top > bounds.top().value.max(baseline) + 2.0
+                {
+                    continue;
+                }
+            }
+        } else if x < region.left - 2.0
             || x > region.right + 2.0
             || y < region.top.min(region.bottom) - 2.0
             || y > region.top.max(region.bottom) + 2.0
         {
             continue;
         }
-        let score = forward_neighbor_score(&tokens, hint, index);
         let rect = SearchRect {
             left: bounds.left().value,
             right: bounds.right().value,
@@ -3802,6 +3833,237 @@ mod tests {
 
         assert!(context.starts_with("[23] Weller et al."), "{context:?}");
         assert!(!context.contains("[24]"));
+    }
+
+    #[test]
+    fn point_forward_words_cross_runs_only_with_unique_complete_context() {
+        use pdfium_render::prelude::{PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints};
+
+        let pdfium = super::load_pdfium(None).unwrap();
+        let mut document = pdfium.create_new_pdf().unwrap();
+        let mut page = document
+            .pages_mut()
+            .create_page_at_start(PdfPagePaperSize::a4())
+            .unwrap();
+        let courier = document.fonts_mut().courier();
+        let helvetica = document.fonts_mut().helvetica();
+        for (x, y, text, font) in [
+            (20.0, 200.0, "Before café ", courier),
+            (106.4, 200.0, "anchor after", helvetica),
+            (20.0, 160.0, "Long context begins", courier),
+            (20.0, 140.0, "with chosen words here", helvetica),
+            (20.0, 100.0, "repeat target suffix", courier),
+            (20.0, 60.0, "repeat target suffix", helvetica),
+        ] {
+            page.objects_mut()
+                .create_text_object(
+                    PdfPoints::new(x),
+                    PdfPoints::new(y),
+                    text,
+                    font,
+                    PdfPoints::new(12.0),
+                )
+                .unwrap();
+        }
+        drop(page);
+        let page = document.pages().get(0).unwrap();
+        let mut cache = super::empty_text_cache(1);
+        let cached = super::cached_page_text(&document, 0, &mut cache).unwrap();
+        let anchor = super::SearchRect {
+            left: 20.0,
+            right: 20.0,
+            top: 200.0,
+            bottom: 200.0,
+        };
+        let mut hint = crate::synctex::ForwardWord {
+            words: ["Before", "Cafe\u{301}", "anchor", "after"]
+                .map(String::from)
+                .into(),
+            selected: 2,
+        };
+        let rect = super::forward_word_rect(&page, cached, &hint, anchor)
+            .unwrap()
+            .unwrap();
+        assert!(rect.left > 100.0 && rect.right < 155.0, "{rect:?}");
+        assert!(rect.bottom >= 198.0 && rect.top < 215.0, "{rect:?}");
+
+        // Matching only part of the context must not escape the anchored run.
+        hint.words[1] = "missing".into();
+        assert!(
+            super::forward_word_rect(&page, cached, &hint, anchor)
+                .unwrap()
+                .is_none()
+        );
+        hint.words = ["anchor", "after"].map(String::from).into();
+        hint.selected = 0;
+        assert!(
+            super::forward_word_rect(&page, cached, &hint, anchor)
+                .unwrap()
+                .is_none()
+        );
+
+        hint.words = ["context", "begins", "with", "chosen", "words", "here"]
+            .map(String::from)
+            .into();
+        hint.selected = 3;
+        let wrapped_anchor = super::SearchRect {
+            top: 160.0,
+            bottom: 160.0,
+            ..anchor
+        };
+        let wrapped = super::forward_word_rect(&page, cached, &hint, wrapped_anchor)
+            .unwrap()
+            .unwrap();
+        assert!(wrapped.left > 35.0 && wrapped.right < 100.0, "{wrapped:?}");
+        assert!(
+            wrapped.bottom >= 138.0 && wrapped.top < 155.0,
+            "{wrapped:?}"
+        );
+        assert!(
+            super::forward_word_rect(
+                &page,
+                cached,
+                &hint,
+                super::SearchRect {
+                    right: 300.0,
+                    top: 175.0,
+                    ..wrapped_anchor
+                },
+            )
+            .unwrap()
+            .is_none(),
+            "nonzero SyncTeX regions must not use page-wide context"
+        );
+
+        hint.words = ["repeat", "target", "suffix"].map(String::from).into();
+        hint.selected = 1;
+        assert!(
+            super::forward_word_rect(
+                &page,
+                cached,
+                &hint,
+                super::SearchRect {
+                    top: 100.0,
+                    bottom: 100.0,
+                    ..anchor
+                },
+            )
+            .unwrap()
+            .is_none(),
+            "even complete context is ambiguous when repeated"
+        );
+    }
+
+    #[test]
+    fn point_forward_words_use_anchored_pdf_text_runs() {
+        use pdfium_render::prelude::{PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints};
+
+        let pdfium = super::load_pdfium(None).unwrap();
+        let mut document = pdfium.create_new_pdf().unwrap();
+        let mut page = document
+            .pages_mut()
+            .create_page_at_start(PdfPagePaperSize::a4())
+            .unwrap();
+        let font = document.fonts_mut().courier();
+        for (x, y, text) in [
+            (20.0, 100.0, "alpha needle beta gamma needle delta"),
+            (350.0, 100.0, "other needle beta elsewhere"),
+            (20.0, 60.0, "distant needle beta elsewhere"),
+            (20.0, 160.0, "café déjà"),
+        ] {
+            page.objects_mut()
+                .create_text_object(
+                    PdfPoints::new(x),
+                    PdfPoints::new(y),
+                    text,
+                    font,
+                    PdfPoints::new(12.0),
+                )
+                .unwrap();
+        }
+        drop(page);
+        let page = document.pages().get(0).unwrap();
+        let mut cache = super::empty_text_cache(1);
+        let cached = super::cached_page_text(&document, 0, &mut cache).unwrap();
+        let anchor = super::SearchRect {
+            left: 20.0,
+            right: 20.0,
+            top: 100.0,
+            bottom: 100.0,
+        };
+        let mut hint = crate::synctex::ForwardWord {
+            words: ["alpha", "needle", "beta"].map(String::from).into(),
+            selected: 1,
+        };
+        let first = super::forward_word_rect(&page, cached, &hint, anchor)
+            .unwrap()
+            .unwrap();
+        assert!(first.left > 60.0 && first.right < 115.0, "{first:?}");
+        assert!(first.bottom >= 98.0 && first.top < 115.0, "{first:?}");
+
+        // The span's start can precede the selected word by several words.
+        // Context selects the second occurrence without reaching other runs.
+        hint.words = ["gamma", "needle", "delta"].map(String::from).into();
+        let second = super::forward_word_rect(&page, cached, &hint, anchor)
+            .unwrap()
+            .unwrap();
+        assert!(second.left > 190.0 && second.right < 245.0, "{second:?}");
+        assert!(second.bottom >= 98.0 && second.top < 115.0, "{second:?}");
+
+        hint.selected = 0;
+        for word in ["needle", "need", "elsewhere"] {
+            hint.words = vec![word.into()];
+            assert!(
+                super::forward_word_rect(&page, cached, &hint, anchor)
+                    .unwrap()
+                    .is_none(),
+                "ambiguous, partial, or unrelated-run word {word:?}"
+            );
+        }
+        hint.words = vec!["alpha".into()];
+        hint.selected = 0;
+        for point in [
+            super::SearchRect {
+                left: 5.0,
+                right: 5.0,
+                ..anchor
+            },
+            super::SearchRect {
+                top: 200.0,
+                bottom: 200.0,
+                ..anchor
+            },
+            // Only a true point gets run-based refinement. A zero-width
+            // SyncTeX region still uses the original word-center filter.
+            super::SearchRect {
+                top: 110.0,
+                ..anchor
+            },
+        ] {
+            assert!(
+                super::forward_word_rect(&page, cached, &hint, point)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert!(cached.normalized.contains("café déjà"));
+        hint.words = ["Cafe\u{301}", "déjà"].map(String::from).into();
+        hint.selected = 0;
+        let unicode = super::forward_word_rect(
+            &page,
+            cached,
+            &hint,
+            super::SearchRect {
+                top: 160.0,
+                bottom: 160.0,
+                ..anchor
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(unicode.left >= 19.0 && unicode.right < 55.0, "{unicode:?}");
+        assert!(unicode.bottom > 155.0 && unicode.top < 175.0, "{unicode:?}");
     }
 
     #[test]

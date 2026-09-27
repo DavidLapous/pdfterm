@@ -8,6 +8,25 @@ local function canonical(path, cwd)
   return vim.uv.fs_realpath(absolute) or absolute
 end
 
+local function literal_word(source, byte_column)
+  -- Bound the literal excerpt for the 4096-byte forward socket, even on long
+  -- prose lines. Cut only at whitespace so UTF-8 and edge words remain whole.
+  -- Rust owns Unicode tokenization; do not duplicate it with Vim's ASCII classes.
+  local first, last = math.max(1, byte_column - 255), math.min(#source, byte_column + 256)
+  if first > 1 then
+    first = source:find('%s', first)
+    if not first or first > byte_column then return vim.NIL end
+    first = first + 1
+  end
+  if last < #source then
+    local boundary = source:sub(first, last):match('.*()%s')
+    if not boundary then return vim.NIL end
+    last = first + boundary - 2
+  end
+  if byte_column < first - 1 or byte_column >= last then return vim.NIL end
+  return { text = source:sub(first, last), byte_column = byte_column - first + 1 }
+end
+
 local function compile_args(project)
   local argv = project.build
   local program = type(argv) == 'table' and vim.fs.basename(argv[1] or '') or ''
@@ -281,7 +300,8 @@ function M.resolve(project, file, line, byte_column, callback)
         -- Typst supplies a point in PDF points measured from the page top.
         -- A zero-size SyncTeX rectangle preserves that exact point.
         finish(nil, vim.json.encode({ pdf = project.pdf, revision = revision(project.pdf),
-          page = page, h = x, v = y, width = 0, height = 0, word = vim.NIL }))
+          page = page, h = x, v = y, width = 0, height = 0,
+          word = literal_word(source, byte_column) }))
       end
     end
     rpc = vim.lsp.rpc.start({ 'tinymist', 'lsp' }, {

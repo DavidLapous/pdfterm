@@ -112,6 +112,10 @@ impl ForwardWord {
             .into_iter()
             .filter(|(start, _)| *start == 0 || !text[..*start].ends_with('\\'))
             .collect();
+        Self::from_tokens(&words, byte)
+    }
+
+    fn from_tokens(words: &[(usize, &str)], byte: usize) -> Option<Self> {
         let selected = words
             .iter()
             .position(|(start, word)| *start <= byte && byte < start + word.len())?;
@@ -142,6 +146,36 @@ impl ForwardWord {
     }
 }
 
+// Editor adapters can supply a literal saved line and UTF-8 cursor offset.
+// Tokenize here so every adapter shares PDF matching's Unicode word rules.
+fn deserialize_forward_word<'de, D>(deserializer: D) -> Result<Option<ForwardWord>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Literal {
+        text: String,
+        byte_column: usize,
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Context(ForwardWord),
+        Literal(Literal),
+    }
+    match Option::<Input>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Input::Context(word)) => Ok(Some(word)),
+        Some(Input::Literal(Literal { text, byte_column })) => {
+            if !text.is_char_boundary(byte_column) {
+                return Err(serde::de::Error::custom("invalid source word byte column"));
+            }
+            Ok(ForwardWord::from_tokens(&words(&text), byte_column))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardRequest {
@@ -152,6 +186,7 @@ pub struct ForwardRequest {
     pub v: f32,
     pub width: f32,
     pub height: f32,
+    #[serde(default, deserialize_with = "deserialize_forward_word")]
     pub word: Option<ForwardWord>,
 }
 
@@ -1387,6 +1422,42 @@ mod tests {
             assert_eq!(hint.words[hint.selected], decomposed);
             assert!(hint.valid());
         }
+    }
+
+    #[test]
+    fn literal_forward_word_uses_utf8_boundaries_and_unicode_context() {
+        let revision = PdfRevision::read(Path::new(file!())).unwrap();
+        let request = |text: &str, byte_column: usize| {
+            parse_forward_request(
+                &serde_json::json!({
+                    "pdf": "/literal.pdf", "revision": revision, "page": 1,
+                    "h": 72, "v": 120, "width": 0, "height": 0,
+                    "word": { "text": text, "byte_column": byte_column }
+                })
+                .to_string(),
+            )
+        };
+        let text = "one two three four café λ e\u{301}cole 漢字 nine ten";
+        let selected = text.find("e\u{301}cole").unwrap();
+        for byte in [selected, selected + 1] {
+            let hint = request(text, byte).unwrap().word.unwrap();
+            assert_eq!(
+                hint.words,
+                ["four", "café", "λ", "e\u{301}cole", "漢字", "nine", "ten"]
+            );
+            assert_eq!(hint.selected, 3);
+        }
+        assert_eq!(request("λ first", 0).unwrap().word.unwrap().words[0], "λ");
+        assert_eq!(
+            request("100% literal", 5).unwrap().word.unwrap().words[1],
+            "literal"
+        );
+        assert!(request("λ first", 1).is_err());
+        assert!(request(text, text.len() + 1).is_err());
+        for byte in [3, text.len()] {
+            assert!(request(text, byte).unwrap().word.is_none());
+        }
+        assert!(request(&"x".repeat(129), 0).unwrap().word.is_none());
     }
 
     #[test]
