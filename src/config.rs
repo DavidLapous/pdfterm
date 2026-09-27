@@ -120,8 +120,14 @@ impl Config {
         Ok(config)
     }
 
-    /// Select private endpoints without duplicating the configuration directory.
-    pub fn select_session(&mut self, name: &str) -> io::Result<()> {
+    /// Select named endpoints, or disable viewer control without changing the editor.
+    pub fn select_session(&mut self, name: Option<&str>) -> io::Result<()> {
+        let Some(name) = name else {
+            if let Some(socket) = self.forward_socket.as_mut() {
+                socket.clear();
+            }
+            return Ok(());
+        };
         if name.is_empty()
             || name.len() > 24
             || !name
@@ -495,6 +501,26 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_session_disables_control_but_preserves_inverse_search() {
+        let mut config = Config::default();
+        let editor = config.editor.socket_mut().unwrap().clone();
+        config.select_session(None).unwrap();
+        assert_eq!(config.forward_socket(), None);
+        assert_eq!(config.editor.socket_mut().unwrap(), &editor);
+    }
+
+    #[test]
+    fn named_session_preserves_explicitly_disabled_control() {
+        let mut config = Config {
+            forward_socket: Some(String::new()),
+            ..Config::default()
+        };
+        config.select_session(Some("paper")).unwrap();
+        assert_eq!(config.forward_socket(), None);
+        assert_eq!(config.editor.socket_mut().unwrap(), "paper-editor.sock");
+    }
+
+    #[test]
     fn session_names_validate_before_changing_either_endpoint() {
         let mut config = Config {
             editor: crate::editor::Editor::Socket {
@@ -503,7 +529,7 @@ mod tests {
             forward_socket: Some(format!("/private/{}/forward.sock", "x".repeat(80))),
             ..Config::default()
         };
-        assert!(config.select_session("paper").is_err());
+        assert!(config.select_session(Some("paper")).is_err());
         assert_eq!(config.editor.socket_mut().unwrap(), "/private/editor.sock");
         for invalid in [
             "",
@@ -512,7 +538,7 @@ mod tests {
             "é",
             "abcdefghijklmnopqrstuvwxy",
         ] {
-            assert!(config.select_session(invalid).is_err());
+            assert!(config.select_session(Some(invalid)).is_err());
         }
     }
 }

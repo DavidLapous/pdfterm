@@ -12,7 +12,7 @@ link_picker_layout = "auto"         # auto, vertical, horizontal, or floating
 synctex_enabled = true              # Enable Option/Alt-click PDF-to-source jumps
 # Relative names resolve inside the private config-directory/run directory (mode 0700).
 # Absolute paths require a current-user-owned mode-0700 parent. Never use shared /tmp directly.
-forward_socket = "forward.sock"    # Empty disables source-to-PDF requests
+forward_socket = "forward.sock"    # Requires --session; empty disables viewer control even with a session
 
 [editor]
 transport = "socket"               # socket (Neovim default), command, or none (clipboard only)

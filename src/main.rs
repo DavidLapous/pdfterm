@@ -27,7 +27,7 @@ struct Cli {
     third_party_licenses: bool,
 
     /// Resolve a source position and send it to an already-running viewer.
-    #[arg(long, conflicts_with = "synctex_view")]
+    #[arg(long, conflicts_with = "synctex_view", requires = "session")]
     forward_search: Option<PathBuf>,
 
     /// Resolve a source position and print the editor-neutral forward JSON request.
@@ -42,7 +42,7 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     column: u32,
 
-    /// Named viewer/editor session sharing the same configuration.
+    /// Enable viewer control with named viewer/editor endpoints.
     #[arg(long)]
     session: Option<String>,
     /// Opaque launch identity used by the bundled Neovim adapter.
@@ -54,7 +54,7 @@ struct Cli {
     synctex_edit_batch: bool,
 
     /// Save the running viewer's visible PDF viewport as a PNG.
-    #[arg(long, conflicts_with_all = ["path", "forward_search", "synctex_view", "synctex_edit_batch"])]
+    #[arg(long, requires = "session", conflicts_with_all = ["path", "forward_search", "synctex_view", "synctex_edit_batch"])]
     screenshot: Option<PathBuf>,
 }
 
@@ -102,9 +102,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(name) = cli.session.as_deref()
-        && let Err(error) = config.select_session(name)
-    {
+    if let Err(error) = config.select_session(cli.session.as_deref()) {
         eprintln!("pdfterm: {error}");
         return ExitCode::FAILURE;
     }

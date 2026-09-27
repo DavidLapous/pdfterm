@@ -15,9 +15,11 @@ The current viewer fits one page to the terminal, keeps the current and adjacent
 
 One viewer's forward socket serves all its PDF tabs: forwarding to a different
 PDF opens or selects that tab, and `Tab` / `Shift-Tab` switches among open PDFs.
-To run independent viewers, give each a distinct `--session NAME`; a second
-viewer cannot bind an occupied session socket. `--screenshot` captures the
-selected viewer's active tab, not a PDF chosen by path.
+Without `--session`, viewers open no control socket, so independent viewers can
+run concurrently. To enable external control, give each viewer a distinct
+`--session NAME`; a second viewer cannot bind an occupied named-session socket.
+`--screenshot` requires a session and captures that viewer's active tab, not a
+PDF chosen by path.
 
 You can fit pages to the terminal width or height and scroll through the overflow, zoom in and out beyond the fitted size in discrete steps, jump around with the outline (table of contents) or a go-to-page prompt, follow annotated links, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line shows one total render time by default; press `p` to expand it into rendering, dark-mode conversion, compression, and transfer timings.
 
@@ -57,10 +59,10 @@ pdfterm document.pdf
 
 Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page N` to open at a specific page.
 
-`pdfterm --screenshot /absolute/path.png [--session NAME]` asks the
-already-running viewer to save its rendered viewport as a PNG for agent visual
-checks. The absolute output path must not already exist; `--session` selects
-which viewer to capture.
+`pdfterm --screenshot /absolute/path.png --session NAME` asks the
+already-running named viewer to save its rendered viewport as a PNG for agent
+visual checks. The absolute output path must not already exist; `--session`
+selects which viewer to capture.
 The PNG contains the currently visible rendered PDF page crops and viewer
 highlights/labels, but not terminal text, status rows, or terminal fonts. It
 captures only pages already visible in the viewer, not the full document or a
@@ -375,16 +377,19 @@ the viewer also copies `file:line:byte-column` to the clipboard. With
 failures are reported without copying; the default socket transport requires a
 listening editor.
 
-Any editor can forward-search an already-running viewer:
+Start a named viewer with `pdfterm /project/main.pdf --session paper`.
+Any editor can then forward-search that viewer:
 
 ```console
-pdfterm /project/main.pdf --forward-search /project/main.tex --line 12 --column 3
+pdfterm /project/main.pdf --session paper --forward-search /project/main.tex --line 12 --column 3
 ```
 
 Source coordinates are one-based; `--column` counts Unicode scalars. To obtain
 the request without sending it, substitute `--synctex-view` for
-`--forward-search`. The forward socket accepts one JSON object, at most 4096
-bytes, followed by a write-half-close:
+`--forward-search`; `--synctex-view` does not require a session.
+`forward_socket = ""` disables viewer control even with a named session.
+The forward socket accepts one JSON object, at most 4096 bytes, followed by a
+write-half-close:
 
 ```json
 {"pdf":"/project/main.pdf","revision":{"device":1,"inode":42,"length":12345,"modified_seconds":1700000000,"modified_nanoseconds":0,"changed_seconds":1700000000,"changed_nanoseconds":0},"page":2,"h":72.0,"v":120.0,"width":250.0,"height":12.0}
@@ -917,8 +922,10 @@ Each session supports one viewer socket and one editor adapter socket, with
 multiple document tabs. `pdfterm --session paper ...` and
 `setup({ session = "paper" })` select distinct endpoints while sharing config.
 Names contain 1–24 ASCII letters, digits, `_`, or `-`; socket path limits still
-apply. The standalone CLI's unnamed session retains existing endpoint names;
-the Neovim adapter defaults to an automatically generated session instead.
+apply. Without a session, the standalone CLI disables the viewer control socket
+and retains the configured editor endpoint for inverse search.
+`--print-config` reports these effective endpoints; the Neovim adapter defaults
+to an automatically generated session instead.
 A second editor using the same explicit session fails only its navigation
 action, with a live-listener or stale-socket diagnostic. It never steals or
 automatically removes an endpoint. Stop its owner before removing a stale socket.
