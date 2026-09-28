@@ -12,7 +12,7 @@ link_picker_layout = "auto"         # auto, vertical, horizontal, or floating
 synctex_enabled = true              # Enable Option/Alt-click PDF-to-source jumps
 # Relative names resolve inside the private config-directory/run directory (mode 0700).
 # Absolute paths require a current-user-owned mode-0700 parent. Never use shared /tmp directly.
-forward_socket = "forward.sock"    # Empty disables source-to-PDF requests
+forward_socket = "forward.sock"    # Requires --session; empty disables viewer control even with a session
 
 [editor]
 transport = "socket"               # socket (Neovim default), command, or none (clipboard only)
@@ -41,7 +41,7 @@ word_precision = true              # Refine inverse search with nearby PDF/sourc
 source_context_lines = 4           # Source radius outside Beamer frames, 0–100; frames use full block
 
 [nvim]
-compile = false                    # Run latexmk before forward search
+compile = false                    # Run latexmk before LaTeX forward search; Typst always compiles
 attach_only = false                # true: require an existing viewer even for explicit split/open commands
 focus_on_inverse = false           # Focus the source terminal after inverse search when available
 focus_on_forward = false           # Focus the exact viewer after an acknowledged forward search when available
@@ -50,6 +50,6 @@ executable = ""                    # Runtime override; setup({executable=...}) s
 [nvim.keys]
 # Empty keys disable mappings. Choose bindings in your local config.
 forward = ""                       # Save and forward-search existing viewer (optionally compile)
-build = ""                         # Build main TeX file (TeX buffers only)
-main_file = ""                     # Use current TeX file as main document
-compile = ""                       # Toggle compilation before forward search
+build = ""                         # Build main document (TeX and Typst buffers)
+main_file = ""                     # Use current TeX or Typst file as main document
+compile = ""                       # Toggle LaTeX compilation before forward search

@@ -15,9 +15,11 @@ The current viewer fits one page to the terminal, keeps the current and adjacent
 
 One viewer's forward socket serves all its PDF tabs: forwarding to a different
 PDF opens or selects that tab, and `Tab` / `Shift-Tab` switches among open PDFs.
-To run independent viewers, give each a distinct `--session NAME`; a second
-viewer cannot bind an occupied session socket. `--screenshot` captures the
-selected viewer's active tab, not a PDF chosen by path.
+Without `--session`, viewers open no control socket, so independent viewers can
+run concurrently. To enable external control, give each viewer a distinct
+`--session NAME`; a second viewer cannot bind an occupied named-session socket.
+`--screenshot` requires a session and captures that viewer's active tab, not a
+PDF chosen by path.
 
 You can fit pages to the terminal width or height and scroll through the overflow, zoom in and out beyond the fitted size in discrete steps, jump around with the outline (table of contents) or a go-to-page prompt, follow annotated links, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line shows one total render time by default; press `p` to expand it into rendering, dark-mode conversion, compression, and transfer timings.
 
@@ -57,10 +59,10 @@ pdfterm document.pdf
 
 Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page N` to open at a specific page.
 
-`pdfterm --screenshot /absolute/path.png [--session NAME]` asks the
-already-running viewer to save its rendered viewport as a PNG for agent visual
-checks. The absolute output path must not already exist; `--session` selects
-which viewer to capture.
+`pdfterm --screenshot /absolute/path.png --session NAME` asks the
+already-running named viewer to save its rendered viewport as a PNG for agent
+visual checks. The absolute output path must not already exist; `--session`
+selects which viewer to capture.
 The PNG contains the currently visible rendered PDF page crops and viewer
 highlights/labels, but not terminal text, status rows, or terminal fonts. It
 captures only pages already visible in the viewer, not the full document or a
@@ -114,6 +116,9 @@ a new one.
 Automatic PDF reloads preserve the current page and horizontal/vertical scroll
 offsets. If the rebuilt document has fewer pages or smaller page dimensions,
 the viewport is clamped to the remaining page and its available scroll range.
+
+Zoom in, zoom out, and reset preserve the document position at the viewport's
+upper-left by scaling scroll offsets with the zoom level, subject to page bounds.
 
 Vertical scrolling shows adjacent pages together, separated by one terminal row,
 in every fit mode. Links and inverse search target the page under the pointer,
@@ -372,16 +377,19 @@ the viewer also copies `file:line:byte-column` to the clipboard. With
 failures are reported without copying; the default socket transport requires a
 listening editor.
 
-Any editor can forward-search an already-running viewer:
+Start a named viewer with `pdfterm /project/main.pdf --session paper`.
+Any editor can then forward-search that viewer:
 
 ```console
-pdfterm /project/main.pdf --forward-search /project/main.tex --line 12 --column 3
+pdfterm /project/main.pdf --session paper --forward-search /project/main.tex --line 12 --column 3
 ```
 
 Source coordinates are one-based; `--column` counts Unicode scalars. To obtain
 the request without sending it, substitute `--synctex-view` for
-`--forward-search`. The forward socket accepts one JSON object, at most 4096
-bytes, followed by a write-half-close:
+`--forward-search`; `--synctex-view` does not require a session.
+`forward_socket = ""` disables viewer control even with a named session.
+The forward socket accepts one JSON object, at most 4096 bytes, followed by a
+write-half-close:
 
 ```json
 {"pdf":"/project/main.pdf","revision":{"device":1,"inode":42,"length":12345,"modified_seconds":1700000000,"modified_nanoseconds":0,"changed_seconds":1700000000,"changed_nanoseconds":0},"page":2,"h":72.0,"v":120.0,"width":250.0,"height":12.0}
@@ -395,13 +403,19 @@ checked before and after SyncTeX resolution. This is local filesystem identity,
 not a cryptographic content digest. Geometry is in points, with `h` the left edge
 and `v` the bottom edge measured down from the page top.
 
-The resolver also sends optional `word` context, for example
+The SyncTeX resolver also sends optional `word` context, for example
 `{"words":["a","navigation","anchor"],"selected":1}` (`selected` is zero-based).
 It uses the saved UTF-8 source, bounded to a regular file of at most 2 MiB;
 unreadable or unsupported source files fail resolution explicitly. Command names,
 comments, and positions outside a literal word supply no word hint.
 Hints contain at most seven words of at most 128 UTF-8 bytes each. Letters,
 numbers, and attached Unicode combining marks form words.
+Adapters may instead send a literal UTF-8 excerpt and zero-based byte offset,
+for example `{"text":"a navigation anchor","byte_column":2}`. The viewer applies
+the same Unicode tokenization and context limits; whitespace and punctuation
+produce no hint, and offsets inside a multibyte character are rejected. This
+literal form does not interpret TeX or Typst syntax. Both forms remain subject
+to the 4096-byte limit for the complete request.
 
 Within the selected SyncTeX region, the viewer matches complete PDF words using
 case/compatibility normalization and neighboring-word context. A unique best match
@@ -763,8 +777,8 @@ bridge token, or exact viewer reply fails explicitly.
 
 Public actions are `open(pdf)`, `forward()`, `forward_split()`, `build()`,
 `set_main(file)`, and `toggle_compile()`. `open(pdf)` opens or selects a PDF at
-page one using the same local/SSH session; it needs neither TeX sources nor a
-SyncTeX sidecar. If `forward()` or `forward_split()` cannot resolve a SyncTeX
+page one using the same local/SSH session; it needs neither source files nor a
+SyncTeX sidecar. If `forward()` or `forward_split()` cannot resolve a source
 location, it warns and navigates to page one without source positioning.
 A failed compile-before-forward build still stops navigation rather than opening
 stale output.
@@ -790,16 +804,60 @@ instead of appending a separate message on each refresh.
 `project.cwd` with the same serialized queue, progress reporting, output bound,
 and timeout as the default LaTeX build. Use an explicit shell invocation only when
 shell syntax is required. The configured command must produce `project.pdf` and,
-for source navigation, its SyncTeX sidecar. This plugin currently supports LaTeX;
-Typst and other generators are not implemented.
+for LaTeX source navigation, its SyncTeX sidecar.
 
 Without a project descriptor, the selected/current TeX file, its directory,
 adjacent PDF, and `latexmk -pdf -interaction=nonstopmode -synctex=1` are used.
 
+Typst `.typ` files use `typst compile <main> <pdf>` instead. Forward commands
+always save and compile Typst before navigating, independently of the LaTeX
+`compile` toggle. Install both `typst` (PDF compilation) and `tinymist`
+(cursor-to-PDF positions) on the machine running Neovim. The existing
+`:PdfTermForwardSplit` mapping works for both languages without configuration
+changes. `:PdfTermBuild` and `:PdfTermMain` also accept Typst.
+
+For an included Typst file, select its entry point with `:PdfTermMain path/to/main.typ`
+or `project.main` first; automatic TeX-root discovery does not apply to Typst.
+The resolver starts a temporary Tinymist preview service on loopback, without
+opening a browser, and uses compiler source spans to locate the cursor. It
+exports to a private temporary file, replacing the PDF only when a valid
+position is available and neither the PDF nor the saved project inputs changed.
+The resolver scans the effective Typst root (including symlink targets) before
+and after resolution; source or asset changes abort positioning. External
+package and font resources must remain stable during the request. Large project
+roots increase scan cost. The effective root follows the compiler's `--root`,
+`TYPST_ROOT`, then entry-directory precedence, not the Neovim workspace root.
+This second compilation keeps the displayed PDF consistent with Tinymist's
+compiler even when the installed `typst` version differs. Cancellation and
+completion stop the service and remove its temporary output before returning.
+
+Typst source navigation supports direct `typst compile` / `tinymist compile`
+build vectors and common root, input, font, package, and PDF options. Custom
+shell wrappers, page filtering, and unsupported flags still build normally but
+warn and open page one rather than use potentially wrong coordinates. Missing
+Tinymist or an unrendered cursor position has the same fallback; resolution
+times out after 30 seconds. A failed initial compile stops navigation.
+Cursor positions refer to the character under Neovim's cursor, including the
+first character of a word or line and multibyte characters. Place the cursor on
+rendered text; comments, whitespace, and non-rendered code may have no position.
+Repeated source instances select the first mapped occurrence. Typst inverse
+search is not supported. The preview protocol was exercised with Tinymist 0.15.8.
+
+Typst forward search also flashes the literal word under the cursor, using the
+same Unicode-aware PDF word matching as LaTeX. The adapter sends at most 512
+bytes of the saved source line around the cursor. Tinymist supplies a point at
+the start of a source span, so PDF font changes or soft wrapping can put the
+word away from that point. Matching across text runs requires all available
+neighboring words to agree, with at least two neighbors; otherwise the word
+must belong to the text run and baseline at the mapped point. Equal best
+matches, missing words, and unsupported glyph mappings retain the mapped point
+rather than highlight a guessed word. Matching stays on Tinymist's selected
+page and does not expand generated text or math.
+
 No editor keybindings are installed by default. Set `opts.keys` in your plugin
 specification or `[nvim.keys]` in TOML: `forward` saves and forward-searches,
-`build` builds the main TeX file in TeX buffers, `main_file` selects the current
-TeX file as main, and `compile` toggles compilation before forward search.
+`build` builds the main document in TeX and Typst buffers, `main_file` selects the
+current document as main, and `compile` toggles LaTeX compilation before forward search.
 Empty or omitted keys remain unmapped. Explicit Lua keys are available immediately,
 including when the executable or TOML is broken; actions report the failure.
 TOML-only mappings appear after background configuration finishes. `opts.keys`
@@ -864,8 +922,10 @@ Each session supports one viewer socket and one editor adapter socket, with
 multiple document tabs. `pdfterm --session paper ...` and
 `setup({ session = "paper" })` select distinct endpoints while sharing config.
 Names contain 1–24 ASCII letters, digits, `_`, or `-`; socket path limits still
-apply. The standalone CLI's unnamed session retains existing endpoint names;
-the Neovim adapter defaults to an automatically generated session instead.
+apply. Without a session, the standalone CLI disables the viewer control socket
+and retains the configured editor endpoint for inverse search.
+`--print-config` reports these effective endpoints; the Neovim adapter defaults
+to an automatically generated session instead.
 A second editor using the same explicit session fails only its navigation
 action, with a live-listener or stale-socket diagnostic. It never steals or
 automatically removes an endpoint. Stop its owner before removing a stale socket.
