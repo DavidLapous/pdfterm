@@ -3081,9 +3081,9 @@ impl App {
             }
             KeyCode::Right => self.move_view(Axis::Horizontal, true, false, true, output)?,
             KeyCode::Left => self.move_view(Axis::Horizontal, false, false, true, output)?,
-            KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
+            KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
-                self.set_page(self.tab().page_count - 1, output)?
+                self.set_page_vertically(self.tab().page_count - 1, output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
@@ -3160,9 +3160,9 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 self.move_view(Axis::Horizontal, false, false, true, output)?
             }
-            KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
+            KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
-                self.set_page(self.tab().page_count - 1, output)?
+                self.set_page_vertically(self.tab().page_count - 1, output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('+') | KeyCode::Char('=') => self.zoom_in(output)?,
@@ -3187,9 +3187,13 @@ impl App {
     }
 
     fn set_page(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
+        self.tab_mut().scroll_x = 0;
+        self.set_page_vertically(page, output)
+    }
+
+    fn set_page_vertically(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
         let page = page.min(self.tab().page_count - 1);
         self.tab_mut().page = page;
-        self.tab_mut().scroll_x = 0;
         self.tab_mut().scroll_y = 0;
         self.request_current(output)
     }

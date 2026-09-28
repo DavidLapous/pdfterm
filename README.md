@@ -78,7 +78,7 @@ selected render is still pending; retry after the current PDF frame appears.
 | `k` / up / `Backspace` / `PageUp` | scroll up continuously across pages |
 | `h` / `l` / left / right | scroll horizontally, or change page at the edge |
 | Mouse wheel / trackpad | scroll the document, or move through entries in the outline |
-| `g` / `G` | first / last page |
+| `g` / `Home`, `G` / `End` | first / last page; preserve horizontal scroll (clamped to the destination page's width) |
 | `:` | go-to-page prompt (type a number, `Enter` to jump, `Esc` to cancel) |
 | `/` | search selectable document text |
 | `n` / `N` | next / previous page containing a search match |
