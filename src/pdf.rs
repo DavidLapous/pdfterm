@@ -157,6 +157,8 @@ pub struct Frame {
 pub struct ForwardHighlight {
     pub rect: SearchRect,
     pub page_height_pt: f32,
+    /// Horizontal bounds in the rendered frame, after PDFium's page transform.
+    pub horizontal_bounds: Option<(i32, i32)>,
     pub word_precise: bool,
     /// Refinement errors fail this forward request, not the renderer.
     pub error: Option<Arc<str>>,
@@ -164,7 +166,11 @@ pub struct ForwardHighlight {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkTarget {
-    Internal { page: u32, top_ratio: Option<f32> },
+    Internal {
+        page: u32,
+        top_ratio: Option<f32>,
+        left_ratio: Option<f32>,
+    },
     Uri(String),
 }
 
@@ -965,6 +971,7 @@ fn run_worker(
                             ForwardHighlight {
                                 rect: refined.unwrap_or(flipped),
                                 page_height_pt: page_height,
+                                horizontal_bounds: None,
                                 word_precise: refined.is_some(),
                                 error,
                             },
@@ -1306,7 +1313,13 @@ fn run_worker(
                     compression_elapsed,
                     generation: request.generation,
                     links,
-                    flash: flash.cloned(),
+                    flash: flash.map(|highlight| {
+                        let mut highlight = highlight.clone();
+                        highlight.horizontal_bounds =
+                            page_rect_pixel_bounds(&page, &config, highlight.rect)
+                                .map(|(left, right, _, _)| (left, right));
+                        highlight
+                    }),
                 }))
                 .map_err(|_| "viewer stopped".to_string())?;
         }
@@ -2822,32 +2835,8 @@ fn apply_search_highlights(
     color: [u8; 3],
 ) {
     for rectangle in rectangles {
-        let corners = [
-            (rectangle.left, rectangle.top),
-            (rectangle.right, rectangle.top),
-            (rectangle.left, rectangle.bottom),
-            (rectangle.right, rectangle.bottom),
-        ];
-        let pixels: Vec<_> = corners
-            .into_iter()
-            .filter_map(|(x, y)| {
-                page.points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), config)
-                    .ok()
-            })
-            .collect();
-        if pixels.len() != corners.len() {
-            continue;
-        }
-        let Some(min_x) = pixels.iter().map(|(x, _)| *x).min() else {
-            continue;
-        };
-        let Some(max_x) = pixels.iter().map(|(x, _)| *x).max() else {
-            continue;
-        };
-        let Some(min_y) = pixels.iter().map(|(_, y)| *y).min() else {
-            continue;
-        };
-        let Some(max_y) = pixels.iter().map(|(_, y)| *y).max() else {
+        let Some((min_x, max_x, min_y, max_y)) = page_rect_pixel_bounds(page, config, *rectangle)
+        else {
             continue;
         };
         let left = min_x.saturating_sub(1).clamp(0, width as i32) as u32;
@@ -3204,19 +3193,93 @@ fn resolve_internal_destination(
 ) -> Option<LinkTarget> {
     let page_index = destination.page_index().ok()?;
     let page = u32::try_from(page_index).ok()?;
-    let target_y = match destination.view_settings().ok() {
-        Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, y, _)) => y,
+    let (target_x, target_y) = match destination.view_settings().ok() {
+        Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, y, _)) => (x, y),
         Some(PdfDestinationViewSettings::FitPageHorizontallyToWindow(y))
-        | Some(PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(y)) => y,
-        Some(PdfDestinationViewSettings::FitPageToRectangle(rect)) => Some(rect.top()),
-        _ => None,
+        | Some(PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(y)) => (None, y),
+        Some(PdfDestinationViewSettings::FitPageVerticallyToWindow(x))
+        | Some(PdfDestinationViewSettings::FitBoundsVerticallyToWindow(x)) => (x, None),
+        Some(PdfDestinationViewSettings::FitPageToRectangle(rect)) => {
+            (Some(rect.left()), Some(rect.top()))
+        }
+        _ => (None, None),
     };
+    let target_page = (target_x.is_some() || target_y.is_some())
+        .then(|| document.pages().get(page_index).ok())
+        .flatten();
     let top_ratio = target_y.and_then(|y| {
-        let target_page = document.pages().get(page_index).ok()?;
-        let page_height = target_page.height().value;
+        let page_height = target_page.as_ref()?.height().value;
         (page_height > 0.0).then(|| ((page_height - y.value) / page_height).clamp(0.0, 1.0))
     });
-    Some(LinkTarget::Internal { page, top_ratio })
+    // Use the rendered horizontal axis: rotation can make PDF y determine it.
+    let left_ratio = target_page.as_ref().and_then(|page| {
+        const WIDTH: i32 = 10_000;
+        let config = PdfRenderConfig::new().set_target_width(WIDTH);
+        page_horizontal_position(page, &config, target_x, target_y)
+            .map(|x| (x as f32 / WIDTH as f32).clamp(0.0, 1.0))
+    });
+    Some(LinkTarget::Internal {
+        page,
+        top_ratio,
+        left_ratio,
+    })
+}
+
+fn page_horizontal_position(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    x: Option<PdfPoints>,
+    y: Option<PdfPoints>,
+) -> Option<i32> {
+    let x_value = x.unwrap_or(PdfPoints::ZERO);
+    let y_value = y.unwrap_or(PdfPoints::ZERO);
+    let (horizontal, _) = page.points_to_pixels(x_value, y_value, config).ok()?;
+    // A missing coordinate preserves the current position on its rendered axis.
+    if x.is_none()
+        && page
+            .points_to_pixels(PdfPoints::new(1.0), y_value, config)
+            .ok()?
+            .0
+            != horizontal
+    {
+        return None;
+    }
+    if y.is_none()
+        && page
+            .points_to_pixels(x_value, PdfPoints::new(1.0), config)
+            .ok()?
+            .0
+            != horizontal
+    {
+        return None;
+    }
+    Some(horizontal)
+}
+
+fn page_rect_pixel_bounds(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    bounds: SearchRect,
+) -> Option<(i32, i32, i32, i32)> {
+    let mut left = i32::MAX;
+    let mut right = i32::MIN;
+    let mut top = i32::MAX;
+    let mut bottom = i32::MIN;
+    for (x, y) in [
+        (bounds.left, bounds.top),
+        (bounds.right, bounds.top),
+        (bounds.left, bounds.bottom),
+        (bounds.right, bounds.bottom),
+    ] {
+        let (x, y) = page
+            .points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), config)
+            .ok()?;
+        left = left.min(x);
+        right = right.max(x);
+        top = top.min(y);
+        bottom = bottom.max(y);
+    }
+    Some((left, right, top, bottom))
 }
 
 fn page_rect_to_pixels(
@@ -3226,25 +3289,16 @@ fn page_rect_to_pixels(
     height: u32,
     bounds: PdfRect,
 ) -> Option<PixelRect> {
-    let corners = [
-        (bounds.left().value, bounds.top().value),
-        (bounds.right().value, bounds.top().value),
-        (bounds.left().value, bounds.bottom().value),
-        (bounds.right().value, bounds.bottom().value),
-    ];
-    let mut left = i32::MAX;
-    let mut right = i32::MIN;
-    let mut top = i32::MAX;
-    let mut bottom = i32::MIN;
-    for (x, y) in corners {
-        let (x, y) = page
-            .points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), config)
-            .ok()?;
-        left = left.min(x);
-        right = right.max(x);
-        top = top.min(y);
-        bottom = bottom.max(y);
-    }
+    let (left, right, top, bottom) = page_rect_pixel_bounds(
+        page,
+        config,
+        SearchRect {
+            left: bounds.left().value,
+            right: bounds.right().value,
+            top: bounds.top().value,
+            bottom: bounds.bottom().value,
+        },
+    )?;
     Some(PixelRect {
         left: left.saturating_sub(1).clamp(0, width as i32) as u32,
         right: right.saturating_add(2).clamp(0, width as i32) as u32,
@@ -4208,7 +4262,7 @@ mod tests {
         assert_ne!(highlighted, original);
 
         let link_document = pdfium
-            .load_pdf_from_byte_vec(synthetic_link_pdf(), None)
+            .load_pdf_from_byte_vec(synthetic_link_pdf("XYZ null 300 null"), None)
             .expect("load synthetic linked PDF");
         let link_page = link_document.pages().get(0).expect("first page");
         let link_config = PdfRenderConfig::new()
@@ -4238,7 +4292,8 @@ mod tests {
             link.target,
             LinkTarget::Internal {
                 page: 1,
-                top_ratio: Some(ratio)
+                top_ratio: Some(ratio),
+                left_ratio: None,
             } if (ratio - 0.25).abs() < f32::EPSILON
         )));
         assert!(links.iter().any(|link| {
@@ -4329,15 +4384,122 @@ mod tests {
         pdf
     }
 
-    fn synthetic_link_pdf() -> Vec<u8> {
+    #[test]
+    fn internal_links_preserve_optional_horizontal_destinations() {
+        let pdfium = super::load_pdfium(None).unwrap();
+        for (view, left_ratio, top_ratio) in [
+            ("XYZ 100 300 null", Some(0.25), Some(0.25)),
+            ("XYZ null 300 null", None, Some(0.25)),
+            ("FitH 300", None, Some(0.25)),
+            ("FitV 200", Some(0.5), None),
+            ("FitR 100 100 200 300", Some(0.25), Some(0.25)),
+        ] {
+            let document = pdfium
+                .load_pdf_from_byte_vec(synthetic_link_pdf(view), None)
+                .unwrap();
+            let page = document.pages().get(0).unwrap();
+            let link = page.links().get(0).unwrap();
+            assert_eq!(
+                super::resolve_link_target(&document, &link),
+                Some(LinkTarget::Internal {
+                    page: 1,
+                    top_ratio,
+                    left_ratio,
+                }),
+                "{view}",
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_targets_follow_crop_origin_and_page_rotation() {
+        let pdfium = super::load_pdfium(None).unwrap();
+        for (geometry, view, expected_ratio, width, expected_bounds) in [
+            (
+                "/CropBox [100 0 400 400]",
+                "XYZ 200 300 null",
+                Some(1.0 / 3.0),
+                600,
+                (200, 240),
+            ),
+            (
+                "/MediaBox [100 0 500 400]",
+                "XYZ 200 300 null",
+                Some(0.25),
+                800,
+                (200, 240),
+            ),
+            (
+                "/Rotate 90",
+                "XYZ null 300 null",
+                Some(0.75),
+                800,
+                (200, 240),
+            ),
+            ("/Rotate 90", "XYZ 200 null null", None, 800, (200, 240)),
+            (
+                "/Rotate 180",
+                "XYZ 200 300 null",
+                Some(0.5),
+                800,
+                (360, 400),
+            ),
+            (
+                "/Rotate 270",
+                "XYZ 200 300 null",
+                Some(0.25),
+                800,
+                (560, 600),
+            ),
+        ] {
+            let document = pdfium
+                .load_pdf_from_byte_vec(synthetic_link_pdf_geometry(view, geometry), None)
+                .unwrap();
+            let source = document.pages().get(0).unwrap();
+            let link = source.links().get(0).unwrap();
+            let Some(LinkTarget::Internal { left_ratio, .. }) =
+                super::resolve_link_target(&document, &link)
+            else {
+                panic!("missing internal destination: {geometry}");
+            };
+            match (left_ratio, expected_ratio) {
+                (Some(actual), Some(expected)) => assert!(
+                    (actual - expected).abs() < 0.0001,
+                    "{geometry}: {actual} != {expected}"
+                ),
+                (None, None) => {}
+                _ => panic!("wrong optional horizontal position: {geometry}: {left_ratio:?}"),
+            }
+            let target = document.pages().get(1).unwrap();
+            let config = pdfium_render::prelude::PdfRenderConfig::new().set_target_width(width);
+            let (left, right, _, _) = super::page_rect_pixel_bounds(
+                &target,
+                &config,
+                super::SearchRect {
+                    left: 200.0,
+                    right: 220.0,
+                    top: 100.0,
+                    bottom: 120.0,
+                },
+            )
+            .unwrap();
+            assert_eq!((left, right), expected_bounds, "{geometry}");
+        }
+    }
+
+    fn synthetic_link_pdf(destination: &str) -> Vec<u8> {
+        synthetic_link_pdf_geometry(destination, "")
+    }
+
+    fn synthetic_link_pdf_geometry(destination: &str, geometry: &str) -> Vec<u8> {
         let objects = [
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [7 0 R 8 0 R] /Contents 5 0 R >>".to_string(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Contents 6 0 R >>".to_string(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] {geometry} /Contents 6 0 R >>"),
             "<< /Length 0 >>\nstream\n\nendstream".to_string(),
             "<< /Length 0 >>\nstream\n\nendstream".to_string(),
-            "<< /Type /Annot /Subtype /Link /Rect [10 10 80 30] /Border [0 0 0] /Dest [4 0 R /XYZ null 300 null] >>".to_string(),
+            format!("<< /Type /Annot /Subtype /Link /Rect [10 10 80 30] /Border [0 0 0] /Dest [4 0 R /{destination}] >>"),
             "<< /Type /Annot /Subtype /Link /Rect [100 10 180 30] /Border [0 0 0] /A << /S /URI /URI (https://example.invalid/paper) >> >>".to_string(),
         ];
         let mut pdf = b"%PDF-1.7\n".to_vec();
@@ -4490,6 +4652,7 @@ mod tests {
         let shared_target = LinkTarget::Internal {
             page: 7,
             top_ratio: None,
+            left_ratio: None,
         };
         let links = vec![
             PageLink {
@@ -4602,6 +4765,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 0,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             })
             .collect::<Vec<_>>();
@@ -4624,10 +4788,12 @@ mod tests {
         let target = LinkTarget::Internal {
             page: 12,
             top_ratio: Some(0.5),
+            left_ratio: None,
         };
         let interleaved_target = LinkTarget::Internal {
             page: 13,
             top_ratio: Some(0.25),
+            left_ratio: None,
         };
         let links = vec![
             PageLink {
