@@ -39,12 +39,14 @@ local function intent()
   return id
 end
 local function with_source(id, source, callback)
+  local config = options or setup_options or {}
+  local attach_focus = config.attach_only and config.focus_on_inverse and not remote_session()
   local function captured(error, handle)
     if alive(id) then
-      callback(handle, error)
+      callback(handle or (attach_focus and M._source_terminal or nil), error)
     end
   end
-  if source or remote_session() or (options or setup_options or {}).attach_only then
+  if source or remote_session() or (config.attach_only and not attach_focus) then
     captured(nil, source)
     return
   end

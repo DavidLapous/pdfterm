@@ -595,7 +595,9 @@ fn document_metadata_word_location(
     let mut tied = false;
     for (file_index, (_, source)) in files.iter().enumerate() {
         let mut start = 0;
-        for row in source.lines() {
+        for raw_row in source.split_inclusive('\n') {
+            let row = raw_row.strip_suffix('\n').unwrap_or(raw_row);
+            let row = row.strip_suffix('\r').unwrap_or(row);
             let visible = source_line_text(row);
             for command in ["\\title", "\\subtitle", "\\author", "\\date", "\\institute"] {
                 let Some(at) = visible.find(command) else {
@@ -628,7 +630,7 @@ fn document_metadata_word_location(
                     }
                 }
             }
-            start += row.len() + 1;
+            start += raw_row.len();
         }
     }
     let (score, index, line, byte) = best.filter(|_| !tied)?;
@@ -1241,6 +1243,23 @@ mod tests {
         assert!(found.0.ends_with("preamble.tex"));
         assert_eq!((found.2, found.3), (2, 19));
         assert!(document_metadata_word_location(&pdf, "Report", 0).is_none());
+    }
+
+    #[test]
+    fn inverse_metadata_preserves_crlf_and_unicode_byte_offsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("slides.pdf");
+        let declaration = "\\newcommand{\\unused}{éééé}\\title{Example Report}";
+        for newline in ["\n", "\r\n"] {
+            let mut source = format!("\\documentclass{{beamer}}{newline}");
+            for _ in 0..7 {
+                source.push_str(&format!("% padding{newline}"));
+            }
+            source.push_str(declaration);
+            fs::write(pdf.with_extension("tex"), &source).unwrap();
+            let found = document_metadata_word_location(&pdf, "Example Report", 8).unwrap();
+            assert_eq!((found.2, found.3), (9, declaration.find("Report").unwrap()));
+        }
     }
 
     #[test]

@@ -2532,7 +2532,9 @@ impl App {
                 }
                 tab.link_history.push(current);
                 tab.page = page;
-                tab.scroll_y = 0;
+                if top_ratio.is_some() {
+                    tab.scroll_y = 0;
+                }
                 tab.pending_destination = Some(LinkDestination {
                     page,
                     top_ratio,
@@ -3743,8 +3745,7 @@ impl App {
             return Ok(());
         }
 
-        // Center the highlighted region using continuous scrolling, including
-        // the preceding page when the target is near the top of this one.
+        // Center across page boundaries only when the active display is continuous.
         let flash_scroll = match self.navigation.flash.as_mut() {
             Some(flash)
                 if flash.document_id == key.document_id
@@ -3786,7 +3787,10 @@ impl App {
                 } else {
                     i64::from(viewport.pixel_height) * 8 / 100
                 };
-            if self.viewer.continuous_scroll {
+            if self.viewer.continuous_scroll
+                && self.link_picker.is_none()
+                && self.search_picker.is_none()
+            {
                 self.pending_vertical_scroll = target;
             } else {
                 self.tab_mut().scroll_y = target.max(0) as u32;
@@ -3907,10 +3911,6 @@ impl App {
         if let Some(destination) = self.tab_mut().pending_destination.take()
             && destination.page == frame.key.page
         {
-            let target_y = destination
-                .top_ratio
-                .map(|ratio| (ratio * frame.height as f32).round() as u32)
-                .unwrap_or(0);
             if let Some(left_ratio) = destination.left_ratio {
                 let target_x = left_ratio * frame.width as f32;
                 self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
@@ -3921,7 +3921,9 @@ impl App {
                     target_x,
                 );
             }
-            self.tab_mut().scroll_y = target_y;
+            if let Some(top_ratio) = destination.top_ratio {
+                self.tab_mut().scroll_y = (top_ratio * frame.height as f32).round() as u32;
+            }
         }
         if self.viewer.continuous_scroll
             && self.link_picker.is_none()
@@ -7619,6 +7621,23 @@ mod tests {
         app.tab_mut().cache.retain(|key, _| key.page != 1);
         app.pending.insert(target);
         (app, viewport, file)
+    }
+
+    #[test]
+    fn rendered_destination_without_vertical_coordinate_preserves_scroll() {
+        let (mut app, viewport, _file) = continuous_app();
+        app.viewer.continuous_scroll = false;
+        app.tab_mut().scroll_y = 20;
+        app.tab_mut().pending_destination = Some(super::LinkDestination {
+            page: 0,
+            // A 90-degree XYZ null 300 null destination specifies only rendered x.
+            top_ratio: None,
+            left_ratio: Some(0.75),
+        });
+        let frame = app.tab().cache[&app.page_key(0, viewport)].clone();
+        app.draw_frame_unsynchronized(&frame, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!(app.tab().scroll_y, 20);
     }
 
     #[test]
