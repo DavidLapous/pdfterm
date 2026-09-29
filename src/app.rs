@@ -297,6 +297,7 @@ pub fn run(
         if event::poll(app.input_wait())? {
             match read_event()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.pending_zoom = None;
                     app.cancel_forward("forward search cancelled by keyboard input")?;
                     if app.handle_key(key, &mut output)? {
                         break;
@@ -305,6 +306,7 @@ pub fn run(
                 Event::Resize(_, _) => app.request_current(&mut output)?,
                 Event::Mouse(mouse) => {
                     if !matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
+                        app.pending_zoom = None;
                         app.cancel_forward("forward search cancelled by mouse input")?;
                     }
                     app.handle_mouse(mouse, &mut output)?;
@@ -341,6 +343,7 @@ struct App {
     visible_image_id: Option<u32>,
     visible_pages: Vec<VisiblePage>,
     missing_visible_page: Option<RenderKey>,
+    pending_zoom: Option<(RenderKey, u16)>,
     canvas_viewport: Option<Viewport>,
     pending_vertical_scroll: i64,
     smooth_scroll_remaining: i64,
@@ -894,6 +897,7 @@ impl App {
             visible_image_id: None,
             visible_pages: Vec::new(),
             missing_visible_page: None,
+            pending_zoom: None,
             canvas_viewport: None,
             pending_vertical_scroll: 0,
             smooth_scroll_remaining: 0,
@@ -2282,6 +2286,7 @@ impl App {
             return Err(io::Error::other("forward page is outside the document").into());
         }
         let rect = request.rect();
+        self.pending_zoom = None;
         self.select_tab(index, output)?;
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
@@ -3463,18 +3468,84 @@ impl App {
 
     fn set_zoom(&mut self, zoom: u16, output: &mut impl Write) -> Result<(), AppError> {
         let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
-        if zoom == self.tab().zoom {
+        let old_zoom = self.tab().zoom;
+        if zoom == old_zoom {
             return Ok(());
         }
-        let tab = self.tab_mut();
-        // Offsets are rendered pixels; retain their position in document space.
-        let old_zoom = u64::from(tab.zoom);
-        let scale = |offset: u32| {
-            ((u64::from(offset) * u64::from(zoom) + old_zoom / 2) / old_zoom)
-                .min(u64::from(u32::MAX)) as u32
+        // Zoom anchors to the displayed position, not an unfinished scroll target.
+        self.smooth_scroll_remaining = 0;
+        self.pending_vertical_scroll = 0;
+        let viewport = self.viewport()?;
+        let tab = self.tab();
+        let current_key = self.render_key(viewport);
+        let page_size = |page| {
+            let key = self.page_key(page, viewport);
+            let frame = tab
+                .cache
+                .get(&key)
+                .map(Arc::as_ref)
+                .or_else(|| {
+                    self.visible_pages
+                        .iter()
+                        .find(|visible| {
+                            visible.frame.key.page == page
+                                && visible.frame.key.fit == tab.fit
+                                && visible.frame.key.width == viewport.pixel_width
+                                && visible.frame.key.height == viewport.pixel_height
+                                && visible.frame.revision.pdf == tab.revision
+                        })
+                        .map(|visible| visible.frame.as_ref())
+                })
+                .or_else(|| {
+                    tab.cache
+                        .values()
+                        .find(|frame| {
+                            frame.key.page == page
+                                && frame.key.width == current_key.width
+                                && frame.key.height == current_key.height
+                                && frame.key.fit == current_key.fit
+                                && frame.revision.pdf == tab.revision
+                        })
+                        .map(Arc::as_ref)
+                })?;
+            if frame.key.document_id != tab.document_id
+                || frame.key.fit != tab.fit
+                || frame.key.width != viewport.pixel_width
+                || frame.key.height != viewport.pixel_height
+                || frame.revision.pdf != tab.revision
+            {
+                return None;
+            }
+            Some((
+                scale_zoom(frame.width, frame.key.zoom, old_zoom),
+                scale_zoom(frame.height, frame.key.zoom, old_zoom),
+            ))
         };
-        tab.scroll_x = scale(tab.scroll_x);
-        tab.scroll_y = scale(tab.scroll_y);
+        let position = centered_zoom_view(
+            viewport,
+            tab.page,
+            tab.page_count,
+            (tab.scroll_x, tab.scroll_y),
+            (old_zoom, zoom),
+            self.viewer.continuous_scroll
+                && self.link_picker.is_none()
+                && self.search_picker.is_none(),
+            page_size,
+        );
+        let (page, scroll_x, scroll_y) = match position {
+            Ok(position) => position,
+            Err(missing_page) => {
+                let key = self.page_key(missing_page, viewport);
+                self.pending_zoom = Some((key, zoom));
+                self.request_visible_page(key)?;
+                self.draw_status(output, viewport, "loading page geometry for zoom")?;
+                return Ok(());
+            }
+        };
+        let tab = self.tab_mut();
+        tab.page = page;
+        tab.scroll_x = scroll_x;
+        tab.scroll_y = scroll_y;
         tab.zoom = zoom;
         self.request_current(output)
     }
@@ -3529,6 +3600,7 @@ impl App {
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
+        self.pending_zoom = None;
         self.missing_visible_page = None;
         self.status_line.clear();
         if self.label_query.is_some() {
@@ -3609,7 +3681,12 @@ impl App {
         // Config validation bounds prefetch_pages at u32::MAX.
         let cache_radius = u32::try_from(self.viewer.prefetch_pages)
             .expect("validated prefetch_pages exceeds u32")
-            .max(1);
+            .max(1)
+            .max(
+                self.pending_zoom
+                    .filter(|(wanted, _)| wanted.document_id == key.document_id)
+                    .map_or(0, |(wanted, _)| wanted.page.abs_diff(current_page)),
+            );
         let visible_end = self
             .visible_pages
             .last()
@@ -3632,6 +3709,13 @@ impl App {
                 && (cached.selected_link_ordinal.is_none()
                     || cached.selected_link_ordinal == key.selected_link_ordinal)
         });
+        if let Some((waiting, zoom)) = self.pending_zoom
+            && waiting == key
+        {
+            self.pending_zoom = None;
+            self.set_zoom(zoom, output)?;
+            return Ok(());
+        }
 
         // Center the highlighted region using continuous scrolling, including
         // the preceding page when the target is near the top of this one.
@@ -3920,8 +4004,6 @@ impl App {
             // height + cell. This is the inclusive clamp for that half-open span.
             frame.height + cell - 1
         };
-        let max_x = frame.width.saturating_sub(u32::from(viewport.pixel_width));
-        self.tab_mut().scroll_x = self.tab().scroll_x.min(max_x);
         self.tab_mut().scroll_y = self.tab().scroll_y.min(max_y);
         let old_pages = std::mem::take(&mut self.visible_pages);
         if old_pages.is_empty()
@@ -4006,6 +4088,19 @@ impl App {
             }
             y += span; // Keep a one-cell-high gap, without rounding page heights.
             page += 1;
+        }
+        if self.missing_visible_page.is_none() {
+            let max_x = self
+                .visible_pages
+                .iter()
+                .map(|page| {
+                    page.frame
+                        .width
+                        .saturating_sub(u32::from(viewport.pixel_width))
+                })
+                .max()
+                .unwrap_or(0);
+            self.tab_mut().scroll_x = self.tab().scroll_x.min(max_x);
         }
         for old in old_pages {
             if !self
@@ -4637,6 +4732,86 @@ fn stepped_zoom(current: u16, zoom_in: bool) -> u16 {
         current.saturating_sub(ZOOM_STEP)
     };
     next.clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+fn scale_zoom(value: u32, old_zoom: u16, new_zoom: u16) -> u32 {
+    ((u64::from(value) * u64::from(new_zoom) + u64::from(old_zoom) / 2) / u64::from(old_zoom))
+        .min(u64::from(u32::MAX)) as u32
+}
+
+/// Keep the PDF point under the viewport center fixed, even if it belongs to
+/// the next visible page. Page gaps stay one terminal row rather than scaling.
+fn centered_zoom_view(
+    viewport: Viewport,
+    mut page: u32,
+    page_count: u32,
+    (scroll_x, scroll_y): (u32, u32),
+    (old_zoom, new_zoom): (u16, u16),
+    continuous: bool,
+    page_size: impl Fn(u32) -> Option<(u32, u32)>,
+) -> Result<(u32, u32, u32), u32> {
+    let width = u32::from(viewport.pixel_width);
+    let height = u32::from(viewport.pixel_height);
+    let half_width = i64::from(width / 2);
+    let half_height = i64::from(height / 2);
+    let gap = (height / u32::from(viewport.rows).max(1)).max(1);
+    let mut center_y = i64::from(scroll_y) + half_height;
+    if continuous {
+        while page + 1 < page_count {
+            let (_, page_height) = page_size(page).ok_or(page)?;
+            let span = i64::from(page_height) + i64::from(gap);
+            if center_y < span {
+                break;
+            }
+            center_y -= span;
+            page += 1;
+        }
+    }
+    let (page_width, page_height) = page_size(page).ok_or(page)?;
+    let center_x = if page_width < width {
+        // Narrow images are centered by whole terminal cells; leftover pixels
+        // stay on the right, not symmetrically around the image midpoint.
+        let cell_width = (width / u32::from(viewport.columns).max(1)).max(1);
+        let left = u32::from(viewport.place(page_width, page_height, 0, 0).left) * cell_width;
+        (width / 2).saturating_sub(left).min(page_width)
+    } else {
+        scroll_x.saturating_add(width / 2).min(page_width)
+    };
+    let x = (i64::from(scale_zoom(center_x, old_zoom, new_zoom)) - half_width).clamp(
+        0,
+        i64::from(scale_zoom(page_width, old_zoom, new_zoom).saturating_sub(width)),
+    ) as u32;
+    if center_y >= i64::from(page_height) && (!continuous || page + 1 == page_count) {
+        center_y = i64::from(page_height / 2);
+    }
+    let mut y = i64::from(scale_zoom(
+        center_y.min(i64::from(page_height)) as u32,
+        old_zoom,
+        new_zoom,
+    )) - half_height;
+    if continuous {
+        while y < 0 && page > 0 {
+            page -= 1;
+            let (_, previous_height) = page_size(page).ok_or(page)?;
+            y += i64::from(scale_zoom(previous_height, old_zoom, new_zoom)) + i64::from(gap);
+        }
+        while page + 1 < page_count {
+            let (_, current_height) = page_size(page).ok_or(page)?;
+            let span = i64::from(scale_zoom(current_height, old_zoom, new_zoom)) + i64::from(gap);
+            if y < span {
+                break;
+            }
+            y -= span;
+            page += 1;
+        }
+    }
+    let (_, top_page_height) = page_size(page).ok_or(page)?;
+    let max_y = if continuous && page + 1 < page_count {
+        scale_zoom(top_page_height, old_zoom, new_zoom).saturating_add(gap - 1)
+    } else {
+        scale_zoom(top_page_height, old_zoom, new_zoom).saturating_sub(height)
+    };
+    Ok((page, x, y.clamp(0, i64::from(max_y)) as u32))
 }
 
 fn numbered_tab_index(key: KeyEvent) -> Option<usize> {
@@ -7235,12 +7410,12 @@ mod tests {
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
         PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState, ZOOM_DEFAULT,
-        ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, clear_image_canvas, clear_picker,
-        clear_picker_filter, cycled_tab_index, draw_link_picker, draw_picker, draw_search_picker,
-        draw_theme_picker, filter_document_links, filter_outline, filter_theme_indices,
-        link_at_cell, link_picker_focus_for_key, link_picker_label, link_picker_link_at_position,
-        link_picker_list_area, link_picker_navigation_index, link_picker_panes,
-        link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
+        ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, centered_zoom_view,
+        clear_image_canvas, clear_picker, clear_picker_filter, cycled_tab_index, draw_link_picker,
+        draw_picker, draw_search_picker, draw_theme_picker, filter_document_links, filter_outline,
+        filter_theme_indices, link_at_cell, link_picker_focus_for_key, link_picker_label,
+        link_picker_link_at_position, link_picker_list_area, link_picker_navigation_index,
+        link_picker_panes, link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
         outline_start_index, picker_color, picker_rect, render_timing_status,
         restore_link_picker_split, search_target_page, show_link_picker_split, stale_status_row,
         stepped_zoom, synchronized_output, update_link_number_selection, write_clipboard_osc52,
@@ -7352,6 +7527,30 @@ mod tests {
         app.draw_continuous(&frame, viewport, &mut Vec::new())
             .unwrap();
         assert_eq!((app.tab().scroll_x, app.tab().scroll_y), (20, 40));
+    }
+
+    #[test]
+    fn continuous_zoom_retains_x_offset_for_wider_page_below_narrow_top_page() {
+        let (mut app, mut viewport, _file) = continuous_app();
+        viewport.pixel_width = 60;
+        let revision = app.tab().watcher.accepted;
+        let narrow_key = app.page_key(0, viewport);
+        let wide_key = app.page_key(1, viewport);
+        let mut narrow = continuous_frame(narrow_key, revision, false);
+        let first = std::sync::Arc::get_mut(&mut narrow).unwrap();
+        first.width = 40;
+        first.compressed_rgba = crate::kitty::compress_rgba(&[255; 40 * 240 * 4]).unwrap();
+        let wide = continuous_frame(wide_key, revision, false);
+        app.tab_mut().cache.clear();
+        app.tab_mut().cache.insert(narrow_key, narrow.clone());
+        app.tab_mut().cache.insert(wide_key, wide);
+        app.tab_mut().scroll_x = 20;
+        app.tab_mut().scroll_y = 220;
+        app.draw_continuous(&narrow, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!(app.tab().scroll_x, 20);
+        assert_eq!(app.visible_pages[0].placement.scroll_x, 0);
+        assert_eq!(app.visible_pages[1].placement.scroll_x, 20);
     }
 
     #[test]
@@ -8686,6 +8885,110 @@ mod tests {
         assert_eq!(stepped_zoom(ZOOM_MIN, false), ZOOM_MIN);
         assert_eq!(stepped_zoom(ZOOM_MAX, true), ZOOM_MAX);
         assert_eq!(stepped_zoom(ZOOM_MAX - ZOOM_STEP, true), ZOOM_MAX);
+    }
+
+    #[test]
+    fn zoom_keeps_viewport_center_when_page_first_fits_then_overflows() {
+        let viewport = Viewport {
+            columns: 10,
+            rows: 8,
+            pixel_width: 100,
+            pixel_height: 80,
+            top: 0,
+            status_row: 8,
+        };
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 1, (0, 0), (100, 300), false, |_| Some((
+                60, 40
+            ))),
+            Ok((0, 40, 20))
+        );
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 1, (30, 50), (100, 150), false, |_| Some((
+                200, 160
+            ))),
+            Ok((0, 70, 95))
+        );
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 1, (70, 95), (150, 100), false, |_| Some((
+                300, 240
+            ))),
+            Ok((0, 30, 50))
+        );
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 1, (200, 160), (150, 100), false, |_| Some((
+                300, 240
+            ))),
+            Ok((0, 100, 80))
+        );
+    }
+
+    #[test]
+    fn zoom_uses_actual_terminal_cell_placement_when_page_first_fits() {
+        let viewport = Viewport {
+            columns: 80,
+            rows: 29,
+            pixel_width: 960,
+            pixel_height: 580,
+            top: 0,
+            status_row: 29,
+        };
+        // 870px occupies 73 columns, offset by three 12px cells: its midpoint
+        // is at x=471, nine pixels left of the viewport center.
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 1, (0, 0), (100, 125), false, |_| Some((
+                870, 580
+            ))),
+            Ok((0, 75, 73))
+        );
+    }
+
+    #[test]
+    fn zoom_keeps_center_on_next_page_and_can_reveal_previous_page() {
+        let viewport = Viewport {
+            columns: 10,
+            rows: 8,
+            pixel_width: 100,
+            pixel_height: 80,
+            top: 0,
+            status_row: 8,
+        };
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 2, (0, 90), (100, 200), true, |page| {
+                Some(if page == 0 { (200, 100) } else { (100, 120) })
+            }),
+            Ok((1, 50, 0))
+        );
+        assert_eq!(
+            centered_zoom_view(viewport, 1, 2, (50, 0), (200, 100), true, |page| {
+                Some(if page == 0 { (400, 200) } else { (200, 240) })
+            }),
+            Ok((0, 0, 90))
+        );
+    }
+
+    #[test]
+    fn zoom_identifies_uncached_predecessor_and_keeps_short_page_center() {
+        let viewport = Viewport {
+            columns: 10,
+            rows: 8,
+            pixel_width: 100,
+            pixel_height: 80,
+            top: 0,
+            status_row: 8,
+        };
+        assert_eq!(
+            centered_zoom_view(viewport, 1, 2, (0, 0), (200, 100), true, |page| {
+                (page == 1).then_some((200, 160))
+            }),
+            Err(0)
+        );
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 1, (0, 0), (100, 125), true, |_| Some((
+                100, 70
+            ))),
+            Ok((0, 13, 8))
+        );
     }
 
     #[test]
