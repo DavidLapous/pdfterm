@@ -78,7 +78,7 @@ selected render is still pending; retry after the current PDF frame appears.
 | `k` / up / `Backspace` / `PageUp` | scroll up continuously across pages |
 | `h` / `l` / left / right | scroll horizontally, or change page at the edge |
 | Mouse wheel / trackpad | scroll the document, or move through entries in the outline |
-| `g` / `G` | first / last page |
+| `g` / `Home`, `G` / `End` | first / last page; preserve horizontal scroll (clamped to the destination page's width) |
 | `:` | go-to-page prompt (type a number, `Enter` to jump, `Esc` to cancel) |
 | `/` | search selectable document text |
 | `n` / `N` | next / previous page containing a search match |
@@ -178,6 +178,10 @@ redaction check: sanitize PDFs before using it on sensitive covered content.
 Click a PDF hyperlink to follow it; no mode toggle is required. Mouse capture stays
 enabled while the viewer runs, including outside `L` mode. Use `y` to copy
 the page's text, or your terminal's mouse-capture override for terminal selection.
+Internal links preserve horizontal scroll when the destination is already visible;
+otherwise they scroll only far enough to reveal its horizontal position. Links
+without a horizontal destination keep the current offset, clamped to the target
+page's width.
 Press `L` to toggle annotation highlights and open the document-wide link browser.
 Press `Enter` to open the same browser without enabling highlights. It uses a
 Grimoire-style split view. Wide terminals place
@@ -426,6 +430,10 @@ missing words, and unsupported PDF glyph mappings retain the original region,
 with an explicit status message rather than guessing the nearest word. This does
 not expand TeX macros or select a different page or Beamer overlay. PDF text
 extraction errors fail the request explicitly.
+Forward search from Neovim or the control socket preserves horizontal scroll when
+the target region is already visible; otherwise it scrolls only far enough to
+reveal it. Word-refined requests use the word's bounds. If the region is wider
+than the viewport, an offset already within that region stays unchanged.
 
 The viewer reloads a different revision **before** validating page count, positions
 the target, and replies `{"ok":true,"error":null}` only after submitting the

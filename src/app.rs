@@ -473,6 +473,7 @@ struct ViewPosition {
 struct LinkDestination {
     page: u32,
     top_ratio: Option<f32>,
+    left_ratio: Option<f32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1947,6 +1948,7 @@ impl App {
         tab.pending_destination = Some(LinkDestination {
             page: link.source_page,
             top_ratio: Some((link.source_top_ratio - 0.08).max(0.0)),
+            left_ratio: None,
         });
         self.request_current(output)
     }
@@ -2303,7 +2305,6 @@ impl App {
         let page = request.page.saturating_sub(1).min(tab.page_count - 1);
         if page != tab.page {
             tab.page = page;
-            tab.scroll_x = 0;
             tab.scroll_y = 0;
         }
         self.navigation.flash = Some(PendingFlash {
@@ -2514,7 +2515,11 @@ impl App {
 
     fn follow_link(&mut self, target: LinkTarget, output: &mut impl Write) -> Result<(), AppError> {
         match target {
-            LinkTarget::Internal { page, top_ratio } => {
+            LinkTarget::Internal {
+                page,
+                top_ratio,
+                left_ratio,
+            } => {
                 let current = ViewPosition {
                     page: self.tab().page,
                     scroll_x: self.tab().scroll_x,
@@ -2527,9 +2532,12 @@ impl App {
                 }
                 tab.link_history.push(current);
                 tab.page = page;
-                tab.scroll_x = 0;
                 tab.scroll_y = 0;
-                tab.pending_destination = Some(LinkDestination { page, top_ratio });
+                tab.pending_destination = Some(LinkDestination {
+                    page,
+                    top_ratio,
+                    left_ratio,
+                });
                 self.request_current(output)?;
             }
             LinkTarget::Uri(uri) => {
@@ -3086,9 +3094,9 @@ impl App {
             }
             KeyCode::Right => self.move_view(Axis::Horizontal, true, false, true, output)?,
             KeyCode::Left => self.move_view(Axis::Horizontal, false, false, true, output)?,
-            KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
+            KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
-                self.set_page(self.tab().page_count - 1, output)?
+                self.set_page_vertically(self.tab().page_count - 1, output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
@@ -3165,9 +3173,9 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 self.move_view(Axis::Horizontal, false, false, true, output)?
             }
-            KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
+            KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
-                self.set_page(self.tab().page_count - 1, output)?
+                self.set_page_vertically(self.tab().page_count - 1, output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('+') | KeyCode::Char('=') => self.zoom_in(output)?,
@@ -3192,10 +3200,16 @@ impl App {
     }
 
     fn set_page(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
-        let page = page.min(self.tab().page_count - 1);
-        self.tab_mut().page = page;
         self.tab_mut().scroll_x = 0;
-        self.tab_mut().scroll_y = 0;
+        self.set_page_vertically(page, output)
+    }
+
+    fn set_page_vertically(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
+        let page = page.min(self.tab().page_count - 1);
+        let tab = self.tab_mut();
+        tab.page = page;
+        tab.scroll_y = 0;
+        tab.pending_destination = None;
         self.request_current(output)
     }
 
@@ -3237,7 +3251,19 @@ impl App {
                 Ok(())
             };
         };
-        let (max_x, max_y) = viewport.max_scroll(frame.width, frame.height);
+        let (mut max_x, max_y) = viewport.max_scroll(frame.width, frame.height);
+        if self.viewer.continuous_scroll
+            && self.link_picker.is_none()
+            && self.search_picker.is_none()
+        {
+            for page in &self.visible_pages {
+                max_x = max_x.max(
+                    page.frame
+                        .width
+                        .saturating_sub(u32::from(viewport.pixel_width)),
+                );
+            }
+        }
         let (axis_max, current) = match axis {
             Axis::Vertical => (max_y, self.tab().scroll_y),
             Axis::Horizontal => (max_x, self.tab().scroll_x),
@@ -3739,6 +3765,16 @@ impl App {
         };
         if let Some(center_pt) = flash_scroll {
             let viewport = self.viewport()?;
+            let highlight = frame.flash.as_ref().unwrap();
+            if let Some((left, right)) = highlight.horizontal_bounds {
+                self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
+                    self.tab().scroll_x,
+                    frame.width,
+                    u32::from(viewport.pixel_width),
+                    left as f32,
+                    right as f32,
+                );
+            }
             let center = (center_pt / frame.flash.as_ref().unwrap().page_height_pt
                 * frame.height as f32)
                 .round() as i64;
@@ -3875,7 +3911,16 @@ impl App {
                 .top_ratio
                 .map(|ratio| (ratio * frame.height as f32).round() as u32)
                 .unwrap_or(0);
-            self.tab_mut().scroll_x = 0;
+            if let Some(left_ratio) = destination.left_ratio {
+                let target_x = left_ratio * frame.width as f32;
+                self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
+                    self.tab().scroll_x,
+                    frame.width,
+                    u32::from(viewport.pixel_width),
+                    target_x,
+                    target_x,
+                );
+            }
             self.tab_mut().scroll_y = target_y;
         }
         if self.viewer.continuous_scroll
@@ -4044,7 +4089,11 @@ impl App {
             if let Some(placement) = viewport.place_continuous(
                 rendered.width,
                 rendered.height,
-                self.tab().scroll_x,
+                self.tab().scroll_x.min(
+                    rendered
+                        .width
+                        .saturating_sub(u32::from(viewport.pixel_width)),
+                ),
                 offset,
                 top,
             ) {
@@ -4089,18 +4138,17 @@ impl App {
             y += span; // Keep a one-cell-high gap, without rounding page heights.
             page += 1;
         }
-        if self.missing_visible_page.is_none() {
-            let max_x = self
+        // A narrow preceding page must not hide a wider visible jump or zoom target.
+        // Each placement clamps independently, including retained overlay frames.
+        // An uncached visible page may be wider; retain the requested offset until it renders.
+        if self.missing_visible_page.is_none()
+            && let Some(scroll_x) = self
                 .visible_pages
                 .iter()
-                .map(|page| {
-                    page.frame
-                        .width
-                        .saturating_sub(u32::from(viewport.pixel_width))
-                })
+                .map(|page| page.placement.scroll_x)
                 .max()
-                .unwrap_or(0);
-            self.tab_mut().scroll_x = self.tab().scroll_x.min(max_x);
+        {
+            self.tab_mut().scroll_x = scroll_x;
         }
         for old in old_pages {
             if !self
@@ -4615,6 +4663,31 @@ fn link_at_cell(
         .map(|link| link.target.clone())
 }
 
+/// Keep a visible horizontal target stationary; otherwise reveal it with the least movement.
+fn horizontal_scroll_to_reveal(
+    current: u32,
+    page_width: u32,
+    viewport_width: u32,
+    target_left: f32,
+    target_right: f32,
+) -> u32 {
+    let left = (target_left.min(target_right).floor() as u32).min(page_width.saturating_sub(1));
+    let right = (target_left.max(target_right).ceil() as u32)
+        .max(left.saturating_add(1))
+        .min(page_width);
+    let right_aligned = right.saturating_sub(viewport_width);
+    let min_scroll = left.min(right_aligned);
+    let max_scroll = left.max(right_aligned);
+    let page_max = page_width.saturating_sub(viewport_width);
+    // Continuous view can share an offset larger than this page can crop.
+    // Judge visibility using this page's actual crop, without moving its wider neighbor.
+    if (min_scroll..=max_scroll).contains(&current.min(page_max)) {
+        current
+    } else {
+        current.clamp(min_scroll, max_scroll).min(page_max)
+    }
+}
+
 fn badge_glyph_size(text_height: u32) -> u32 {
     // Keep short labels readable at small on-page word sizes.
     text_height.saturating_sub(2).max(8)
@@ -4775,7 +4848,10 @@ fn centered_zoom_view(
         let left = u32::from(viewport.place(page_width, page_height, 0, 0).left) * cell_width;
         (width / 2).saturating_sub(left).min(page_width)
     } else {
-        scroll_x.saturating_add(width / 2).min(page_width)
+        scroll_x
+            .min(page_width.saturating_sub(width))
+            .saturating_add(width / 2)
+            .min(page_width)
     };
     let x = (i64::from(scale_zoom(center_x, old_zoom, new_zoom)) - half_width).clamp(
         0,
@@ -7406,6 +7482,37 @@ impl From<Palette> for PickerTheme {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn horizontal_navigation_only_scrolls_to_reveal_hidden_targets() {
+        let scroll = |current, left, right| {
+            super::horizontal_scroll_to_reveal(current, 2000, 800, left, right)
+        };
+        assert_eq!(scroll(300, 400.0, 500.0), 300);
+        assert_eq!(scroll(300, 300.0, 1100.0), 300);
+        assert_eq!(scroll(300, 250.0, 400.0), 250);
+        assert_eq!(scroll(300, 1000.0, 1150.0), 350);
+        assert_eq!(scroll(300, 1100.0, 1100.0), 301);
+        assert_eq!(scroll(300, 400.0, 400.0), 300);
+        assert_eq!(scroll(300, 100.0, 1400.0), 300);
+        assert_eq!(scroll(0, 100.0, 1400.0), 100);
+        assert_eq!(scroll(900, 100.0, 1400.0), 600);
+        assert_eq!(scroll(300, 2000.0, 2000.0), 1200);
+        // Shared continuous scroll can exceed this narrow page's own crop.
+        // Its x=50 target is visible at the actual per-page offset 20.
+        assert_eq!(
+            super::horizontal_scroll_to_reveal(100, 120, 100, 50.0, 51.0),
+            100,
+        );
+        assert_eq!(
+            super::horizontal_scroll_to_reveal(100, 120, 100, 0.0, 10.0),
+            0,
+        );
+        assert_eq!(
+            super::horizontal_scroll_to_reveal(100, 60, 100, 30.0, 35.0),
+            100,
+        );
+    }
+
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
@@ -7459,6 +7566,7 @@ mod tests {
                     right: 20.0,
                 },
                 page_height_pt: 240.0,
+                horizontal_bounds: Some((10, 20)),
                 word_precise: true,
                 error: None,
             }),
@@ -7551,6 +7659,31 @@ mod tests {
         assert_eq!(app.tab().scroll_x, 20);
         assert_eq!(app.visible_pages[0].placement.scroll_x, 0);
         assert_eq!(app.visible_pages[1].placement.scroll_x, 20);
+    }
+
+    #[test]
+    fn continuous_redraw_preserves_offset_for_wider_visible_target() {
+        let (mut app, viewport, _file) = continuous_app();
+        let target = app.page_key(1, viewport);
+        let mut wide = continuous_frame(target, app.tab().watcher.accepted, true);
+        std::sync::Arc::get_mut(&mut wide).unwrap().width = 160;
+        app.tab_mut().cache.insert(target, wide);
+        app.tab_mut().scroll_x = 45;
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        app.draw_continuous(&primary, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!(app.tab().scroll_x, 45);
+        assert_eq!(app.visible_pages[0].placement.scroll_x, 0);
+        assert_eq!(app.visible_pages[1].placement.scroll_x, 45);
+        app.tab_mut().cache.remove(&target);
+        app.draw_continuous(&primary, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!(app.tab().scroll_x, 45);
+        assert_eq!(app.visible_pages[1].placement.scroll_x, 45);
+        app.tab_mut().scroll_y = 0;
+        app.draw_continuous(&primary, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!(app.tab().scroll_x, 0);
     }
 
     #[test]
@@ -8024,6 +8157,7 @@ mod tests {
         let target = LinkTarget::Internal {
             page: 7,
             top_ratio: Some(0.5),
+            left_ratio: None,
         };
         let links = [PageLink {
             rect: PageLinkRect {
@@ -8155,6 +8289,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 10,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             },
             DocumentLink {
@@ -8186,6 +8321,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 4,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             },
             DocumentLink {
@@ -8198,6 +8334,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 5,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             },
         ];
@@ -8234,6 +8371,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 4,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             },
             DocumentLink {
@@ -8246,6 +8384,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 6,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             },
             DocumentLink {
@@ -8258,6 +8397,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 7,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             },
         ];
@@ -8287,6 +8427,7 @@ mod tests {
                 target: LinkTarget::Internal {
                     page: 7,
                     top_ratio: None,
+                    left_ratio: None,
                 },
             },
             DocumentLink {
@@ -8964,6 +9105,26 @@ mod tests {
                 Some(if page == 0 { (400, 200) } else { (200, 240) })
             }),
             Ok((0, 0, 90))
+        );
+    }
+
+    #[test]
+    fn zoom_anchors_the_narrow_center_page_at_its_actual_crop() {
+        let viewport = Viewport {
+            columns: 10,
+            rows: 8,
+            pixel_width: 100,
+            pixel_height: 80,
+            top: 0,
+            status_row: 8,
+        };
+        // Page one begins within the viewport and permits shared scroll_x=100,
+        // but the centered page zero is only 120px wide and crops at x=20.
+        assert_eq!(
+            centered_zoom_view(viewport, 0, 2, (100, 0), (100, 200), true, |page| {
+                Some(if page == 0 { (120, 60) } else { (300, 180) })
+            }),
+            Ok((0, 90, 40)),
         );
     }
 
