@@ -12,6 +12,9 @@ It is not a sandboxed viewer for hostile PDFs.
 ![pdfterm rendering an arXiv paper in dark mode inside Kitty](assets/pdfterm-dark-mode-arxiv.png)
 
 The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top and remain searchable alongside recursively discovered PDFs. Picker searches match filenames and parent directories, with filename matches ranked first. Press `/` to filter a picker; `Esc` clears an active query before closing it.
+Recursive discovery in Git checkouts preserves literal filenames, including
+Unicode, quotes, and embedded newlines; Git's display-quoting settings do not
+affect which PDFs appear.
 
 One viewer's forward socket serves all its PDF tabs: forwarding to a different
 PDF opens or selects that tab, and `Tab` / `Shift-Tab` switches among open PDFs.
@@ -126,6 +129,9 @@ Vertical scrolling shows adjacent pages together, separated by one terminal row,
 in every fit mode. Links and inverse search target the page under the pointer,
 not just the first visible page. The `h`/`l` keys and left/right arrows scroll
 horizontally when the rendered page is wider than the viewport.
+Internal-link destinations use rendered page coordinates, including page rotation
+and crop/media-box offsets. An omitted destination coordinate leaves its
+corresponding rendered scroll axis unchanged.
 
 Search scans and caches selectable text incrementally without blocking foreground
 page rendering. Results open beside the PDF, grouped by outline section and page,
@@ -393,6 +399,8 @@ pdfterm /project/main.pdf --session paper --forward-search /project/main.tex --l
 Source coordinates are one-based; `--column` counts Unicode scalars. To obtain
 the request without sending it, substitute `--synctex-view` for
 `--forward-search`; `--synctex-view` does not require a session.
+Forward search keeps an open search or link pane and centers the target within
+its single-page PDF view rather than scrolling into an adjacent page.
 `forward_socket = ""` disables viewer control even with a named session.
 The forward socket accepts one JSON object, at most 4096 bytes, followed by a
 write-half-close:
@@ -414,6 +422,8 @@ The SyncTeX resolver also sends optional `word` context, for example
 It uses the saved UTF-8 source, bounded to a regular file of at most 2 MiB;
 unreadable or unsupported source files fail resolution explicitly. Command names,
 comments, and positions outside a literal word supply no word hint.
+Word-precision inverse search accepts both LF and CRLF source files, including
+Unicode text in document metadata.
 Hints contain at most seven words of at most 128 UTF-8 bytes each. Letters,
 numbers, and attached Unicode combining marks form words.
 Adapters may instead send a literal UTF-8 excerpt and zero-based byte offset,
@@ -586,13 +596,16 @@ Each editor gets a unique session unless `session` is explicitly supplied.
 #### Local terminal split setup
 
 Local navigation captures its source terminal at invocation, before asynchronous
-configuration, builds, or resolution can observe another focused window. Manual
-`:PdfTermViewerCommand` also captures the editor terminal at invocation, including
-with `attach_only`; it prints its command after capture completes or fails.
-Capture failure still permits socket-only attachment but reports unavailable
-focus when requested. `:PdfTermForward` never creates a terminal split; if the
-viewer is absent it reports the missing viewer. `:PdfTermForwardSplit` can launch
-one using the captured identity when `attach_only` is false.
+configuration, builds, or resolution can observe another focused window. With
+`attach_only` and `focus_on_inverse`, navigation still captures the source
+terminal; if capture fails, it retains an earlier captured handle when available.
+Manual `:PdfTermViewerCommand` also captures the editor terminal at invocation,
+including with `attach_only`; it prints its command after capture completes or
+fails. Capture failure still permits socket-only attachment but reports unavailable
+focus when requested without a retained handle. `:PdfTermForward` never creates a
+terminal split; if the viewer is absent it reports the missing viewer.
+`:PdfTermForwardSplit` can launch one using the captured identity when
+`attach_only` is false.
 Set `focus_on_forward = true` to focus the exact viewer after its forward frame
 is submitted: a plugin-owned split must return its launch token; an externally
 started viewer needs a supported exact terminal-focus backend (Kitty, Ghostty

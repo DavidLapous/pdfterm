@@ -3207,17 +3207,18 @@ fn resolve_internal_destination(
     let target_page = (target_x.is_some() || target_y.is_some())
         .then(|| document.pages().get(page_index).ok())
         .flatten();
-    let top_ratio = target_y.and_then(|y| {
-        let page_height = target_page.as_ref()?.height().value;
-        (page_height > 0.0).then(|| ((page_height - y.value) / page_height).clamp(0.0, 1.0))
-    });
-    // Use the rendered horizontal axis: rotation can make PDF y determine it.
-    let left_ratio = target_page.as_ref().and_then(|page| {
-        const WIDTH: i32 = 10_000;
-        let config = PdfRenderConfig::new().set_target_width(WIDTH);
-        page_horizontal_position(page, &config, target_x, target_y)
-            .map(|x| (x as f32 / WIDTH as f32).clamp(0.0, 1.0))
-    });
+    let (left_ratio, top_ratio) = target_page
+        .as_ref()
+        .and_then(|page| {
+            // A fixed square maps both rendered axes directly to normalized positions,
+            // including page rotation and the visible crop/media-box origin.
+            const SIZE: i32 = 10_000;
+            let config = PdfRenderConfig::new().set_fixed_size(SIZE, SIZE);
+            let (left, top) = page_destination_position(page, &config, target_x, target_y)?;
+            let ratio = |position: i32| (position as f32 / SIZE as f32).clamp(0.0, 1.0);
+            Some((left.map(ratio), top.map(ratio)))
+        })
+        .unwrap_or((None, None));
     Some(LinkTarget::Internal {
         page,
         top_ratio,
@@ -3225,35 +3226,31 @@ fn resolve_internal_destination(
     })
 }
 
-fn page_horizontal_position(
+fn page_destination_position(
     page: &PdfPage,
     config: &PdfRenderConfig,
     x: Option<PdfPoints>,
     y: Option<PdfPoints>,
-) -> Option<i32> {
+) -> Option<(Option<i32>, Option<i32>)> {
     let x_value = x.unwrap_or(PdfPoints::ZERO);
     let y_value = y.unwrap_or(PdfPoints::ZERO);
-    let (horizontal, _) = page.points_to_pixels(x_value, y_value, config).ok()?;
-    // A missing coordinate preserves the current position on its rendered axis.
-    if x.is_none()
-        && page
-            .points_to_pixels(PdfPoints::new(1.0), y_value, config)
-            .ok()?
-            .0
-            != horizontal
-    {
-        return None;
+    let (horizontal, vertical) = page.points_to_pixels(x_value, y_value, config).ok()?;
+    if x.is_some() && y.is_some() {
+        return Some((Some(horizontal), Some(vertical)));
     }
-    if y.is_none()
-        && page
-            .points_to_pixels(x_value, PdfPoints::new(1.0), config)
-            .ok()?
-            .0
-            != horizontal
-    {
-        return None;
-    }
-    Some(horizontal)
+    // Rotation determines the optional rendered axes exactly; comparing transformed
+    // integer pixels would lose omitted coordinates on large or fractionally cropped pages.
+    let axes_swapped = matches!(
+        page.rotation().ok()?,
+        pdfium_render::prelude::PdfPageRenderRotation::Degrees90
+            | pdfium_render::prelude::PdfPageRenderRotation::Degrees270
+    );
+    let (has_left, has_top) = if axes_swapped {
+        (y.is_some(), x.is_some())
+    } else {
+        (x.is_some(), y.is_some())
+    };
+    Some((has_left.then_some(horizontal), has_top.then_some(vertical)))
 }
 
 fn page_rect_pixel_bounds(
@@ -4385,40 +4382,53 @@ mod tests {
     }
 
     #[test]
-    fn internal_links_preserve_optional_horizontal_destinations() {
+    fn internal_links_preserve_optional_rendered_destinations() {
         let pdfium = super::load_pdfium(None).unwrap();
-        for (view, left_ratio, top_ratio) in [
-            ("XYZ 100 300 null", Some(0.25), Some(0.25)),
-            ("XYZ null 300 null", None, Some(0.25)),
-            ("FitH 300", None, Some(0.25)),
-            ("FitV 200", Some(0.5), None),
-            ("FitR 100 100 200 300", Some(0.25), Some(0.25)),
+        for (geometry, x_position, y_position) in [
+            ("", (Some(0.25), None), (None, Some(0.25))),
+            ("/Rotate 90", (None, Some(0.25)), (Some(0.75), None)),
+            ("/Rotate 180", (Some(0.75), None), (None, Some(0.75))),
+            ("/Rotate 270", (None, Some(0.75)), (Some(0.25), None)),
         ] {
-            let document = pdfium
-                .load_pdf_from_byte_vec(synthetic_link_pdf(view), None)
-                .unwrap();
-            let page = document.pages().get(0).unwrap();
-            let link = page.links().get(0).unwrap();
-            assert_eq!(
-                super::resolve_link_target(&document, &link),
-                Some(LinkTarget::Internal {
-                    page: 1,
-                    top_ratio,
-                    left_ratio,
-                }),
-                "{view}",
-            );
+            let full_position = (x_position.0.or(y_position.0), x_position.1.or(y_position.1));
+            for (view, (left_ratio, top_ratio)) in [
+                ("XYZ 100 300 null", full_position),
+                ("XYZ 100 null null", x_position),
+                ("XYZ null 300 null", y_position),
+                ("XYZ null null null", (None, None)),
+                ("FitH 300", y_position),
+                ("FitBH 300", y_position),
+                ("FitV 100", x_position),
+                ("FitBV 100", x_position),
+                ("FitR 100 100 200 300", full_position),
+            ] {
+                let document = pdfium
+                    .load_pdf_from_byte_vec(synthetic_link_pdf_geometry(view, geometry), None)
+                    .unwrap();
+                let page = document.pages().get(0).unwrap();
+                let link = page.links().get(0).unwrap();
+                assert_eq!(
+                    super::resolve_link_target(&document, &link),
+                    Some(LinkTarget::Internal {
+                        page: 1,
+                        top_ratio,
+                        left_ratio,
+                    }),
+                    "{geometry}: {view}",
+                );
+            }
         }
     }
 
     #[test]
-    fn horizontal_targets_follow_crop_origin_and_page_rotation() {
+    fn targets_follow_crop_origin_and_page_rotation() {
         let pdfium = super::load_pdfium(None).unwrap();
-        for (geometry, view, expected_ratio, width, expected_bounds) in [
+        for (geometry, view, expected_left, expected_top, width, expected_bounds) in [
             (
                 "/CropBox [100 0 400 400]",
                 "XYZ 200 300 null",
                 Some(1.0 / 3.0),
+                Some(0.25),
                 600,
                 (200, 240),
             ),
@@ -4426,6 +4436,23 @@ mod tests {
                 "/MediaBox [100 0 500 400]",
                 "XYZ 200 300 null",
                 Some(0.25),
+                Some(0.25),
+                800,
+                (200, 240),
+            ),
+            (
+                "/CropBox [100 100 400 400]",
+                "XYZ 200 300 null",
+                Some(1.0 / 3.0),
+                Some(1.0 / 3.0),
+                600,
+                (200, 240),
+            ),
+            (
+                "/MediaBox [100 100 500 500]",
+                "XYZ 200 300 null",
+                Some(0.25),
+                Some(0.5),
                 800,
                 (200, 240),
             ),
@@ -4433,23 +4460,57 @@ mod tests {
                 "/Rotate 90",
                 "XYZ null 300 null",
                 Some(0.75),
+                None,
                 800,
                 (200, 240),
             ),
-            ("/Rotate 90", "XYZ 200 null null", None, 800, (200, 240)),
+            (
+                "/Rotate 90",
+                "XYZ 200 null null",
+                None,
+                Some(0.5),
+                800,
+                (200, 240),
+            ),
+            (
+                "/Rotate 90 /CropBox [100 100 400 400]",
+                "XYZ 200 300 null",
+                Some(2.0 / 3.0),
+                Some(1.0 / 3.0),
+                600,
+                (0, 40),
+            ),
             (
                 "/Rotate 180",
                 "XYZ 200 300 null",
                 Some(0.5),
+                Some(0.75),
                 800,
+                (360, 400),
+            ),
+            (
+                "/Rotate 180 /CropBox [100 100 400 400]",
+                "XYZ 200 300 null",
+                Some(2.0 / 3.0),
+                Some(2.0 / 3.0),
+                600,
                 (360, 400),
             ),
             (
                 "/Rotate 270",
                 "XYZ 200 300 null",
                 Some(0.25),
+                Some(0.5),
                 800,
                 (560, 600),
+            ),
+            (
+                "/Rotate 270 /MediaBox [100 100 500 500]",
+                "XYZ 200 300 null",
+                Some(0.5),
+                Some(0.75),
+                800,
+                (760, 800),
             ),
         ] {
             let document = pdfium
@@ -4457,18 +4518,26 @@ mod tests {
                 .unwrap();
             let source = document.pages().get(0).unwrap();
             let link = source.links().get(0).unwrap();
-            let Some(LinkTarget::Internal { left_ratio, .. }) =
-                super::resolve_link_target(&document, &link)
+            let Some(LinkTarget::Internal {
+                left_ratio,
+                top_ratio,
+                ..
+            }) = super::resolve_link_target(&document, &link)
             else {
                 panic!("missing internal destination: {geometry}");
             };
-            match (left_ratio, expected_ratio) {
-                (Some(actual), Some(expected)) => assert!(
-                    (actual - expected).abs() < 0.0001,
-                    "{geometry}: {actual} != {expected}"
-                ),
-                (None, None) => {}
-                _ => panic!("wrong optional horizontal position: {geometry}: {left_ratio:?}"),
+            for (axis, actual, expected) in [
+                ("horizontal", left_ratio, expected_left),
+                ("vertical", top_ratio, expected_top),
+            ] {
+                match (actual, expected) {
+                    (Some(actual), Some(expected)) => assert!(
+                        (actual - expected).abs() < 0.0001,
+                        "{geometry}: {view}: {axis}: {actual} != {expected}"
+                    ),
+                    (None, None) => {}
+                    _ => panic!("wrong optional {axis} position: {geometry}: {view}: {actual:?}"),
+                }
             }
             let target = document.pages().get(1).unwrap();
             let config = pdfium_render::prelude::PdfRenderConfig::new().set_target_width(width);
@@ -4484,6 +4553,34 @@ mod tests {
             )
             .unwrap();
             assert_eq!((left, right), expected_bounds, "{geometry}");
+        }
+    }
+
+    #[test]
+    fn optional_destination_axes_survive_subpixel_coordinate_changes() {
+        let pdfium = super::load_pdfium(None).unwrap();
+        for (rotation, expected_left, expected_top) in
+            [(0, None, Some(0.25)), (90, Some(0.75), None)]
+        {
+            let geometry =
+                format!("/MediaBox [0 0 14400 400] /CropBox [.4 0 14400 400] /Rotate {rotation}");
+            let document = pdfium
+                .load_pdf_from_byte_vec(
+                    synthetic_link_pdf_geometry("XYZ null 300 null", &geometry),
+                    None,
+                )
+                .unwrap();
+            let source = document.pages().get(0).unwrap();
+            let link = source.links().get(0).unwrap();
+            assert_eq!(
+                super::resolve_link_target(&document, &link),
+                Some(LinkTarget::Internal {
+                    page: 1,
+                    left_ratio: expected_left,
+                    top_ratio: expected_top,
+                }),
+                "{geometry}"
+            );
         }
     }
 

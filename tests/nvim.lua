@@ -925,6 +925,103 @@ local ok, failure = xpcall(function()
       )
     end
   end
+  -- Attaching never requires capture, but requested inverse focus retains a
+  -- manually paired terminal when discovery is temporarily unavailable.
+  vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
+  wait(function()
+    return not vim.uv.fs_lstat(config.editor.path)
+  end)
+  package.loaded['pdfterm'] = nil
+  adapter = require('pdfterm')
+  adapter.setup({
+    executable = binary,
+    session = 'adapter',
+    attach_only = true,
+    focus_on_inverse = true,
+    focus_on_forward = false,
+    compile = false,
+    project = { main = source, pdf = pdf, cwd = directory },
+  })
+  local attachment_notices = {}
+  vim.notify = function(message)
+    attachment_notices[#attachment_notices + 1] = tostring(message)
+  end
+  terminal.launch_split = function()
+    error('attach_only must not launch a terminal')
+  end
+  terminal.capture_source = function(callback)
+    callback('terminal discovery unavailable')
+  end
+  vim.cmd.edit(vim.fn.fnameescape(source))
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  local previous = #requests
+  vim.cmd('PdfTermForward')
+  wait(function()
+    return #requests == previous + 1
+      and attachment_notices[#attachment_notices]
+      and attachment_notices[#attachment_notices]:find('terminal discovery unavailable', 1, true)
+  end)
+  focused = nil
+  inverse_jump()
+  wait(function()
+    return vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 4, 6 })
+      and attachment_notices[#attachment_notices]:find('source terminal unavailable', 1, true)
+  end)
+  assert(focused == nil, 'unavailable capture invented a source terminal')
+
+  terminal.capture_source = function(callback)
+    callback(nil, { kind = 'ghostty', id = 'attached-manual-source' })
+  end
+  vim.cmd('PdfTermViewerCommand ' .. vim.fn.fnameescape(pdf))
+  wait(function()
+    return attachment_notices[#attachment_notices]:find('--session', 1, true)
+  end)
+  terminal.capture_source = function()
+    error('terminal discovery temporarily unavailable')
+  end
+  previous = #requests
+  vim.cmd('PdfTermForward')
+  wait(function()
+    return #requests == previous + 1
+  end)
+  focused = nil
+  inverse_jump()
+  wait(function()
+    return focused ~= nil
+  end)
+  assert(focused == 'attached-manual-source', 'attachment discarded the manually paired source')
+
+  terminal.capture_source = function(callback)
+    callback(nil, { kind = 'ghostty', id = 'attached-current-source' })
+  end
+  previous = #requests
+  vim.cmd('PdfTermForward')
+  wait(function()
+    return #requests == previous + 1
+  end)
+  focused = nil
+  inverse_jump()
+  wait(function()
+    return focused ~= nil
+  end)
+  assert(focused == 'attached-current-source', 'attachment skipped requested source capture')
+
+  terminal.capture_source = function()
+    error('explicit attachment source must not be recaptured')
+  end
+  previous = #requests
+  adapter.forward_search(pdf, vim.json.encode(requests[1]),
+    { kind = 'ghostty', id = 'attached-explicit-source' })
+  wait(function()
+    return #requests == previous + 1
+  end)
+  focused = nil
+  inverse_jump()
+  wait(function()
+    return focused ~= nil
+  end)
+  assert(focused == 'attached-explicit-source', 'attachment ignored its explicit source')
+  vim.notify = original_notify
   print(
     'adapter regressions passed: builds, timeouts, bootstrap, sessions, root projects, included forward, forward focus, inverse focus, split ownership; event ticks='
       .. ticks
