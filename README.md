@@ -852,16 +852,17 @@ The resolver starts an isolated Tinymist preview service on loopback, without
 opening a browser, and uses compiler source spans to locate the cursor. It
 exports to a private temporary file, replacing the PDF only when a valid
 position is available and neither the PDF nor the saved project inputs changed.
-The resolver scans the effective Typst root (including symlink targets) before
-and after resolution; source or asset changes abort positioning. External
-package and font resources must remain stable during the request. Large project
-roots increase scan cost. The effective root follows the compiler's `--root`,
-`TYPST_ROOT`, then entry-directory precedence, not the Neovim workspace root.
+Input guards track files actually accessed by Tinymist, including symlink
+targets, before and after resolution. Source or asset changes abort positioning;
+unrelated files and editor swap files do not invalidate the map. The effective
+root follows the compiler's `--root`, `TYPST_ROOT`, then entry-directory
+precedence, not the Neovim workspace root.
 This second compilation keeps the displayed PDF consistent with Tinymist's
 compiler even when the installed `typst` version differs. A successful forward
-search retains that service and a private inverse-search socket until it is
-replaced by another forward search for the same PDF or Neovim exits. Failed or
-cancelled resolution stops the service and removes its temporary output.
+search retains a private inverse-search socket until another forward search
+replaces it, the selected main document or builder changes, or Neovim exits.
+Failed or cancelled initial resolution stops the service and removes its
+temporary output.
 
 Typst source navigation supports direct `typst compile` / `tinymist compile`
 build vectors and common root, input, font, package, and PDF options. Custom
@@ -879,9 +880,21 @@ jumps resolve PDF points through that retained compiler map, including included
 files. Results use the same editor command/socket delivery, clipboard handling,
 and optional editor focus as LaTeX. Generated text may map to its producing
 expression rather than a literal word; no lexical source guessing is applied.
-If the PDF or saved project inputs change, repeat forward search to refresh the
-map; stale maps are rejected rather than jumping into the wrong source. Merely
-opening a Typst PDF without forward search does not establish a compiler map.
+Saved input changes and PDF recompilation automatically refresh the compiler
+map through the same inverse-search socket; another forward search is not
+required. Refresh exports and atomically replaces the PDF with the matching
+Tinymist output, without forward-positioning the viewport. A click taken from
+the replaced PDF may be rejected while the viewer reloads; retry from the
+updated view rather than use stale coordinates. A failed compile rejects
+inverse search without destroying the service, and the next valid save recovers.
+
+Inverse requests are serialized because Tinymist's source notifications have
+no request IDs. Superseded or cancelled requests cannot donate a late reply to
+another click. Unmapped points may produce no compiler response and time out
+after nine seconds; the compiler generation is restarted, not the private
+endpoint, so later clicks still work. Changes to compiler options, font
+discovery, or package-registry metadata require another forward search.
+Merely opening a Typst PDF without forward search does not establish a map.
 The preview protocol was exercised with Tinymist 0.15.8.
 
 Typst forward search also flashes the literal word under the cursor, using the

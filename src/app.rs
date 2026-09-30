@@ -2308,10 +2308,9 @@ impl App {
             tab.scroll_y = 0;
         }
         if let Some(endpoint) = &request.inverse_search {
-            self.navigation.source_maps.insert(
-                self.session.tabs[index].path.clone(),
-                (request.revision, endpoint.clone()),
-            );
+            self.navigation
+                .source_maps
+                .insert(self.session.tabs[index].path.clone(), endpoint.clone());
         } else {
             self.navigation
                 .source_maps
@@ -4573,16 +4572,6 @@ impl App {
             let index = self
                 .tab_index(click.document_id)
                 .ok_or_else(|| io::Error::other("clicked document closed"))?;
-            if self
-                .navigation
-                .source_maps
-                .get(&self.session.tabs[index].path)
-                .is_some_and(|(revision, _)| *revision != pending.revision.pdf)
-            {
-                return Err(io::Error::other(
-                    "Typst source map is for an older PDF; repeat forward search",
-                ));
-            }
             self.navigation.worker.submit(InverseTask {
                 request_id: pending.request_id,
                 path: self.session.tabs[index].path.clone(),
@@ -4596,7 +4585,7 @@ impl App {
                     .navigation
                     .source_maps
                     .get(&self.session.tabs[index].path)
-                    .map(|(_, endpoint)| endpoint.clone()),
+                    .cloned(),
                 operation: pending.operation.clone(),
             })
         })();
