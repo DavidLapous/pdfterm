@@ -120,10 +120,11 @@ Automatic PDF reloads preserve the current page and horizontal/vertical scroll
 offsets. If the rebuilt document has fewer pages or smaller page dimensions,
 the viewport is clamped to the remaining page and its available scroll range.
 
-Zoom in, zoom out, and reset keep the PDF position under the center of the
-viewport fixed, including when the center is on the next visible page. Near
-document edges the view is clamped to available page bounds; narrow pages
-are positioned on whole terminal cells, so a few pixels of movement may remain.
+Zoom in, zoom out, reset, and cycling fit mode with `m` keep the PDF position
+under the center of the viewport fixed, including when the center is on the next
+visible page. Near document edges the view is clamped to available page bounds;
+narrow pages are positioned on whole terminal cells, so a few pixels of movement
+may remain.
 
 Vertical scrolling shows adjacent pages together, separated by one terminal row,
 in every fit mode. Links and inverse search target the page under the pointer,
