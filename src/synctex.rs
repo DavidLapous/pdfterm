@@ -188,6 +188,9 @@ pub struct ForwardRequest {
     pub height: f32,
     #[serde(default, deserialize_with = "deserialize_forward_word")]
     pub word: Option<ForwardWord>,
+    /// Revision-bound compiler source-map service supplied by an editor adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse_search: Option<String>,
 }
 
 impl ForwardRequest {
@@ -201,6 +204,16 @@ impl ForwardRequest {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self
+            .inverse_search
+            .as_ref()
+            .is_some_and(|path| !Path::new(path).is_absolute() || path.as_bytes().contains(&0))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inverse source-map endpoint must be an absolute Unix socket path",
+            ));
+        }
         if self.word.as_ref().is_some_and(|word| !word.valid()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -317,6 +330,7 @@ pub fn resolve_forward_with_library(
                 width,
                 height,
                 word: word.clone(),
+                inverse_search: None,
             };
             match result.validate() {
                 Ok(()) => candidates.push(result),

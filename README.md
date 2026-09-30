@@ -146,8 +146,9 @@ reported as having no matches.
 
 Press `x` to find text only on the currently visible page or pages; type a query
 to update matching highlights and labels as you go, then type a displayed label
-to run inverse SyncTeX and deliver the resulting source location to the configured
-editor. `Esc` exits; `Backspace` removes label input first, then edits the query.
+to resolve the matching PDF point and deliver its source location to the configured
+editor. LaTeX uses SyncTeX; Typst uses the compiler map established by forward search.
+`Esc` exits; `Backspace` removes label input first, then edits the query.
 Labels avoid characters that would extend a current match. An exact label takes
 precedence over another query character; once only one match remains, its label
 is the next ASCII word character when available, or a regular label otherwise.
@@ -417,6 +418,11 @@ the PDF's Unix device/inode, size, and nanosecond modification/change timestamps
 checked before and after SyncTeX resolution. This is local filesystem identity,
 not a cryptographic content digest. Geometry is in points, with `h` the left edge
 and `v` the bottom edge measured down from the page top.
+
+The Neovim Typst adapter also supplies optional `inverse_search`, the absolute
+path of its private compiler-map Unix socket. The viewer binds that endpoint to
+this PDF revision and uses it for both Alt-click and `x` source jumps. Other
+forward-search clients omit it and retain SyncTeX navigation.
 
 The SyncTeX resolver also sends optional `word` context, for example
 `{"words":["a","navigation","anchor"],"selected":1}` (`selected` is zero-based).
@@ -836,13 +842,13 @@ adjacent PDF, and `latexmk -pdf -interaction=nonstopmode -synctex=1` are used.
 Typst `.typ` files use `typst compile <main> <pdf>` instead. Forward commands
 always save and compile Typst before navigating, independently of the LaTeX
 `compile` toggle. Install both `typst` (PDF compilation) and `tinymist`
-(cursor-to-PDF positions) on the machine running Neovim. The existing
+(bidirectional source positions) on the machine running Neovim. The existing
 `:PdfTermForwardSplit` mapping works for both languages without configuration
 changes. `:PdfTermBuild` and `:PdfTermMain` also accept Typst.
 
 For an included Typst file, select its entry point with `:PdfTermMain path/to/main.typ`
 or `project.main` first; automatic TeX-root discovery does not apply to Typst.
-The resolver starts a temporary Tinymist preview service on loopback, without
+The resolver starts an isolated Tinymist preview service on loopback, without
 opening a browser, and uses compiler source spans to locate the cursor. It
 exports to a private temporary file, replacing the PDF only when a valid
 position is available and neither the PDF nor the saved project inputs changed.
@@ -852,8 +858,10 @@ package and font resources must remain stable during the request. Large project
 roots increase scan cost. The effective root follows the compiler's `--root`,
 `TYPST_ROOT`, then entry-directory precedence, not the Neovim workspace root.
 This second compilation keeps the displayed PDF consistent with Tinymist's
-compiler even when the installed `typst` version differs. Cancellation and
-completion stop the service and remove its temporary output before returning.
+compiler even when the installed `typst` version differs. A successful forward
+search retains that service and a private inverse-search socket until it is
+replaced by another forward search for the same PDF or Neovim exits. Failed or
+cancelled resolution stops the service and removes its temporary output.
 
 Typst source navigation supports direct `typst compile` / `tinymist compile`
 build vectors and common root, input, font, package, and PDF options. Custom
@@ -864,8 +872,17 @@ times out after 30 seconds. A failed initial compile stops navigation.
 Cursor positions refer to the character under Neovim's cursor, including the
 first character of a word or line and multibyte characters. Place the cursor on
 rendered text; comments, whitespace, and non-rendered code may have no position.
-Repeated source instances select the first mapped occurrence. Typst inverse
-search is not supported. The preview protocol was exercised with Tinymist 0.15.8.
+Repeated source instances select the first mapped occurrence.
+
+After one successful Typst forward search, `Alt`/`Option`-click and `x` text-label
+jumps resolve PDF points through that retained compiler map, including included
+files. Results use the same editor command/socket delivery, clipboard handling,
+and optional editor focus as LaTeX. Generated text may map to its producing
+expression rather than a literal word; no lexical source guessing is applied.
+If the PDF or saved project inputs change, repeat forward search to refresh the
+map; stale maps are rejected rather than jumping into the wrong source. Merely
+opening a Typst PDF without forward search does not establish a compiler map.
+The preview protocol was exercised with Tinymist 0.15.8.
 
 Typst forward search also flashes the literal word under the cursor, using the
 same Unicode-aware PDF word matching as LaTeX. The adapter sends at most 512
@@ -901,7 +918,7 @@ not guaranteed; always selecting the last result would not fix `\only`.
 
 ### Inverse-search precision
 
-`Alt`/`Option`-click resolves the clicked location with `synctex edit`, then
+For LaTeX, `Alt`/`Option`-click resolves the clicked location with `synctex edit`, then
 matches the clicked PDF word or mathematical atom against source lines within
 `viewer.source_context_lines` of the result (default four).
 Inside a literal `\begin{frame}` … `\end{frame}` block or `\caption{...}` argument,

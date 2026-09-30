@@ -2307,6 +2307,16 @@ impl App {
             tab.page = page;
             tab.scroll_y = 0;
         }
+        if let Some(endpoint) = &request.inverse_search {
+            self.navigation.source_maps.insert(
+                self.session.tabs[index].path.clone(),
+                (request.revision, endpoint.clone()),
+            );
+        } else {
+            self.navigation
+                .source_maps
+                .remove(&self.session.tabs[index].path);
+        }
         self.navigation.flash = Some(PendingFlash {
             document_id,
             page,
@@ -4563,6 +4573,16 @@ impl App {
             let index = self
                 .tab_index(click.document_id)
                 .ok_or_else(|| io::Error::other("clicked document closed"))?;
+            if self
+                .navigation
+                .source_maps
+                .get(&self.session.tabs[index].path)
+                .is_some_and(|(revision, _)| *revision != pending.revision.pdf)
+            {
+                return Err(io::Error::other(
+                    "Typst source map is for an older PDF; repeat forward search",
+                ));
+            }
             self.navigation.worker.submit(InverseTask {
                 request_id: pending.request_id,
                 path: self.session.tabs[index].path.clone(),
@@ -4572,6 +4592,11 @@ impl App {
                 word_precision: self.viewer.word_precision,
                 radius: self.viewer.source_context_lines as u32,
                 editor: self.editor.clone(),
+                inverse_search: self
+                    .navigation
+                    .source_maps
+                    .get(&self.session.tabs[index].path)
+                    .map(|(_, endpoint)| endpoint.clone()),
                 operation: pending.operation.clone(),
             })
         })();

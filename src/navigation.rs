@@ -7,6 +7,7 @@ use crate::{
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     thread::{self, JoinHandle},
@@ -19,6 +20,7 @@ pub(crate) struct Coordinator {
     pub forward: Option<PendingForward>,
     pub flash: Option<PendingFlash>,
     pub next_request_id: u64,
+    pub source_maps: HashMap<PathBuf, (synctex::PdfRevision, String)>,
 }
 impl Coordinator {
     pub fn new() -> Self {
@@ -28,6 +30,7 @@ impl Coordinator {
             forward: None,
             flash: None,
             next_request_id: 1,
+            source_maps: HashMap::new(),
         }
     }
 }
@@ -75,6 +78,7 @@ pub(crate) struct InverseTask {
     pub word_precision: bool,
     pub radius: u32,
     pub editor: Editor,
+    pub inverse_search: Option<String>,
     pub operation: Operation,
 }
 pub(crate) struct InverseReply {
@@ -95,19 +99,19 @@ impl InverseTask {
         } else {
             None
         };
-        let mut result = synctex::resolve_inverse(
-            &self.path,
-            synctex::InversePoint {
-                page: self.page + 1,
-                x: self.click.pdf_x,
-                y_from_top: self.click.page_height_pt - self.click.pdf_y,
-                page_height_pt: self.click.page_height_pt,
-            },
-            word,
-            self.radius,
-            &self.operation,
-        )?;
-        if self.word_precision
+        let point = synctex::InversePoint {
+            page: self.page + 1,
+            x: self.click.pdf_x,
+            y_from_top: self.click.page_height_pt - self.click.pdf_y,
+            page_height_pt: self.click.page_height_pt,
+        };
+        let mut result = if let Some(endpoint) = &self.inverse_search {
+            crate::typst::resolve_inverse(endpoint, self.revision.pdf, point, &self.operation)?
+        } else {
+            synctex::resolve_inverse(&self.path, point, word, self.radius, &self.operation)?
+        };
+        if self.inverse_search.is_none()
+            && self.word_precision
             && let Err(error) = &self.click.text
         {
             result.warning = Some(format!(
@@ -214,6 +218,7 @@ mod tests {
             word_precision: true,
             radius: 4,
             editor: Editor::None,
+            inverse_search: None,
             operation: Operation::default(),
         };
         let resolution = task.resolve().unwrap();

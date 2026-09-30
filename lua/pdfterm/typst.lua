@@ -2,6 +2,8 @@
 -- scrollPreview command delivers document positions over the local data plane.
 local M = {}
 local active = {}
+local retained = {}
+local closing = {}
 
 local function canonical(path, cwd)
   local absolute = vim.fs.normalize(vim.startswith(path, '/') and path or cwd .. '/' .. path)
@@ -140,7 +142,11 @@ local function websocket(port, ready, message, failure)
       assert(header:match('^HTTP/1%.1 101 ') and header:find('s3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 1, true),
         'Tinymist refused the preview websocket connection')
       buffer, upgraded = buffer:sub(ending + 4), true
-      ready(function() send(1, 'current') end)
+      ready(function(text)
+        text = text or 'current'
+        assert(#text <= 125, 'oversized Tinymist websocket command')
+        send(1, text)
+      end)
     end
     while true do
       if not frame then
@@ -198,57 +204,202 @@ local function websocket(port, ready, message, failure)
   return socket
 end
 
-function M.resolve(project, file, line, byte_column, callback)
-  local rpc, socket, timer, temporary, done, exited, result
-  local function cleanup()
-    if temporary then
-      local entries = vim.uv.fs_scandir(temporary)
-      if entries then
-        while true do
-          local name = vim.uv.fs_scandir_next(entries)
-          if not name then break end
-          vim.uv.fs_unlink(temporary .. '/' .. name)
-        end
-      end
-      vim.uv.fs_rmdir(temporary)
-      temporary = nil
-    end
-    if result then
-      local completed = result
-      result = nil
-      vim.schedule(function() callback(completed) end)
+local function remove_directory(path)
+  if not path then return end
+  local entries = vim.uv.fs_scandir(path)
+  if entries then
+    while true do
+      local name = vim.uv.fs_scandir_next(entries)
+      if not name then break end
+      vim.uv.fs_unlink(path .. '/' .. name)
     end
   end
-  local function finish(error, payload)
-    if done then return end
-    done = true
-    active[finish] = nil
-    if timer then timer:stop(); timer:close() end
-    if socket and not socket:is_closing() then socket:read_stop(); socket:close() end
-    -- Wait for process exit before deleting its export directory: a cancelled
-    -- export must not recreate files after cleanup.
+  vim.uv.fs_rmdir(path)
+end
+
+local function integer(value, minimum)
+  return type(value) == 'number' and value >= minimum and value < math.huge and value % 1 == 0
+end
+
+-- Preview source positions count Unicode scalars, including Tinymist's legacy
+-- showDocument wrapper. UTF-16 is computed from the saved, compiled source.
+local function location(path, row, character, inputs)
+  assert(type(path) == 'string' and path:sub(1, 1) == '/' and not path:find('%z'),
+    'Tinymist returned an invalid source path')
+  path = canonical(path, '/')
+  assert(inputs[path] and inputs[path][1] == 'file', 'mapped source is outside the saved project inputs')
+  assert(integer(row, 0) and integer(character, 0), 'Tinymist returned an invalid source position')
+  local lines = vim.fn.readfile(path, 'b', row + 2)
+  local source = assert(lines[row + 1], 'Tinymist source line is outside the saved file')
+  if lines[row + 2] then source = source:gsub('\r$', '') end
+  local bytes, scalars, units = 0, 0, 0
+  while scalars < character do
+    local lead = assert(source:byte(bytes + 1), 'Tinymist source column is outside the saved line')
+    local length = lead < 128 and 1 or lead >= 240 and 4 or lead >= 224 and 3 or lead >= 194 and 2
+    assert(length and bytes + length <= #source, 'invalid UTF-8 in saved Typst source')
+    for offset = 2, length do
+      local continuation = source:byte(bytes + offset)
+      assert(continuation >= 128 and continuation < 192, 'invalid UTF-8 in saved Typst source')
+    end
+    bytes, scalars, units = bytes + length, scalars + 1, units + (length == 4 and 2 or 1)
+  end
+  return { file = path, line = row + 1, byte_column = bytes,
+    column = units + 1, column_char = scalars + 1, precise = true }
+end
+
+-- EOF frames both directions. Only one request reaches Tinymist at a time:
+-- its source notifications have no request ID. An abandoned in-flight request
+-- therefore invalidates the service instead of allowing a late reply to drift.
+local function inverse_listener(path, dispatch)
+  local server = assert(vim.uv.new_pipe(false))
+  local clients, count = {}, 0
+  local function close()
+    if not server:is_closing() then server:close() end
+    for close_client, is_answered in pairs(clients) do
+      if not is_answered() then close_client() end
+    end
+    vim.uv.fs_unlink(path)
+  end
+  local ok, reason = pcall(function()
+    assert(server:bind(path))
+    assert(vim.uv.fs_chmod(path, 384))
+    assert(server:listen(8, function(err)
+      if err or server:is_closing() then return end
+      local client = assert(vim.uv.new_pipe(false))
+      if not server:accept(client) or count >= 8 then client:close(); return end
+      count = count + 1
+      local timer = assert(vim.uv.new_timer())
+      local chunks, size, answered, cancel = {}, 0, false, nil
+      local close_client
+      close_client = function()
+        if not clients[close_client] then return end
+        clients[close_client], count = nil, count - 1
+        timer:stop(); timer:close()
+        if not client:is_closing() then client:read_stop(); client:close() end
+      end
+      clients[close_client] = function() return answered end
+      local function abandon()
+        local pending = cancel
+        cancel = nil
+        close_client()
+        if pending then vim.schedule(pending) end
+      end
+      local function reply(value)
+        if answered or client:is_closing() then return end
+        answered, cancel = true, nil
+        local encoded = vim.json.encode(value)
+        if #encoded > 4096 then encoded = '{"ok":false,"error":"inverse response exceeds 4096 bytes"}' end
+        client:write(encoded, function(write_error)
+          if client:is_closing() then return end
+          if write_error then close_client(); return end
+          client:shutdown(function() close_client() end)
+        end)
+      end
+      timer:start(9000, 0, function()
+        if answered then close_client(); return end
+        local pending = cancel
+        reply({ ok = false, error = 'Typst inverse search timed out; point may have no rendered source; repeat forward search' })
+        timer:start(1000, 0, close_client)
+        if pending then vim.schedule(pending) end
+      end)
+      client:read_start(function(read_error, chunk)
+        if read_error then abandon(); return end
+        if chunk then
+          size = size + #chunk
+          if size > 4096 then
+            client:read_stop()
+            vim.schedule(function() reply({ ok = false, error = 'inverse request exceeds 4096 bytes' }) end)
+          else
+            chunks[#chunks + 1] = chunk
+          end
+          return
+        end
+        client:read_stop()
+        vim.schedule(function()
+          if answered or client:is_closing() then return end
+          local decoded, request = pcall(vim.json.decode, table.concat(chunks))
+          if not decoded then reply({ ok = false, error = 'invalid inverse request JSON' }); return end
+          local dispatched, result = pcall(dispatch, request, reply)
+          if not dispatched then reply({ ok = false, error = tostring(result) })
+          elseif not answered then cancel = result end
+        end)
+      end)
+    end))
+  end)
+  if not ok then close(); error(reason) end
+  return close
+end
+
+function M.resolve(project, file, line, byte_column, callback)
+  local rpc, socket, timer, temporary, private, close_listener, exited, result
+  local completed, stopped, pending, send, published, inputs, root
+  local stop
+  local function cleanup()
+    closing[stop] = nil
+    remove_directory(temporary)
+    temporary = nil
+    remove_directory(private)
+    private = nil
+    if result then
+      local value = result
+      result = nil
+      vim.schedule(function() callback(value) end)
+    end
+  end
+  local function complete(error, payload)
+    if completed then return end
+    completed = true
+    if timer then timer:stop(); timer:close(); timer = nil end
     result = { code = error and 1 or 0, stdout = payload or '', stderr = error or '' }
-    if rpc and not exited then rpc.terminate() else cleanup() end
+    if not error then
+      local value = result
+      result = nil
+      vim.schedule(function() callback(value) end)
+    end
+  end
+  stop = function(error)
+    if stopped then return end
+    stopped = true
+    active[stop] = nil
+    if retained[project.pdf] == stop then retained[project.pdf] = nil end
+    complete(error or 'Typst source-map service stopped')
+    if pending then
+      pending({ ok = false, error = error or 'Typst source-map service stopped; repeat forward search' })
+      pending = nil
+    end
+    if close_listener then close_listener(); close_listener = nil end
+    -- Tinymist never writes into the socket directory; remove it immediately,
+    -- including during VimLeavePre when process-exit callbacks may run late.
+    remove_directory(private)
+    private = nil
+    if socket and not socket:is_closing() then socket:read_stop(); socket:close() end
+    -- A cancelled export must not recreate files after cleanup.
+    if rpc and not exited then
+      closing[stop] = true
+      rpc.terminate()
+    else
+      cleanup()
+    end
   end
   local function failure(error)
-    finish('Typst forward search: ' .. tostring(error))
+    stop('Typst source navigation: ' .. tostring(error))
   end
   local function guarded(fn)
     return function(...)
-      if done then return end
+      if stopped then return end
       local ok, reason = pcall(fn, ...)
       if not ok then failure(reason) end
     end
   end
   local function command(name, arguments, next_step)
-    if done then return end
+    if stopped then return end
     assert(rpc.request('workspace/executeCommand', { command = name, arguments = arguments },
       guarded(function(err, result)
         if err then failure(err.message or vim.inspect(err)); return end
         next_step(result)
       end)), 'Tinymist request could not be sent')
   end
-  active[finish] = true
+  active[stop] = true
   local start = guarded(function()
     assert(vim.fn.executable('tinymist') == 1, 'tinymist is required for Typst cursor navigation')
     -- Tinymist assigns source IDs lexically under its root. Mixing a symlink
@@ -257,9 +408,11 @@ function M.resolve(project, file, line, byte_column, callback)
     project = vim.tbl_extend('force', project, {
       main = canonical(project.main, project.cwd),
       cwd = canonical(project.cwd, project.cwd),
+      pdf = canonical(project.pdf, project.cwd),
     })
     file = canonical(file, project.cwd)
-    local args, root = compile_args(project)
+    local args
+    args, root = compile_args(project)
     local source = vim.fn.readfile(file, '', line)[line]
     assert(source and byte_column >= 0 and byte_column <= #source, 'cursor is outside the saved Typst source')
     -- Preview counts Unicode scalars and looks up the leaf BEFORE its position.
@@ -271,15 +424,53 @@ function M.resolve(project, file, line, byte_column, callback)
     temporary = canonical(assert(vim.uv.fs_mkdtemp(vim.fs.dirname(project.pdf) .. '/.pdfterm-XXXXXX')),
       project.cwd)
     local output = temporary .. '/forward.pdf'
-    local inputs = manifest(root, temporary)
+    inputs = manifest(root, temporary)
     local rendered, exported = false, false
+    local function validate()
+      assert(vim.deep_equal(published, revision(project.pdf)),
+        'PDF changed since Typst source mapping; repeat forward search')
+      assert(vim.deep_equal(inputs, manifest(root, nil)),
+        'saved project inputs changed since Typst source mapping; repeat forward search')
+    end
+    local function inverse(request, reply)
+      assert(type(request) == 'table' and integer(request.page, 1) and request.page <= 4294967295
+        and type(request.x) == 'number' and type(request.y) == 'number'
+        and request.x >= 0 and request.y >= 0 and request.x < math.huge and request.y < math.huge,
+        'invalid Typst inverse point')
+      assert(not stopped, 'Typst source-map service stopped; repeat forward search')
+      assert(vim.deep_equal(request.revision, published), 'stale PDF revision; repeat forward search')
+      validate()
+      assert(not pending, 'Typst inverse search is busy')
+      pending = reply
+      local sent, reason = pcall(send, 'src-point ' .. vim.json.encode({
+        page_no = request.page, x = request.x, y = request.y,
+      }))
+      if not sent then
+        pending = nil
+        stop('Tinymist inverse request failed; repeat forward search')
+        error(reason)
+      end
+      return function() stop('Typst inverse request abandoned; repeat forward search') end
+    end
+    local function source_position(path, row, column)
+      if not pending then return end
+      local reply = pending
+      pending = nil
+      local ok, mapped = pcall(function()
+        validate()
+        local value = location(path, row, column, inputs)
+        validate()
+        return value
+      end)
+      reply(ok and { ok = true, location = mapped } or { ok = false, error = tostring(mapped) })
+    end
     local function scroll()
       command('tinymist.scrollPreview', { 'pdfterm', {
         event = 'panelScrollTo', filepath = file, line = line - 1, character = character,
       } }, function() end)
     end
     local function on_message(data)
-      if done then return end
+      if completed or stopped then return end
       if not rendered and (data:match('^new,') or data:match('^diff%-v1,')) then
         rendered = true
         command('tinymist.exportPdf', { project.main }, function(result)
@@ -297,10 +488,25 @@ function M.resolve(project, file, line, byte_column, callback)
         assert(vim.deep_equal(inputs, manifest(root, temporary)),
           'project inputs changed during Typst forward search; repeat navigation')
         assert(vim.uv.fs_rename(output, project.pdf))
-        -- Typst supplies a point in PDF points measured from the page top.
-        -- A zero-size SyncTeX rectangle preserves that exact point.
-        finish(nil, vim.json.encode({ pdf = project.pdf, revision = revision(project.pdf),
-          page = page, h = x, v = y, width = 0, height = 0,
+        remove_directory(temporary)
+        temporary = nil
+        private = canonical(assert(vim.uv.fs_mkdtemp('/tmp/pdfterm-XXXXXX')), '/')
+        assert(vim.uv.fs_chmod(private, 448))
+        local owner = assert(vim.uv.fs_lstat(private))
+        assert(owner.uid == vim.uv.getuid() and bit.band(owner.mode, 511) == 448,
+          'Typst inverse socket directory is not private')
+        local endpoint = private .. '/inverse.sock'
+        close_listener = inverse_listener(endpoint, inverse)
+        -- Publishing changes PDF metadata and its parent directory: bind the
+        -- retained map to the post-rename, post-cleanup project manifest.
+        published = revision(project.pdf)
+        inputs = manifest(root, nil)
+        local previous = retained[project.pdf]
+        retained[project.pdf] = stop
+        if previous then previous('Typst source map refreshed; repeat forward search') end
+        -- PDF points measured from the page top; keep the exact zero-size point.
+        complete(nil, vim.json.encode({ pdf = project.pdf, revision = published,
+          inverse_search = endpoint, page = page, h = x, v = y, width = 0, height = 0,
           word = literal_word(source, byte_column) }))
       end
     end
@@ -311,23 +517,44 @@ function M.resolve(project, file, line, byte_column, callback)
           -- typstExtraArgs: Tinymist reports those as configuration warnings.
           failure(params.message)
         end
+        if method == 'tinymist/preview/scrollSource' and pending then
+          assert(type(params) == 'table' and type(params.start) == 'table',
+            'Tinymist returned a missing source position')
+          source_position(params.filepath, params.start[1], params.start[2])
+        end
       end),
-      server_request = function() return vim.NIL end,
+      server_request = function(method, params)
+        if method == 'window/showDocument' then
+          local ok, reason = pcall(function()
+            if pending then
+              assert(type(params) == 'table' and type(params.selection) == 'table'
+                and type(params.selection.start) == 'table', 'Tinymist returned a missing source position')
+              source_position(vim.uri_to_fname(params.uri), params.selection.start.line,
+                params.selection.start.character)
+            end
+          end)
+          if not ok then failure(reason) end
+          -- Resolve only: never focus a window or move Neovim's cursor.
+          return { success = ok }
+        end
+        return vim.NIL
+      end,
       on_error = function(_, err) failure(vim.inspect(err)) end,
       on_exit = function()
         exited = true
+        stop('Tinymist source-map service exited; repeat forward search')
         cleanup()
-        failure('Tinymist exited before resolving the cursor')
       end,
     }, { cwd = project.cwd, detached = false })
     timer = assert(vim.uv.new_timer())
     timer:start(30000, 0, function() failure('timed out (the cursor may have no rendered position)') end)
     assert(rpc.request('initialize', {
       processId = vim.fn.getpid(), rootUri = vim.uri_from_fname(project.cwd),
-      capabilities = vim.empty_dict(),
+      capabilities = { general = { positionEncodings = { 'utf-16' } } },
       initializationOptions = {
         -- Tinymist appends the format extension to outputPath.
         exportPdf = 'never', outputPath = temporary .. '/forward', typstExtraArgs = args,
+        customizedShowDocument = true,
         formatterMode = 'disable', semanticTokens = 'disable',
       },
     }, guarded(function(err, result)
@@ -343,19 +570,22 @@ function M.resolve(project, file, line, byte_column, callback)
           local port = preview.dataPlanePort
           assert(type(port) == 'number' and port > 0 and port < 65536,
             'Tinymist did not expose a local preview data plane')
-          socket = websocket(port, function(current) current() end,
+          socket = websocket(port, function(current) send = current; current() end,
             function(data) vim.schedule(guarded(function() on_message(data) end)) end, failure)
         end)
       end)
     end)), 'Tinymist initialization could not be sent')
   end)
   start()
-  return function() finish('navigation cancelled') end
+  return function()
+    if not completed then stop('navigation cancelled') end
+  end
 end
 
 vim.api.nvim_create_autocmd('VimLeavePre', {
   callback = function()
     for finish in pairs(active) do finish('Neovim is exiting') end
+    vim.wait(2000, function() return next(closing) == nil end, 10)
   end,
 })
 

@@ -14,3 +14,4 @@ pub mod screenshot;
 pub mod synctex;
 pub mod terminal;
 pub mod theme;
+mod typst;
