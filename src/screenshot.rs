@@ -505,6 +505,8 @@ mod tests {
             revision: DocumentRevision::read(revision_file.path()).unwrap(),
             width: 4,
             height: 4,
+            page_width_pt: 4.0,
+            page_height_pt: 4.0,
             compressed_rgba,
             render_elapsed: Duration::ZERO,
             dark_mode_elapsed: None,

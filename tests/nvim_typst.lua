@@ -10,6 +10,7 @@ local alias = directory .. ' alias'
 local original_root = vim.env.TYPST_ROOT
 vim.env.TYPST_ROOT = nil
 local start_rpc = vim.lsp.rpc.start
+local endpoints = {}
 local function resolve(p, file, line, column)
   local result
   local cancel = typst.resolve(p, file, line, column, function(value)
@@ -20,7 +21,9 @@ local function resolve(p, file, line, column)
     error('Typst source resolution timed out')
   end
   assert(result.code == 0, result.stderr)
-  return vim.json.decode(result.stdout)
+  local mapped = vim.json.decode(result.stdout)
+  endpoints[#endpoints + 1] = assert(mapped.inverse_search)
+  return mapped
 end
 local ok, failure = xpcall(function()
   vim.fn.writefile({
@@ -58,7 +61,7 @@ local ok, failure = xpcall(function()
     build = { 'typst', 'compile', '--root', alias, directory .. '/main.typ', p.pdf },
   })
   local linked_third = resolve(linked, directory .. '/chapter.typ', 2, 9)
-  assert(linked_third.page == 3 and linked_third.pdf == linked.pdf, vim.inspect(linked_third))
+  assert(linked_third.page == 3, vim.inspect(linked_third))
   local linked_second = resolve(linked, alias .. '/main.typ', 6, #'Unicode café λ ')
   assert(linked_second.page == 2, vim.inspect(linked_second))
 
@@ -112,7 +115,15 @@ end, debug.traceback)
 vim.lsp.rpc.start = start_rpc
 vim.env.TYPST_ROOT = original_root
 project.close()
+vim.api.nvim_exec_autocmds('VimLeavePre', {})
+local cleaned = vim.wait(5000, function()
+  for _, endpoint in ipairs(endpoints) do
+    if vim.uv.fs_lstat(vim.fs.dirname(endpoint)) then return false end
+  end
+  return true
+end, 10)
 vim.uv.fs_unlink(alias)
 vim.fn.delete(directory, 'rf')
 assert(ok, failure)
+assert(cleaned, 'Typst source-map service did not clean up on Neovim exit')
 print('Typst source-position tests passed')

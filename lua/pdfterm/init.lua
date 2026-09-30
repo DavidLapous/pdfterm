@@ -405,6 +405,11 @@ function M.open(pdf)
     open_pdf(pdf, id, source, source_error, true, false)
   end)
 end
+local function release_typst(pdf)
+  local compiler = package.loaded['pdfterm.typst']
+  if compiler then compiler.release(pdf) end
+end
+
 function M.set_main(file)
   file = file or vim.api.nvim_buf_get_name(0)
   intent()
@@ -412,6 +417,7 @@ function M.set_main(file)
     assert(file:match('%.tex$') or file:match('%.typ$'), 'main document must be a TeX or Typst file')
     main_file = vim.fn.fnamemodify(file, ':p')
     options.project = vim.tbl_extend('force', options.project or {}, { main = main_file })
+    release_typst(project.describe(options.project, main_file).pdf)
     vim.notify('Set current main file to ' .. main_file)
   end)
 end
@@ -468,6 +474,7 @@ function M.build()
       return
     end
     local p = project.describe(options.project, main_file or file)
+    if not p.main:match('%.typ$') then release_typst(p.pdf) end
     project.build(p, id)
   end)
 end
@@ -483,6 +490,7 @@ local function forward(allow_launch)
         return
       end
       local p = project.describe(options.project, main_file or file)
+      if not p.main:match('%.typ$') then release_typst(p.pdf) end
       local function resolve()
         if not alive(id) then
           return
