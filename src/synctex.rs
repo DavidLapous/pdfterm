@@ -380,7 +380,7 @@ fn run(operation: &Operation, args: &[&str]) -> io::Result<String> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct InversePoint {
     pub page: u32,
     pub x: f32,

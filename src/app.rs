@@ -3789,33 +3789,31 @@ impl App {
                     && flash.page == key.page
                     && frame.flash.is_some() =>
             {
-                std::mem::take(&mut flash.positioning_pending).then(|| {
-                    let highlight = frame.flash.as_ref().unwrap();
-                    let position = if self.viewer.center_forward_search {
-                        (highlight.rect.top + highlight.rect.bottom) * 0.5
-                    } else {
-                        highlight.rect.top.max(highlight.rect.bottom)
-                    };
-                    highlight.page_height_pt - position
-                })
+                if std::mem::take(&mut flash.positioning_pending) {
+                    frame
+                        .flash
+                        .as_ref()
+                        .and_then(|highlight| highlight.pixel_bounds)
+                } else {
+                    None
+                }
             }
             _ => None,
         };
-        if let Some(center_pt) = flash_scroll {
+        if let Some((left, right, top, bottom)) = flash_scroll {
             let viewport = self.viewport()?;
-            let highlight = frame.flash.as_ref().unwrap();
-            if let Some((left, right)) = highlight.horizontal_bounds {
-                self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
-                    self.tab().scroll_x,
-                    frame.width,
-                    u32::from(viewport.pixel_width),
-                    left as f32,
-                    right as f32,
-                );
-            }
-            let center = (center_pt / frame.flash.as_ref().unwrap().page_height_pt
-                * frame.height as f32)
-                .round() as i64;
+            self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
+                self.tab().scroll_x,
+                frame.width,
+                u32::from(viewport.pixel_width),
+                left as f32,
+                right as f32,
+            );
+            let center = if self.viewer.center_forward_search {
+                (i64::from(top) + i64::from(bottom)) / 2
+            } else {
+                i64::from(top)
+            };
             self.tab_mut().pending_destination = None;
             self.tab_mut().scroll_y = 0;
             let target = center
@@ -7651,8 +7649,7 @@ mod tests {
                     top: 20.0,
                     right: 20.0,
                 },
-                page_height_pt: 240.0,
-                horizontal_bounds: Some((10, 20)),
+                pixel_bounds: Some((10, 20, 220, 230)),
                 word_precise: true,
                 error: None,
             }),
@@ -7660,6 +7657,7 @@ mod tests {
     }
 
     fn continuous_app() -> (super::App, Viewport, tempfile::NamedTempFile) {
+        let _native = crate::pdf::pdfium_test_lock();
         let file = tempfile::NamedTempFile::new().unwrap();
         let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
         // These draw tests supply completed frames and an already-pending

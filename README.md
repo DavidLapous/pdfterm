@@ -416,8 +416,13 @@ before applying the request; switching projects does not require restarting it.
 Use `--synctex-view` to obtain `revision` together with the geometry. It records
 the PDF's Unix device/inode, size, and nanosecond modification/change timestamps,
 checked before and after SyncTeX resolution. This is local filesystem identity,
-not a cryptographic content digest. Geometry is in points, with `h` the left edge
-and `v` the bottom edge measured down from the page top.
+not a cryptographic content digest. Geometry is in original, unrotated compiler
+page points, with `h` the absolute PDF x coordinate and `v` the box bottom measured
+down from the compiler paper top. PDFium transforms that space into the displayed
+crop and rotation. A nonzero MediaBox origin does not shift the compiler origin;
+the original paper height is the unrotated MediaBox height, not its upper edge
+or the cropped/displayed height. Arbitrarily changing paper extents without
+updating the source map does not establish matching provenance.
 
 The Neovim Typst adapter also supplies optional `inverse_search`, the absolute
 path of its private compiler-map Unix socket. The viewer binds that endpoint to

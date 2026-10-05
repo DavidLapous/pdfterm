@@ -102,9 +102,11 @@ impl InverseTask {
         };
         let point = synctex::InversePoint {
             page: self.page + 1,
-            x: self.click.pdf_x,
-            y_from_top: self.click.page_height_pt - self.click.pdf_y,
-            page_height_pt: self.click.page_height_pt,
+            ..if self.inverse_search.is_some() {
+                self.click.typst
+            } else {
+                self.click.synctex
+            }
         };
         let mut result = if let Some(endpoint) = &self.inverse_search {
             crate::typst::resolve_inverse(endpoint, self.revision.pdf, point, &self.operation)?
@@ -237,9 +239,18 @@ mod tests {
                 revision: DocumentRevision::read(&self.path).unwrap(),
                 page: 0,
                 click: ResolvedClick {
-                    pdf_x: request_id as f32,
-                    pdf_y: 20.,
-                    page_height_pt: 600.,
+                    synctex: crate::synctex::InversePoint {
+                        page: 1,
+                        x: request_id as f32,
+                        y_from_top: 580.,
+                        page_height_pt: 600.,
+                    },
+                    typst: crate::synctex::InversePoint {
+                        page: 1,
+                        x: request_id as f32,
+                        y_from_top: 580.,
+                        page_height_pt: 600.,
+                    },
                     text: Ok(None),
                 },
                 word_precision: false,
@@ -433,9 +444,18 @@ mod tests {
             path,
             page: forward.page - 1,
             click: ResolvedClick {
-                pdf_x: forward.h + forward.width / 2.,
-                pdf_y: -(forward.v - forward.height / 2.),
-                page_height_pt: 0.,
+                synctex: crate::synctex::InversePoint {
+                    page: forward.page,
+                    x: forward.h + forward.width / 2.,
+                    y_from_top: forward.v - forward.height / 2.,
+                    page_height_pt: 792.,
+                },
+                typst: crate::synctex::InversePoint {
+                    page: forward.page,
+                    x: forward.h + forward.width / 2.,
+                    y_from_top: forward.v - forward.height / 2.,
+                    page_height_pt: 792.,
+                },
                 text: Err("unsupported glyph encoding".into()),
             },
             word_precision: true,

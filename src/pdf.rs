@@ -158,9 +158,9 @@ pub struct Frame {
 #[derive(Clone, Debug)]
 pub struct ForwardHighlight {
     pub rect: SearchRect,
-    pub page_height_pt: f32,
-    /// Horizontal bounds in the rendered frame, after PDFium's page transform.
-    pub horizontal_bounds: Option<(i32, i32)>,
+    /// Rendered frame bounds after PDFium's crop and rotation transforms,
+    /// ordered left, right, top, bottom.
+    pub pixel_bounds: Option<(i32, i32, i32, i32)>,
     pub word_precise: bool,
     /// Refinement errors fail this forward request, not the renderer.
     pub error: Option<Arc<str>>,
@@ -204,10 +204,90 @@ pub struct DocumentLink {
 
 #[derive(Debug)]
 pub struct ResolvedClick {
-    pub pdf_x: f32,
-    pub pdf_y: f32,
-    pub page_height_pt: f32,
+    /// Original compiler page coordinates, independent of the displayed crop/rotation.
+    pub synctex: crate::synctex::InversePoint,
+    /// Preserve the existing compiler-service wire convention for Typst.
+    pub typst: crate::synctex::InversePoint,
     pub text: Result<Option<(String, usize)>, String>,
+}
+
+/// SyncTeX uses the compiler's original paper height and an absolute x coordinate,
+/// not the rendered page's height or CropBox origin. A nonzero MediaBox origin
+/// does not move pdfTeX's output origin: its paper height is the unrotated extent.
+/// PDFium page/device transforms handle the displayed crop and rotation separately.
+#[derive(Clone, Copy)]
+struct SourcePageCoordinates {
+    height: f32,
+}
+
+impl SourcePageCoordinates {
+    fn for_page(page: &PdfPage) -> Result<Self, String> {
+        let media = page
+            .boundaries()
+            .media()
+            .map_err(|error| format!("could not read original PDF paper bounds: {error}"))?
+            .bounds;
+        if ![
+            media.left().value,
+            media.bottom().value,
+            media.right().value,
+            media.top().value,
+            media.width().value,
+            media.height().value,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+            || media.width().value <= 0.0
+            || media.height().value <= 0.0
+        {
+            return Err("PDFium returned invalid original paper bounds".into());
+        }
+        Ok(Self {
+            height: media.height().value,
+        })
+    }
+
+    // This involution is shared by forward boxes, inverse clicks, and batch input.
+    fn flip_y(self, y: f32) -> Result<f32, String> {
+        let flipped = self.height - y;
+        if !y.is_finite() || !flipped.is_finite() {
+            return Err("original page coordinate is not finite".into());
+        }
+        Ok(flipped)
+    }
+
+    fn pdf_point(self, x: f32, y_from_top: f32) -> Result<(f32, f32), String> {
+        if !x.is_finite() {
+            return Err("original page coordinate is not finite".into());
+        }
+        Ok((x, self.flip_y(y_from_top)?))
+    }
+
+    fn inverse_point(
+        self,
+        page: u32,
+        pdf_x: f32,
+        pdf_y: f32,
+    ) -> Result<crate::synctex::InversePoint, String> {
+        let (x, y_from_top) = self.pdf_point(pdf_x, pdf_y)?;
+        Ok(crate::synctex::InversePoint {
+            page,
+            x,
+            y_from_top,
+            page_height_pt: self.height,
+        })
+    }
+
+    fn pdf_rect(self, rect: SearchRect) -> Result<SearchRect, String> {
+        let (left, top) = self.pdf_point(rect.left, rect.top)?;
+        let (right, bottom) = self.pdf_point(rect.right, rect.bottom)?;
+        Ok(SearchRect {
+            left,
+            right,
+            top,
+            bottom,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -886,38 +966,46 @@ fn run_worker(
                     key,
                     revision,
                 } => {
-                    let result = (|| -> Result<ResolvedClick, String> {
-                        if revisions.get(&document_id) != Some(&revision) {
-                            return Err("hit-test document revision is no longer loaded".into());
-                        }
-                        let document = documents
-                            .get(&document_id)
-                            .ok_or("hit-test document is closed")?;
-                        let page_index = i32::try_from(page).map_err(|e| e.to_string())?;
-                        let rendered = document
-                            .pages()
-                            .get(page_index)
-                            .map_err(|e| e.to_string())?;
-                        let zoom = i32::from(key.zoom.max(1));
-                        let target_width = (i32::from(key.width) * zoom / 100).max(1);
-                        let target_height = (i32::from(key.height) * zoom / 100).max(1);
-                        let base_config = PdfRenderConfig::new()
-                            .set_reverse_byte_order(true)
-                            .use_lcd_text_rendering(true)
-                            .force_half_tone(false)
-                            .use_print_quality(false);
-                        let config =
-                            build_fit_config(base_config, key.fit, target_width, target_height);
-                        let (pdf_x, pdf_y) = rendered
-                            .pixels_to_points(x as i32, y as i32, &config)
-                            .map_err(|e| e.to_string())?;
-                        Ok(ResolvedClick {
-                            pdf_x: pdf_x.value,
-                            pdf_y: pdf_y.value,
-                            page_height_pt: rendered.height().value,
-                            text: clicked_text(&rendered, pdf_x.value, pdf_y.value),
-                        })
-                    })();
+                    let result =
+                        (|| -> Result<ResolvedClick, String> {
+                            if revisions.get(&document_id) != Some(&revision) {
+                                return Err("hit-test document revision is no longer loaded".into());
+                            }
+                            let document = documents
+                                .get(&document_id)
+                                .ok_or("hit-test document is closed")?;
+                            let page_index = i32::try_from(page).map_err(|e| e.to_string())?;
+                            let rendered = document
+                                .pages()
+                                .get(page_index)
+                                .map_err(|e| e.to_string())?;
+                            let zoom = i32::from(key.zoom.max(1));
+                            let target_width = (i32::from(key.width) * zoom / 100).max(1);
+                            let target_height = (i32::from(key.height) * zoom / 100).max(1);
+                            let base_config = PdfRenderConfig::new()
+                                .set_reverse_byte_order(true)
+                                .use_lcd_text_rendering(true)
+                                .force_half_tone(false)
+                                .use_print_quality(false);
+                            let config =
+                                build_fit_config(base_config, key.fit, target_width, target_height);
+                            let (pdf_x, pdf_y) = rendered
+                                .pixels_to_points(x as i32, y as i32, &config)
+                                .map_err(|e| e.to_string())?;
+                            Ok(ResolvedClick {
+                                synctex: SourcePageCoordinates::for_page(&rendered)?
+                                    .inverse_point(page + 1, pdf_x.value, pdf_y.value)?,
+                                typst: SourcePageCoordinates {
+                                    height: rendered.height().value,
+                                }
+                                .inverse_point(
+                                    page + 1,
+                                    pdf_x.value,
+                                    pdf_y.value,
+                                )?,
+                                text: clicked_text(&rendered, pdf_x.value, pdf_y.value),
+                            })
+                        })();
                     message_tx
                         .send(WorkerMessage::PagePoint {
                             document_id,
@@ -937,8 +1025,8 @@ fn run_worker(
                 } => {
                     // Forward-search flash state: the app re-issues the render
                     // (and the clear) around this store, so nothing else to do.
-                    // The wire rect is y-down from the page top (synctex v);
-                    // flip to pdfium bottom-up so points_to_pixels lands right.
+                    // Translate original source coordinates before PDF-space text
+                    // refinement; rendering applies the crop/rotation afterwards.
                     let Some(document) = documents.get(&document_id) else {
                         continue;
                     };
@@ -946,35 +1034,33 @@ fn run_worker(
                         .pages()
                         .get(page as i32)
                         .map_err(|e| e.to_string())?;
-                    let page_height = target.height().value;
-                    let flipped = SearchRect {
-                        left: rect.left,
-                        right: rect.right,
-                        top: page_height - rect.bottom,
-                        bottom: page_height - rect.top,
-                    };
-                    let refined = (|| -> Result<Option<SearchRect>, String> {
-                        let Some(word) = word else { return Ok(None) };
+                    let translated = SourcePageCoordinates::for_page(&target)
+                        .and_then(|coordinates| coordinates.pdf_rect(rect));
+                    let result = (|| -> Result<(SearchRect, bool), String> {
+                        let coarse = translated?;
+                        let Some(word) = word else {
+                            return Ok((coarse, false));
+                        };
                         let cache = text_cache
                             .get_mut(&document_id)
                             .ok_or("missing PDF text cache")?;
                         let cached = cached_page_text(document, page, cache)
                             .ok_or("could not extract PDF text for word highlighting")?;
-                        forward_word_rect(&target, cached, &word, flipped)
+                        let refined = forward_word_rect(&target, cached, &word, coarse)?;
+                        Ok((refined.unwrap_or(coarse), refined.is_some()))
                     })();
-                    let (refined, error) = match refined {
-                        Ok(rect) => (rect, None),
-                        Err(error) => (None, Some(Arc::<str>::from(error))),
+                    let (rect, word_precise, error) = match result {
+                        Ok((rect, precise)) => (rect, precise, None),
+                        Err(error) => (rect, false, Some(Arc::<str>::from(error))),
                     };
                     flash_highlights.insert(
                         document_id,
                         (
                             page,
                             ForwardHighlight {
-                                rect: refined.unwrap_or(flipped),
-                                page_height_pt: page_height,
-                                horizontal_bounds: None,
-                                word_precise: refined.is_some(),
+                                rect,
+                                pixel_bounds: None,
+                                word_precise,
                                 error,
                             },
                         ),
@@ -1230,8 +1316,22 @@ fn run_worker(
             let flash = flash_highlights
                 .get(&request.key.document_id)
                 .filter(|(page, _)| *page == request.key.page)
-                .map(|(_, highlight)| highlight);
-            let flash_rectangle = flash.map(|highlight| &highlight.rect);
+                .map(|(_, highlight)| {
+                    let mut highlight = highlight.clone();
+                    if highlight.error.is_none() {
+                        highlight.pixel_bounds =
+                            page_rect_pixel_bounds(&page, &config, highlight.rect);
+                        if highlight.pixel_bounds.is_none() {
+                            highlight.error =
+                                Some("could not convert forward highlight to frame pixels".into());
+                        }
+                    }
+                    highlight
+                });
+            let flash_rectangle = flash
+                .as_ref()
+                .filter(|highlight| highlight.error.is_none())
+                .map(|highlight| &highlight.rect);
             let highlight_elapsed = (search_rectangles.is_some()
                 || (request.key.link_mode && !links.is_empty())
                 || !selected_link_rectangles.is_empty()
@@ -1317,13 +1417,7 @@ fn run_worker(
                     compression_elapsed,
                     generation: request.generation,
                     links,
-                    flash: flash.map(|highlight| {
-                        let mut highlight = highlight.clone();
-                        highlight.horizontal_bounds =
-                            page_rect_pixel_bounds(&page, &config, highlight.rect)
-                                .map(|(left, right, _, _)| (left, right));
-                        highlight
-                    }),
+                    flash,
                 }))
                 .map_err(|_| "viewer stopped".to_string())?;
         }
@@ -1892,9 +1986,9 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
     .map(Some)
 }
 
-/// Resolve newline-delimited PDF-point clicks without starting the viewer.
-/// PDFium and the document stay open for the full batch; each point owns its
-/// own resolver deadline and failure record.
+/// Resolve newline-delimited clicks in original, unrotated SyncTeX page points
+/// (absolute x and y down from the compiler paper top) without starting the viewer.
+/// PDFium and the document stay open; each point owns its resolver deadline.
 pub fn synctex_edit_batch(
     pdf: &Path,
     library: Option<&Path>,
@@ -1933,27 +2027,21 @@ pub fn synctex_edit_batch(
                 cached_page = Some((point.page, page));
             }
             let page = &cached_page.as_ref().expect("current page is cached").1;
-            let height = page.height().value;
-            let width = page.width().value;
-            if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
-                return Err("PDFium returned invalid page dimensions".into());
+            let coordinates = SourcePageCoordinates::for_page(page)?;
+            let (pdf_x, pdf_y) = coordinates.pdf_point(point.x, point.y)?;
+            let (left, bottom, right, top) =
+                effective_page_bounds(page).ok_or("could not determine visible PDF page bounds")?;
+            if pdf_x < left || pdf_x > right || pdf_y < bottom || pdf_y > top {
+                return Err("point is outside the visible PDF page".into());
             }
-            if point.x < 0.0 || point.x > width || point.y < 0.0 || point.y > height {
-                return Err("point is outside the PDF page".into());
-            }
-            let (context, offset) = match clicked_text(page, point.x, height - point.y) {
+            let (context, offset) = match clicked_text(page, pdf_x, pdf_y) {
                 Ok(Some(context)) => context,
                 Ok(None) => return Err("PDFium found no text near point".into()),
                 Err(error) => return Err(format!("PDFium text hit-test failed: {error}")),
             };
             let resolution = crate::synctex::resolve_inverse(
                 pdf,
-                crate::synctex::InversePoint {
-                    page: point.page,
-                    x: point.x,
-                    y_from_top: point.y,
-                    page_height_pt: height,
-                },
+                coordinates.inverse_point(point.page, pdf_x, pdf_y)?,
                 settings.word_precision.then_some((&context, offset)),
                 settings.source_context_lines as u32,
                 &crate::process::Operation::new(std::time::Duration::from_secs(30)),
@@ -3262,6 +3350,12 @@ fn page_rect_pixel_bounds(
     config: &PdfRenderConfig,
     bounds: SearchRect,
 ) -> Option<(i32, i32, i32, i32)> {
+    if ![bounds.left, bounds.right, bounds.top, bounds.bottom]
+        .into_iter()
+        .all(f32::is_finite)
+    {
+        return None;
+    }
     let mut left = i32::MAX;
     let mut right = i32::MIN;
     let mut top = i32::MAX;
@@ -3664,7 +3758,352 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn pdfium_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    // Native fixtures share PDFium state; do not interleave independent fixture
+    // transactions. Production confines PDFium to one render worker.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().expect("native PDFium fixture lock poisoned")
+}
+
+#[cfg(test)]
 mod tests {
+    fn close_test_worker(worker: &super::RenderWorker, revision: super::DocumentRevision) {
+        worker.close(1);
+        worker
+            .find_visible(1, u64::MAX, revision, String::new(), Vec::new())
+            .unwrap();
+        match worker
+            .message_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap()
+        {
+            super::WorkerMessage::VisibleMatchesError { request_id, .. } => {
+                assert_eq!(request_id, u64::MAX);
+            }
+            message => panic!("expected closed native fixture, got {message:?}"),
+        }
+    }
+
+    fn coordinate_frame(worker: &super::RenderWorker) -> super::Frame {
+        match worker
+            .message_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap()
+        {
+            super::WorkerMessage::Frame(frame) => frame,
+            message => panic!("expected coordinate frame, got {message:?}"),
+        }
+    }
+
+    fn coordinate_rgba(frame: &super::Frame) -> Vec<u8> {
+        use std::io::Read;
+        let mut rgba = Vec::new();
+        flate2::read::ZlibDecoder::new(frame.compressed_rgba.as_slice())
+            .read_to_end(&mut rgba)
+            .unwrap();
+        assert_eq!(rgba.len(), (frame.width * frame.height * 4) as usize);
+        rgba
+    }
+
+    #[test]
+    fn synctex_worker_points_and_highlights_follow_original_paper_geometry() {
+        let _native = super::pdfium_test_lock();
+        use crate::{
+            editor::Editor,
+            navigation::{InverseTask, NavigationWorker},
+            process::Operation,
+            synctex,
+        };
+        use pdfium_render::prelude::{PdfPoints, PdfRenderConfig};
+        use std::{fmt::Write, process::Command, time::Duration};
+
+        // pdfTeX's original paper is 400x600bp even on pages whose visible
+        // CropBox is offset, /Rotate swaps display axes, or MediaBox starts
+        // elsewhere. Changing original paper extents without updating SyncTeX
+        // is not a coordinate convention and cannot repair an outdated sidecar.
+        let cases = [
+            (0, "", ""),
+            (90, "", ""),
+            (180, "", ""),
+            (270, "", ""),
+            (0, "/CropBox [20 30 380 570]", ""),
+            (90, "/CropBox [20 30 380 570]", ""),
+            (180, "/CropBox [20 30 380 570]", ""),
+            (270, "/CropBox [20 30 380 570]", ""),
+            (90, "/CropBox [40 60 390 590]", "/MediaBox [20 30 420 630]"),
+            (270, "/CropBox [40 60 390 590]", "/MediaBox [20 30 420 630]"),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("coordinates.tex");
+        let pdf = directory.path().join("coordinates.pdf");
+        let mut tex = String::from(
+            "\\documentclass{article}\n\
+             \\pdfcompresslevel=0\\pdfobjcompresslevel=0\n\
+             \\usepackage[paperwidth=400bp,paperheight=600bp,margin=72bp]{geometry}\n\
+             \\pagestyle{empty}\n\
+             \\begin{document}\n",
+        );
+        let mut lines = Vec::new();
+        for (index, (rotation, crop, media)) in cases.iter().enumerate() {
+            if index != 0 {
+                tex.push_str("\\newpage\n");
+            }
+            writeln!(tex, "\\pdfpageattr{{/Rotate {rotation} {crop} {media}}}").unwrap();
+            lines.push(tex.lines().count() as u32 + 1);
+            tex.push_str(
+                "\\noindent ZenithAlpha confirms the original page origin.\\par\n\
+                 \\vspace{110bp}\n\
+                 \\noindent MeridianBeta identifies a different source line.\\par\n\
+                 \\vspace{110bp}\n\
+                 \\noindent NadirGamma identifies the bottom region.\\par\n",
+            );
+        }
+        tex.push_str("\\end{document}\n");
+        std::fs::write(&source, &tex).unwrap();
+        let output = crate::process::output(
+            Command::new("pdflatex")
+                .current_dir(directory.path())
+                .args([
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    "-synctex=1",
+                    "coordinates.tex",
+                ]),
+            &Operation::new(Duration::from_secs(30)),
+        )
+        .expect("pdflatex is required for real coordinate regressions");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let pdfium = super::load_pdfium(None).unwrap();
+        let document = pdfium.load_pdf_from_file(&pdf, None).unwrap();
+        let worker = super::RenderWorker::spawn(1, pdf.clone(), None);
+        assert_eq!(worker.wait_until_ready().unwrap().0, cases.len() as u32);
+        let navigation = NavigationWorker::new();
+        let revision = synctex::DocumentRevision::read(&pdf).unwrap();
+        worker.begin_generation(1);
+        let mut batch_input = String::new();
+        for (index, line) in lines.iter().copied().enumerate() {
+            let page = document.pages().get(index as i32).unwrap();
+            let text = page.text().unwrap();
+            let first = text
+                .chars()
+                .iter()
+                .position(|character| character.unicode_value() == u32::from('Z'))
+                .unwrap();
+            let glyph = text.chars().get(first + 3).unwrap().tight_bounds().unwrap();
+            let pdf_x = (glyph.left().value + glyph.right().value) * 0.5;
+            let pdf_y = (glyph.top().value + glyph.bottom().value) * 0.5;
+            writeln!(
+                batch_input,
+                "{}",
+                serde_json::json!({
+                    "page": index + 1,
+                    "x": pdf_x,
+                    "y": 600.0 - pdf_y,
+                })
+            )
+            .unwrap();
+            let selected = text.segments_subset(first, "ZenithAlpha".len());
+            assert_eq!(selected.len(), 1);
+            let word = selected.iter().next().unwrap().bounds();
+            let word_rect = super::SearchRect {
+                left: word.left().value,
+                right: word.right().value,
+                top: word.top().value,
+                bottom: word.bottom().value,
+            };
+            let column = tex
+                .lines()
+                .nth(line as usize - 1)
+                .unwrap()
+                .find("ZenithAlpha")
+                .unwrap() as u32
+                + 1;
+            let request = synctex::resolve_forward(&pdf, &source, line, column).unwrap();
+            assert_eq!(request.page, index as u32 + 1);
+            for (fit, zoom) in [(super::FitMode::Page, 100), (super::FitMode::Width, 125)] {
+                let key = super::RenderKey {
+                    document_id: 1,
+                    page: index as u32,
+                    width: 600,
+                    height: 800,
+                    zoom,
+                    fit,
+                    invert: false,
+                    dark_mode_style: super::DarkModeStyle::new([0; 3], [255; 3]),
+                    search_request_id: 0,
+                    search_highlight: [255, 255, 0],
+                    link_mode: false,
+                    link_highlight: [255, 255, 0],
+                    selected_link_ordinal: None,
+                };
+                let config = super::build_fit_config(
+                    PdfRenderConfig::new(),
+                    fit,
+                    i32::from(key.width) * i32::from(zoom) / 100,
+                    i32::from(key.height) * i32::from(zoom) / 100,
+                );
+                worker.clear_flash(1);
+                worker
+                    .render(super::RenderRequest { key, generation: 1 })
+                    .unwrap();
+                let plain = coordinate_frame(&worker);
+                let (pixel_x, pixel_y) = page
+                    .points_to_pixels(PdfPoints::new(pdf_x), PdfPoints::new(pdf_y), &config)
+                    .unwrap();
+                worker.page_point(revision, 1, pixel_x as u32, pixel_y as u32, key);
+                let super::WorkerMessage::PagePoint { result, .. } = worker
+                    .message_rx
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap()
+                else {
+                    panic!("missing coordinate inverse point");
+                };
+                let click = result.unwrap();
+                assert!((click.synctex.x - pdf_x).abs() < 1.0, "{click:?}");
+                assert!(
+                    (click.synctex.y_from_top - (600.0 - pdf_y)).abs() < 1.0,
+                    "{click:?}"
+                );
+                assert_eq!(click.synctex.page_height_pt, 600.0);
+                // The compiler-service protocol retains its previous semantics.
+                assert_eq!(click.typst.x, click.synctex.x);
+                assert!(
+                    (click.typst.y_from_top
+                        - click.synctex.y_from_top
+                        - (page.height().value - 600.0))
+                        .abs()
+                        < 0.01
+                );
+                assert_eq!(click.typst.page_height_pt, page.height().value);
+                navigation
+                    .submit(InverseTask {
+                        request_id: 1,
+                        path: pdf.clone(),
+                        revision,
+                        page: index as u32,
+                        click,
+                        word_precision: true,
+                        radius: 4,
+                        editor: Editor::None,
+                        inverse_search: None,
+                        operation: Operation::default(),
+                    })
+                    .unwrap();
+                let inverse = navigation
+                    .replies
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_eq!(inverse.location.line, line);
+                assert!(inverse.location.precise, "{:?}", inverse.location);
+                assert_eq!(inverse.location.byte_column, (column - 1) as usize);
+
+                // Compare actual flashed pixels with PDFium's painted text bounds,
+                // not merely the forward/inverse conversion's own round trip.
+                worker.flash(1, index as u32, request.rect(), request.word.clone());
+                worker
+                    .render(super::RenderRequest { key, generation: 1 })
+                    .unwrap();
+                let precise = coordinate_frame(&worker);
+                let highlight = precise.flash.as_ref().unwrap();
+                assert!(highlight.error.is_none(), "{:?}", highlight.error);
+                assert!(highlight.word_precise);
+                let expected = super::page_rect_pixel_bounds(&page, &config, word_rect).unwrap();
+                assert_eq!(highlight.pixel_bounds, Some(expected));
+                let before = coordinate_rgba(&plain);
+                let after = coordinate_rgba(&precise);
+                let mut changed = (u32::MAX, 0, u32::MAX, 0);
+                for (pixel, (before, after)) in before
+                    .chunks_exact(4)
+                    .zip(after.chunks_exact(4))
+                    .enumerate()
+                {
+                    if before != after {
+                        let x = pixel as u32 % precise.width;
+                        let y = pixel as u32 / precise.width;
+                        changed.0 = changed.0.min(x);
+                        changed.1 = changed.1.max(x + 1);
+                        changed.2 = changed.2.min(y);
+                        changed.3 = changed.3.max(y + 1);
+                    }
+                }
+                assert_eq!(
+                    changed,
+                    (
+                        expected.0.saturating_sub(1).clamp(0, precise.width as i32) as u32,
+                        expected.1.saturating_add(2).clamp(0, precise.width as i32) as u32,
+                        expected.2.saturating_sub(1).clamp(0, precise.height as i32) as u32,
+                        expected.3.saturating_add(2).clamp(0, precise.height as i32) as u32,
+                    )
+                );
+
+                worker.flash(1, index as u32, request.rect(), None);
+                worker
+                    .render(super::RenderRequest { key, generation: 1 })
+                    .unwrap();
+                let coarse = coordinate_frame(&worker);
+                let highlight = coarse.flash.as_ref().unwrap();
+                assert!(!highlight.word_precise);
+                assert!(highlight.error.is_none());
+                let expected = super::SearchRect {
+                    left: request.h,
+                    right: request.h + request.width,
+                    top: 600.0 - (request.v - request.height),
+                    bottom: 600.0 - request.v,
+                };
+                assert_eq!(
+                    highlight.pixel_bounds,
+                    super::page_rect_pixel_bounds(&page, &config, expected)
+                );
+
+                if index == 0 && zoom == 100 {
+                    worker.flash(
+                        1,
+                        0,
+                        super::SearchRect {
+                            left: f32::NAN,
+                            ..request.rect()
+                        },
+                        None,
+                    );
+                    worker
+                        .render(super::RenderRequest { key, generation: 1 })
+                        .unwrap();
+                    let invalid = coordinate_frame(&worker);
+                    let highlight = invalid.flash.as_ref().unwrap();
+                    assert!(highlight.error.as_ref().unwrap().contains("not finite"));
+                    assert!(highlight.pixel_bounds.is_none());
+                    assert_eq!(coordinate_rgba(&invalid), before);
+                }
+            }
+        }
+        close_test_worker(&worker, revision);
+        let mut batch_output = Vec::new();
+        super::synctex_edit_batch(
+            &pdf,
+            None,
+            &crate::config::ViewerSettings::default(),
+            std::io::Cursor::new(batch_input),
+            &mut batch_output,
+        )
+        .unwrap();
+        let records = String::from_utf8(batch_output).unwrap();
+        assert_eq!(records.lines().count(), cases.len());
+        for (record, expected_line) in records.lines().zip(lines) {
+            let record: serde_json::Value = serde_json::from_str(record).unwrap();
+            assert_eq!(record["ok"], true, "{record}");
+            assert_eq!(record["pdf_word"], "ZenithAlpha");
+            assert_eq!(record["location"]["line"], expected_line);
+            assert_eq!(record["location"]["precise"], true);
+        }
+    }
+
     #[test]
     fn visible_search_finds_overlapping_unicode_occurrences() {
         assert_eq!(
@@ -3687,6 +4126,7 @@ mod tests {
 
     #[test]
     fn effective_page_bounds_respect_crops_inheritance_and_rotation() {
+        let _native = super::pdfium_test_lock();
         let pdfium = super::load_pdfium(None).unwrap();
         let cases = [
             (
@@ -3720,6 +4160,7 @@ mod tests {
 
     #[test]
     fn invalid_visible_page_reports_an_error_without_stopping_the_renderer() {
+        let _native = super::pdfium_test_lock();
         let pdf = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             pdf.path(),
@@ -3772,6 +4213,7 @@ mod tests {
             reply,
             super::WorkerMessage::VisibleMatches { request_id: 2, .. }
         ));
+        close_test_worker(&worker, revision);
     }
 
     fn synthetic_bounds_pdf(
@@ -3892,6 +4334,7 @@ mod tests {
 
     #[test]
     fn point_forward_words_cross_runs_only_with_unique_complete_context() {
+        let _native = super::pdfium_test_lock();
         use pdfium_render::prelude::{PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints};
 
         let pdfium = super::load_pdfium(None).unwrap();
@@ -4011,6 +4454,7 @@ mod tests {
 
     #[test]
     fn point_forward_words_use_anchored_pdf_text_runs() {
+        let _native = super::pdfium_test_lock();
         use pdfium_render::prelude::{PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints};
 
         let pdfium = super::load_pdfium(None).unwrap();
@@ -4123,6 +4567,7 @@ mod tests {
 
     #[test]
     fn pdfium_image_mask_and_text_cache_work() {
+        let _native = super::pdfium_test_lock();
         use super::{
             LinkTarget, apply_link_highlights, apply_search_highlights, cached_page_text,
             empty_text_cache, extract_document_links, extract_page_links, image_mask, load_pdfium,
@@ -4387,6 +4832,7 @@ mod tests {
 
     #[test]
     fn internal_links_preserve_optional_rendered_destinations() {
+        let _native = super::pdfium_test_lock();
         let pdfium = super::load_pdfium(None).unwrap();
         for (geometry, x_position, y_position) in [
             ("", (Some(0.25), None), (None, Some(0.25))),
@@ -4426,6 +4872,7 @@ mod tests {
 
     #[test]
     fn targets_follow_crop_origin_and_page_rotation() {
+        let _native = super::pdfium_test_lock();
         let pdfium = super::load_pdfium(None).unwrap();
         for (geometry, view, expected_left, expected_top, width, expected_bounds) in [
             (
@@ -4562,6 +5009,7 @@ mod tests {
 
     #[test]
     fn optional_destination_axes_survive_subpixel_coordinate_changes() {
+        let _native = super::pdfium_test_lock();
         let pdfium = super::load_pdfium(None).unwrap();
         for (rotation, expected_left, expected_top) in
             [(0, None, Some(0.25)), (90, Some(0.75), None)]
