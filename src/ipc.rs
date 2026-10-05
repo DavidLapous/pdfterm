@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 /// Cancellable connection, including a saturated Unix listener backlog.
 pub(crate) fn connect(path: &str, operation: &crate::process::Operation) -> io::Result<UnixStream> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::FromRawFd;
     operation.check()?;
     // Zero initialization supplies the trailing NUL and optional platform fields.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -46,31 +46,58 @@ pub(crate) fn connect(path: &str, operation: &crate::process::Operation) -> io::
             )
         };
         if result == 0 {
+            operation.check()?;
             return Ok(stream);
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::EISCONN) => return Ok(stream),
-            Some(libc::EINPROGRESS | libc::EALREADY) => loop {
+            Some(libc::EISCONN) => {
                 operation.check()?;
-                let mut descriptor = libc::pollfd {
-                    fd: stream.as_raw_fd(),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                let ready = unsafe { libc::poll(&mut descriptor, 1, 2) };
-                if ready < 0 {
-                    return Err(io::Error::last_os_error());
+                return Ok(stream);
+            }
+            Some(libc::EINPROGRESS | libc::EALREADY) => {
+                wait_socket(&stream, libc::POLLOUT, operation)?;
+                if let Some(error) = stream.take_error()? {
+                    return Err(error);
                 }
-                if ready > 0 {
-                    if let Some(error) = stream.take_error()? {
-                        return Err(error);
-                    }
-                    return Ok(stream);
-                }
-            },
-            Some(libc::EAGAIN | libc::EINTR) => std::thread::sleep(Duration::from_millis(2)),
+                operation.check()?;
+                return Ok(stream);
+            }
+            // Linux does not queue an AF_UNIX connect when its backlog is full.
+            // An unconnected socket can poll writable, so retry connect itself.
+            Some(libc::EAGAIN) => {
+                std::thread::sleep(operation.remaining()?.min(Duration::from_millis(2)));
+            }
+            Some(libc::EINTR) => {}
             _ => return Err(error),
+        }
+    }
+}
+
+fn wait_socket(
+    stream: &UnixStream,
+    events: libc::c_short,
+    operation: &crate::process::Operation,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let timeout = operation.remaining()?.min(Duration::from_millis(50));
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis().max(1) as i32) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        operation.check()?;
+        if ready > 0 {
+            return Ok(());
         }
     }
 }
@@ -86,13 +113,20 @@ pub(crate) fn send(
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2))
+                wait_socket(stream, libc::POLLOUT, operation)?;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
-    stream.shutdown(Shutdown::Write)
+    loop {
+        operation.check()?;
+        match stream.shutdown(Shutdown::Write) {
+            Ok(()) => return operation.check(),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 /// Only the current user may traverse directories containing IPC or native code.
 pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
@@ -270,28 +304,60 @@ impl Drop for ForwardReply {
     }
 }
 
-pub fn forward(path: &str, request: &ForwardRequest) -> io::Result<()> {
-    request.validate()?;
-    let mut stream = UnixStream::connect(path)?;
-    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-    stream.set_read_timeout(Some(FORWARD_TIMEOUT + Duration::from_secs(1)))?;
-    serde_json::to_writer(&mut stream, request)?;
-    stream.shutdown(Shutdown::Write)?;
-    let mut response = String::new();
-    stream.take(4097).read_to_string(&mut response)?;
-    if response.len() > 4096 {
-        return Err(io::Error::other("forward reply exceeds 4096 bytes"));
+fn request_reply(
+    socket: &str,
+    bytes: &[u8],
+    kind: &str,
+    operation: &crate::process::Operation,
+) -> io::Result<()> {
+    let mut stream = connect(socket, operation)?;
+    send(&mut stream, bytes, operation)?;
+    let mut response = [0; 4097];
+    let mut length = 0;
+    loop {
+        operation.check()?;
+        match stream.read(&mut response[length..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                length += n;
+                if length == response.len() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait_socket(&stream, libc::POLLIN, operation)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
-    let reply: Reply = serde_json::from_str(&response)?;
+    operation.check()?;
+    let response = std::str::from_utf8(&response[..length]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })?;
+    if length > 4096 {
+        return Err(io::Error::other(format!("{kind} reply exceeds 4096 bytes")));
+    }
+    let reply: Reply = serde_json::from_str(response)?;
+    operation.check()?;
     if reply.ok {
         Ok(())
     } else {
         Err(io::Error::other(
             reply
                 .error
-                .unwrap_or_else(|| "forward request rejected".into()),
+                .unwrap_or_else(|| format!("{kind} request rejected")),
         ))
     }
+}
+
+pub fn forward(path: &str, request: &ForwardRequest) -> io::Result<()> {
+    let operation = crate::process::Operation::new(FORWARD_TIMEOUT + Duration::from_secs(1));
+    request.validate()?;
+    request_reply(path, &serde_json::to_vec(request)?, "forward", &operation)
 }
 fn validate_screenshot_path(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
@@ -310,30 +376,14 @@ fn validate_screenshot_path(path: &Path) -> io::Result<()> {
 }
 
 pub fn screenshot(socket: &str, path: &Path) -> io::Result<()> {
+    let operation = crate::process::Operation::new(FORWARD_TIMEOUT + Duration::from_secs(1));
     validate_screenshot_path(path)?;
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-    stream.set_read_timeout(Some(FORWARD_TIMEOUT + Duration::from_secs(1)))?;
-    serde_json::to_writer(
-        &mut stream,
-        &serde_json::json!({"type": "screenshot", "path": path}),
-    )?;
-    stream.shutdown(Shutdown::Write)?;
-    let mut response = String::new();
-    stream.take(4097).read_to_string(&mut response)?;
-    if response.len() > 4096 {
-        return Err(io::Error::other("screenshot reply exceeds 4096 bytes"));
-    }
-    let reply: Reply = serde_json::from_str(&response)?;
-    if reply.ok {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            reply
-                .error
-                .unwrap_or_else(|| "screenshot request rejected".into()),
-        ))
-    }
+    request_reply(
+        socket,
+        &serde_json::to_vec(&serde_json::json!({"type": "screenshot", "path": path}))?,
+        "screenshot",
+        &operation,
+    )
 }
 
 /// Incremental request reads. A slow client never sleeps on the event thread.
@@ -650,5 +700,255 @@ mod tests {
         let operation = crate::process::Operation::new(Duration::from_millis(30));
         let error = send(&mut sender, &vec![0; 4 * 1024 * 1024], &operation).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    fn accept_client(listener: &UnixListener) -> UnixStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // macOS can inherit the listener's nonblocking mode.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "client did not connect");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("client accept failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn manual_clients_exchange_requests_and_wait_for_reply_eof() {
+        for kind in ["forward", "screenshot"] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("client.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let pdf = root.path().join("document.pdf");
+            fs::write(&pdf, b"revision fixture").unwrap();
+            let request = ForwardRequest {
+                revision: crate::synctex::PdfRevision::read(&pdf).unwrap(),
+                pdf,
+                page: 1,
+                h: 10.0,
+                v: 20.0,
+                width: 5.0,
+                height: 5.0,
+                word: None,
+                inverse_search: None,
+            };
+            let output = root.path().join("capture.png");
+            let expected = if kind == "forward" {
+                serde_json::to_value(&request).unwrap()
+            } else {
+                serde_json::json!({"type": "screenshot", "path": output})
+            };
+            let (done, result) = std::sync::mpsc::channel();
+            let client = std::thread::spawn(move || {
+                let response = if kind == "forward" {
+                    forward(socket.to_str().unwrap(), &request)
+                } else {
+                    screenshot(socket.to_str().unwrap(), &output)
+                };
+                done.send(response).unwrap();
+            });
+            let mut server = accept_client(&listener);
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                expected
+            );
+            server.write_all(br#"{"ok":true,"error":null}"#).unwrap();
+            assert!(matches!(
+                result.recv_timeout(Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            server.shutdown(Shutdown::Write).unwrap();
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            client.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn manual_client_deadline_covers_slow_drip_reply() {
+        for kind in ["forward", "screenshot"] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("drip.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut stream = accept_client(&listener);
+                stream.read_to_end(&mut Vec::new()).unwrap();
+                // Complete JSON alone is not a reply: its EOF must also arrive.
+                stream.write_all(br#"{"ok":true,"error":null}"#).unwrap();
+                let mut sent = 0;
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    match stream.write_all(b" ") {
+                        Ok(()) => sent += 1,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => panic!("slow reply write failed: {error}"),
+                    }
+                }
+                sent
+            });
+            let operation = crate::process::Operation::new(Duration::from_millis(120));
+            let started = Instant::now();
+            let error =
+                request_reply(socket.to_str().unwrap(), b"{}", kind, &operation).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(error.to_string(), "navigation timed out");
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(server.join().unwrap() >= 2);
+        }
+    }
+
+    #[test]
+    fn manual_client_reply_limits_and_errors_are_preserved() {
+        for kind in ["forward", "screenshot"] {
+            let mut at_limit = br#"{"ok":true}"#.to_vec();
+            at_limit.resize(4096, b' ');
+            let cases = [
+                (at_limit, None),
+                (
+                    vec![b' '; 4097],
+                    Some(format!("{kind} reply exceeds 4096 bytes")),
+                ),
+                (
+                    br#"{"ok":false,"error":"render rejected"}"#.to_vec(),
+                    Some("render rejected".into()),
+                ),
+                (
+                    br#"{"ok":false}"#.to_vec(),
+                    Some(format!("{kind} request rejected")),
+                ),
+                (
+                    vec![0xff],
+                    Some("stream did not contain valid UTF-8".into()),
+                ),
+            ];
+            for (reply, expected) in cases {
+                let root = tempfile::tempdir().unwrap();
+                let socket = root.path().join("reply.sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                let server = std::thread::spawn(move || {
+                    let mut stream = accept_client(&listener);
+                    stream.read_to_end(&mut Vec::new()).unwrap();
+                    stream.write_all(&reply).unwrap();
+                });
+                let result = request_reply(
+                    socket.to_str().unwrap(),
+                    b"{}",
+                    kind,
+                    &crate::process::Operation::new(Duration::from_secs(1)),
+                );
+                match expected {
+                    None => result.unwrap(),
+                    Some(expected) => assert_eq!(result.unwrap_err().to_string(), expected),
+                }
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn saturated_listener() -> (tempfile::TempDir, PathBuf, UnixListener, Vec<UnixStream>) {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("backlog.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let queued = if cfg!(target_os = "linux") { 2 } else { 1 };
+        let clients = (0..queued)
+            .map(|_| {
+                connect(
+                    socket.to_str().unwrap(),
+                    &crate::process::Operation::new(Duration::from_secs(1)),
+                )
+                .unwrap()
+            })
+            .collect();
+        (root, socket, listener, clients)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saturated_backlog_obeys_manual_client_deadline() {
+        let (_root, socket, _listener, _queued) = saturated_listener();
+        for kind in ["forward", "screenshot"] {
+            let started = Instant::now();
+            let error = request_reply(
+                socket.to_str().unwrap(),
+                b"{}",
+                kind,
+                &crate::process::Operation::new(Duration::from_millis(60)),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(error.to_string(), "navigation timed out");
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saturated_backlog_connect_retries_until_accepted() {
+        let (_root, socket, listener, _queued) = saturated_listener();
+        let client = std::thread::spawn(move || {
+            request_reply(
+                socket.to_str().unwrap(),
+                b"{}",
+                "screenshot",
+                &crate::process::Operation::new(Duration::from_secs(1)),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        // Linux returned EAGAIN without queueing this client's connection.
+        drop(accept_client(&listener));
+        drop(accept_client(&listener));
+        let mut server = accept_client(&listener);
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"{}");
+        server.write_all(br#"{"ok":true}"#).unwrap();
+        server.shutdown(Shutdown::Write).unwrap();
+        client.join().unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn saturated_macos_backlog_keeps_immediate_refusal() {
+        let (_root, socket, _listener, _queued) = saturated_listener();
+        for kind in ["forward", "screenshot"] {
+            let started = Instant::now();
+            let error = request_reply(
+                socket.to_str().unwrap(),
+                b"{}",
+                kind,
+                &crate::process::Operation::new(Duration::from_millis(60)),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
     }
 }

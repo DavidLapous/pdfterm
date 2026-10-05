@@ -466,9 +466,11 @@ request IDs are needed. Changed-again PDFs, unreadable documents, out-of-range p
 invalid requests, supersession, user-input cancellation, and renderer/viewer
 failure return `{"ok":false,"error":"..."}`. Repeat SyncTeX resolution after a
 revision rejection; do not resend stale coordinates against a newer revision.
-The viewer's submission deadline is 30 seconds; the CLI allows 31 seconds for
-the final reply. These are failure ceilings, not readiness delays. A disconnected
-client is discarded without retaining its pending request.
+The viewer's submission deadline is 30 seconds. Each manual forward/screenshot
+CLI transport has one 31-second deadline covering connect, write, write-half-close,
+and the complete reply through EOF; incoming bytes do not restart it. These are
+failure ceilings, not readiness delays. A disconnected client is discarded
+without retaining its pending request.
 
 Successful forward replies also identify the viewer process with a fresh token
 (or the plugin-owned split's launch token). When requested, Neovim sends a
