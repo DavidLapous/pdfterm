@@ -2336,6 +2336,7 @@ impl App {
         }
         self.navigation.flash = Some(PendingFlash {
             document_id,
+            revision: request.revision,
             page,
             positioning_pending: true,
             expires_at: None,
@@ -2361,6 +2362,23 @@ impl App {
         Ok(())
     }
 
+    fn clear_document_flash(&mut self, document_id: DocumentId) {
+        if self
+            .navigation
+            .flash
+            .as_ref()
+            .is_some_and(|flash| flash.document_id == document_id)
+        {
+            let flash = self.navigation.flash.take().unwrap();
+            self.worker.clear_flash(document_id);
+            if let Some(index) = self.tab_index(document_id) {
+                self.session.tabs[index]
+                    .cache
+                    .retain(|key, _| key.page != flash.page);
+            }
+        }
+    }
+
     fn poll_flash_expiry(&mut self) -> Result<(), AppError> {
         if !self.navigation.flash.as_ref().is_some_and(|flash| {
             flash
@@ -2378,11 +2396,14 @@ impl App {
         }
         // Clearing an overlay must not cancel an unrelated in-flight page render.
         if self.tab().document_id == flash.document_id
+            && self.tab().revision == flash.revision
+            && flash.page < self.tab().page_count
             && (self.tab().page == flash.page
-                || self
-                    .visible_pages
-                    .iter()
-                    .any(|page| page.frame.key.page == flash.page))
+                || self.visible_pages.iter().any(|page| {
+                    page.frame.key.document_id == flash.document_id
+                        && page.frame.key.page == flash.page
+                        && page.frame.revision.pdf == flash.revision
+                }))
         {
             let key = self.page_key(flash.page, self.viewport()?);
             if self.pending.insert(key) {
@@ -3736,6 +3757,13 @@ impl App {
         if frame.generation != self.generation {
             return Ok(());
         }
+        let Some(index) = self.tab_index(frame.key.document_id) else {
+            return Ok(());
+        };
+        let tab = &self.session.tabs[index];
+        if frame.key.page >= tab.page_count || frame.revision.pdf != tab.revision {
+            return Ok(());
+        }
         if frame.flash.is_some()
             && !self.navigation.flash.as_ref().is_some_and(|flash| {
                 flash.document_id == frame.key.document_id && flash.page == frame.key.page
@@ -3805,6 +3833,7 @@ impl App {
             Some(flash)
                 if flash.document_id == key.document_id
                     && flash.page == key.page
+                    && flash.revision == frame.revision.pdf
                     && frame.flash.is_some() =>
             {
                 if std::mem::take(&mut flash.positioning_pending) {
@@ -3902,6 +3931,7 @@ impl App {
             let matches = |rendered: &Frame| {
                 rendered.key.document_id == flash.document_id
                     && rendered.key.page == flash.page
+                    && rendered.revision.pdf == flash.revision
                     && rendered.flash.is_some()
             };
             if flash.positioning_pending || self.pending_vertical_scroll != 0 {
@@ -7724,6 +7754,35 @@ mod tests {
     }
 
     #[test]
+    fn expired_flash_never_renders_a_removed_page_or_old_revision() {
+        for shrink in [true, false] {
+            let (mut app, _viewport, file) = continuous_app();
+            let revision = app.tab().revision;
+            app.pending.clear();
+            if shrink {
+                app.tab_mut().page_count = 1;
+            } else {
+                fs::write(file.path(), b"changed PDF revision").unwrap();
+                app.tab_mut().revision = crate::synctex::PdfRevision::read(file.path()).unwrap();
+            }
+            app.navigation.flash = Some(super::PendingFlash {
+                document_id: app.tab().document_id,
+                revision,
+                page: 1,
+                positioning_pending: false,
+                expires_at: Some(Instant::now()),
+            });
+            app.poll_flash_expiry().unwrap();
+            assert!(app.navigation.flash.is_none());
+            assert!(
+                app.pending.is_empty(),
+                "expired flash scheduled an invalid frame"
+            );
+            assert!(app.tab().cache.keys().all(|key| key.page != 1));
+        }
+    }
+
+    #[test]
     fn rendered_destination_without_vertical_coordinate_preserves_scroll() {
         let (mut app, viewport, _file) = continuous_app();
         app.viewer.continuous_scroll = false;
@@ -7825,12 +7884,20 @@ mod tests {
                 document_id,
                 fingerprint: tab.watcher.accepted,
             });
+            app.navigation.flash = Some(super::PendingFlash {
+                document_id,
+                revision,
+                page: 1,
+                positioning_pending: false,
+                expires_at: Some(Instant::now()),
+            });
             app.finish_open(document_id, pages, Vec::new(), revision, &mut Vec::new())
                 .unwrap();
             let tab = &app.session.tabs[0];
             assert_eq!(tab.page, pages - 1);
             assert_eq!((tab.scroll_x, tab.scroll_y, tab.zoom), (37, 123, 150));
             assert!(tab.cache.is_empty());
+            assert!(app.navigation.flash.is_none());
         }
     }
 

@@ -163,6 +163,13 @@ impl App {
         };
 
         self.navigation.inverse.take();
+        self.clear_document_flash(document_id);
+        if self.tab().document_id == document_id {
+            self.generation = self.generation.wrapping_add(1);
+            self.worker.begin_generation(self.generation);
+            self.reset_render_state();
+            self.pending_scale = None;
+        }
         self.worker
             .open(document_id, path)
             .map_err(AppError::Renderer)?;
@@ -196,6 +203,7 @@ impl App {
                 let Some(index) = self.tab_index(document_id) else {
                     return Ok(());
                 };
+                self.clear_document_flash(document_id);
                 let tab = &mut self.session.tabs[index];
                 tab.watcher.accept(fingerprint);
                 tab.revision = revision;

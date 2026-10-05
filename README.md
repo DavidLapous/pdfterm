@@ -119,6 +119,8 @@ a new one.
 Automatic PDF reloads preserve the current page and horizontal/vertical scroll
 offsets. If the rebuilt document has fewer pages or smaller page dimensions,
 the viewport is clamped to the remaining page and its available scroll range.
+Reload also clears pending highlights from the old revision. An expired highlight
+cannot request a page removed by the rebuild.
 
 Zoom in, zoom out, reset, and cycling fit mode with `m` keep the PDF position
 under the center of the viewport fixed, including when the center is on the next

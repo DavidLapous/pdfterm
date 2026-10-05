@@ -48,6 +48,7 @@ pub(crate) struct PendingForward {
 }
 pub(crate) struct PendingFlash {
     pub document_id: DocumentId,
+    pub revision: synctex::PdfRevision,
     pub page: u32,
     pub positioning_pending: bool,
     pub expires_at: Option<std::time::Instant>,
