@@ -359,8 +359,18 @@ function M.describe(config, main)
   end
   pdf = vim.fs.normalize(pdf)
   local argv = p.build
-    or (typst and { 'typst', 'compile', source, pdf })
-    or { 'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1', source }
+  if not argv then
+    if typst then
+      argv = { 'typst', 'compile', source, pdf }
+    else
+      local name = vim.fs.basename(pdf):match('^(.+)%.pdf$')
+      assert(name, 'pdfterm: default LaTeX build requires a .pdf output file')
+      argv = {
+        'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1',
+        '-outdir=' .. vim.fs.dirname(pdf), '-jobname=' .. name, source,
+      }
+    end
+  end
   assert(type(argv) == 'table' and #argv > 0, 'pdfterm: project.build must be a nonempty argument vector')
   for _, arg in ipairs(argv) do
     assert(type(arg) == 'string' and not arg:find('%z'), 'pdfterm: invalid build argument')

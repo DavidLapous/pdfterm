@@ -837,7 +837,12 @@ shell syntax is required. The configured command must produce `project.pdf` and,
 for LaTeX source navigation, its SyncTeX sidecar.
 
 Without a project descriptor, the selected/current TeX file, its directory,
-adjacent PDF, and `latexmk -pdf -interaction=nonstopmode -synctex=1` are used.
+and adjacent PDF are used. A separate `project.cwd` does not move the inferred
+PDF away from `project.main`. The default `latexmk -pdf -interaction=nonstopmode
+-synctex=1` build receives absolute `-outdir=<PDF parent>` and
+`-jobname=<PDF stem>` arguments, also for an explicit `project.pdf`; its output
+name must have a nonempty stem and `.pdf` extension. Custom build argv are
+unchanged.
 
 Typst `.typ` files use `typst compile <main> <pdf>` instead. Forward commands
 always save and compile Typst before navigating, independently of the LaTeX

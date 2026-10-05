@@ -198,6 +198,26 @@ local ok, failure = xpcall(function()
     assert(vim.deep_equal(described.build, custom_build), 'configured build command was replaced')
   end
 
+  -- Default latexmk must write the same PDF that describe() selects, even when
+  -- the main source is nested below a different compilation directory.
+  local default_directory = root_directory .. '/default build'
+  vim.fn.mkdir(default_directory .. '/src', 'p')
+  local default_main = default_directory .. '/src/main.tex'
+  vim.fn.writefile({ '\\documentclass{article}' }, default_main)
+  for _, output in ipairs({ false, 'output/custom name.pdf' }) do
+    local described = project.describe({
+      main = 'src/main.tex', cwd = default_directory, pdf = output or nil,
+    })
+    local expected_pdf = default_directory .. '/' .. (output or 'src/main.pdf')
+    assert(described.main == default_main and described.cwd == default_directory)
+    assert(described.pdf == expected_pdf, 'default build selected a different PDF')
+    assert(vim.deep_equal(described.build, {
+      'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1',
+      '-outdir=' .. vim.fs.dirname(expected_pdf),
+      '-jobname=' .. vim.fs.basename(expected_pdf):gsub('%.pdf$', ''), default_main,
+    }), 'default latexmk output disagrees with the selected PDF')
+  end
+
   -- Ownership requires a literal inclusion path, not merely a nearby TeX document.
   local automatic_directory = directory .. '/automatic roots'
   local automatic_cases = {

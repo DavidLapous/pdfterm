@@ -59,7 +59,10 @@ local ok, failure = xpcall(function()
   local tex = project.describe(nil, directory .. '/sources/chapter.tex')
   equal(directory .. '/owner.tex', tex.main)
   equal(directory .. '/owner.pdf', tex.pdf)
-  equal({ 'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1', tex.main }, tex.build)
+  equal({
+    'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1',
+    '-outdir=' .. directory, '-jobname=owner', tex.main,
+  }, tex.build)
 end, debug.traceback)
 project.close()
 vim.fn.delete(directory, 'rf')
