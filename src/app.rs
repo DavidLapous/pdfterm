@@ -149,7 +149,7 @@ pub fn run(
         Some(token) => token,
         None => new_focus_token()?,
     };
-    let defaults = AppDefaults::from_config(config, Some(focus_token))?;
+    let defaults = AppDefaults::from_config(config, Some(focus_token));
     let theme = defaults.theme;
     let _terminal = TerminalGuard::enter(&mut output, theme)?;
     let path = match path {
@@ -349,7 +349,7 @@ struct App {
     smooth_scroll_remaining: i64,
     smooth_scroll_tick: Instant,
     title_document: Option<DocumentId>,
-    flash_font: crate::screenshot::FlashFont,
+    flash_font: Option<crate::screenshot::FlashFont>,
     viewer: ViewerSettings,
     next_image_id: u32,
     last_status_row: Option<u16>,
@@ -421,11 +421,10 @@ struct AppDefaults {
     forward_socket: Option<String>,
     focus_token: Option<String>,
     viewer: ViewerSettings,
-    flash_font: crate::screenshot::FlashFont,
 }
 
 impl AppDefaults {
-    fn from_config(config: &Config, focus_token: Option<String>) -> io::Result<Self> {
+    fn from_config(config: &Config, focus_token: Option<String>) -> Self {
         let themes = crate::theme::available_themes(config.theme_catalog(), config.theme());
         let configured_theme = crate::theme::load_or_default(config.theme());
         let theme_index = themes
@@ -435,7 +434,7 @@ impl AppDefaults {
         let theme = themes
             .get(theme_index)
             .map_or(configured_theme, |(_, theme)| *theme);
-        Ok(Self {
+        Self {
             fit: config.fit_mode(),
             invert: config.dark_mode(),
             dark_mode_style: DarkModeStyle::new(
@@ -454,11 +453,10 @@ impl AppDefaults {
             forward_socket: config.forward_socket().map(str::to_owned),
             focus_token,
             viewer: config.viewer.clone(),
-            flash_font: crate::screenshot::FlashFont::load(&config.viewer.flash_label_font)?,
             theme,
             themes,
             theme_index,
-        })
+        }
     }
 }
 
@@ -938,7 +936,7 @@ impl App {
             label_request_id: 1,
             label_matches: Vec::new(),
             label_overlay_id: None,
-            flash_font: defaults.flash_font,
+            flash_font: None,
             label_overlay: None,
             viewer: defaults.viewer,
         }
@@ -1114,6 +1112,15 @@ impl App {
         output.flush()
     }
     fn begin_label_mode(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.flash_font.is_none() {
+            match crate::screenshot::FlashFont::load(&self.viewer.flash_label_font) {
+                Ok(font) => self.flash_font = Some(font),
+                Err(error) => {
+                    self.draw_status(output, self.viewport()?, &format!("jump labels: {error}"))?;
+                    return Ok(());
+                }
+            }
+        }
         self.worker.cancel_visible();
         self.clear_label_overlay(output)?;
         self.label_query = Some(String::new());
@@ -1483,6 +1490,9 @@ impl App {
 
     fn draw_label_overlay(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         self.clear_label_overlay(output)?;
+        if self.label_matches.is_empty() {
+            return Ok(());
+        }
         let viewport = self.viewport()?;
         let mut rects = Vec::new();
         let mut badges = Vec::new();
@@ -1576,7 +1586,11 @@ impl App {
             }
             if let Some((word_x, x, rect_y)) = badge_position {
                 let glyph_size = badge_glyph_size(match_height);
-                let layout = self.flash_font.badge_layout(&labeled.label, glyph_size)?;
+                let layout = self
+                    .flash_font
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("jump-label font was not initialized"))?
+                    .badge_layout(&labeled.label, glyph_size)?;
                 let (badge_width, badge_height) = (layout.width, layout.height);
                 let x = if x.saturating_add(badge_width) > u32::from(viewport.pixel_width)
                     && word_x >= badge_width
@@ -1596,7 +1610,11 @@ impl App {
                 });
             }
         }
-        let rgba = crate::screenshot::overlay(&mut self.flash_font, viewport, &rects, &badges)?;
+        let font = self
+            .flash_font
+            .as_mut()
+            .ok_or_else(|| io::Error::other("jump-label font was not initialized"))?;
+        let rgba = crate::screenshot::overlay(font, viewport, &rects, &badges)?;
         let compressed = kitty::compress_rgba(&rgba)?;
         let id = self.next_image_id;
         self.next_image_id = id.wrapping_add(1).max(1);
@@ -7669,7 +7687,7 @@ mod tests {
         );
         assert!(worker.wait_until_ready().is_err());
         let config = toml::from_str("").unwrap();
-        let defaults = super::AppDefaults::from_config(&config, None).unwrap();
+        let defaults = super::AppDefaults::from_config(&config, None);
         let mut app = super::App::new(
             worker,
             2,

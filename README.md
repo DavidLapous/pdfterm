@@ -172,7 +172,9 @@ Badge glyphs scale with the matched text height (minimum 8 pixels for
 readability), use antialiased glyphs from `viewer.flash_label_font` (default
 `monospace`), and sit beside the final visible glyph. Set an installed family
 name such as `Menlo` to choose another face; `monospace` maps to Menlo on macOS
-and the installed generic monospace elsewhere. Unknown or unsupported fonts fail.
+and the installed generic monospace elsewhere. The font loads when `x` is first
+used. An unavailable or unsupported face rejects that action with an explicit
+error; ordinary viewing, inverse clicks, and screenshots remain available.
 
 This is a viewport search, not a document-wide scan: arrows and PageUp/PageDown
 scroll; `Ctrl-+` / `Ctrl--` zoom without leaving the mode; resizing, switching
