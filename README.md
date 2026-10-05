@@ -975,6 +975,29 @@ source words; equally good matches within the scope remain line only rather than
 favoring the occurrence nearest its end. For inline math, immediately adjacent
 literal prose also helps distinguish repeated expressions.
 
+For fragile Beamer frames, the job's reused `.vrb` file may contain only the last
+frame. Inverse search uses the clicked sheet's enclosing original input/line and
+generated-file participation, never that overwritten file's contents. Generated
+results remap even without a word hint. A nongenerated result may search the full
+fragile body only when the clicked point's most-specific containing SyncTeX
+horizontal box has generated descendants and the original frame identity agrees.
+Sheet-wide generated participation alone cannot distinguish body, heading, and
+footer. Without that proof, only a literal match on the raw reported line or
+independent document metadata can establish precision; read/geometry errors do
+not reopen the full-frame search.
+If a body glyph is reported at unrelated original-source metadata, positive
+point ownership allows the proven frame to supply an additional literal-word
+candidate when the raw source scope has no match. An unhinted original-source
+result stays coarse. Document metadata comes from the source map's main input,
+including builds with a separate output directory or job name.
+Point ownership honors the effective preamble and optional postprocessing
+transform, including compressed vertical coordinates. Conflicting box ownership
+and unsupported sheet-form transforms cannot establish body precision.
+
+Nonprinting reference/citation keys, link destinations, graphics arguments, and
+command-definition bodies cannot establish precise prose positions. Printed
+link text and captions remain eligible.
+
 Mathematical matching recognizes literal `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
 and common equation environments. It matches supported TeX commands to Unicode
 symbols and normalizes mathematical alphabet styles without lowercasing variables.

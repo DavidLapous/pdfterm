@@ -3,7 +3,13 @@ mod math;
 use crate::pdf::SearchRect;
 use crate::process::Operation;
 use serde::{Deserialize, Serialize};
-use std::{fs, io, os::unix::fs::MetadataExt, path::Path, process::Command};
+use std::{
+    fs,
+    io::{self, BufRead, BufReader, Read},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 /// Source coordinates: one-based line, zero-based UTF-8 byte offset;
@@ -426,25 +432,111 @@ pub fn resolve_inverse(
         .into_os_string()
         .into_string()
         .map_err(|_| io::Error::other("source path is not UTF-8"))?;
-    if let Some((context, offset)) = word {
+    let generated = Path::new(&target.file)
+        .extension()
+        .is_some_and(|ext| ext == "vrb")
+        && Path::new(&target.file).file_stem() == pdf.file_stem();
+    // A fragile-body hit can instead be reported at unrelated document
+    // metadata. Keep that raw coarse location, but allow the clicked sheet's
+    // original frame as a bounded literal-word refinement candidate.
+    let generated_path = if generated {
+        PathBuf::from(&target.file)
+    } else {
+        pdf.with_extension("vrb")
+    };
+    let source_map = (generated || word.is_some())
+        .then(|| read_source_map(&pdf, point, &generated_path, !generated, operation));
+    let mut remapped_source = None;
+    if generated && let Some(map) = &source_map {
+        match map
+            .as_ref()
+            .map_err(|error| error.to_string())
+            .and_then(|map| original_source_from_verbatim(map).map_err(|error| error.to_string()))
+        {
+            Ok((file, original, anchor)) => {
+                target.file = file;
+                target.line = anchor;
+                remapped_source = Some(original);
+            }
+            Err(error) => {
+                warning = Some(format!(
+                    "line-only navigation: original fragile frame unavailable: {error}"
+                ));
+            }
+        }
+    }
+    // The final .vrb may belong to a different frame. Never refine against it.
+    if let Some((context, offset)) = word
+        && (!generated || remapped_source.is_some())
+    {
         operation.check()?;
-        let source = read_source(Path::new(&target.file));
+        let source = remapped_source.map_or_else(|| read_source(Path::new(&target.file)), Ok);
         if let Err(error) = &source {
             warning = Some(format!(
                 "line-only navigation: source refinement unavailable: {error}"
             ));
         }
         if let Ok(mut source) = source {
-            if let Some((file, original, anchor)) =
-                original_source_from_verbatim(&pdf, Path::new(&target.file), &source, target.line)
+            // A fragile sheet also contains nongenerated headings and footers.
+            // Sheet-wide .vrb participation does not prove this point is body text.
+            let scope_proven = fragile_frame_range(&source, target.line).is_none_or(|frame| {
+                generated
+                    || source_map
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                        .is_some_and(|map| {
+                            map.generated_at_point
+                                && map.page_source.as_ref().is_some_and(|(path, line)| {
+                                    *line == frame.end as u32
+                                        && fs::canonicalize(path)
+                                            .is_ok_and(|path| path == Path::new(&target.file))
+                                })
+                        })
+            });
+            let mut location = if scope_proven {
+                source_word_location(&source, target.line, context, offset, radius)
+            } else {
+                source_word_location_in_range(
+                    &source,
+                    target.line,
+                    context,
+                    offset,
+                    target.line.saturating_sub(1) as usize..target.line as usize,
+                    false,
+                )
+            };
+            if location.is_none()
+                && !generated
+                && let Some(map) = source_map
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .filter(|map| map.generated_at_point && map.page_source.is_some())
             {
-                target.file = file;
-                target.line = anchor;
-                source = original;
+                match original_source_from_verbatim(map) {
+                    Ok((file, original, anchor)) => {
+                        if let Some(candidate) =
+                            source_word_location(&original, anchor, context, offset, radius)
+                        {
+                            target.file = file;
+                            target.line = anchor;
+                            source = original;
+                            location = Some(candidate);
+                        }
+                    }
+                    Err(error) => {
+                        warning = Some(format!(
+                            "line-only navigation: original fragile frame unavailable: {error}"
+                        ));
+                    }
+                }
             }
-            let mut location = source_word_location(&source, target.line, context, offset, radius);
-            if let Some((file, original, line, byte, score)) =
-                document_metadata_word_location(&pdf, context, offset)
+            if let Some(Err(error)) = &source_map {
+                warning = Some(format!("source-map refinement unavailable: {error}"));
+            }
+            if let Some((file, original, line, byte, score)) = source_map
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|map| document_metadata_word_location(&map.main, context, offset))
                 && (location.is_none()
                     || score >= 6
                         && metadata_beats_frame(
@@ -499,12 +591,19 @@ fn metadata_beats_frame(
         return true;
     };
     y_from_top >= page_height_pt / 2.0
-        && source_prose_scored_location(source, line, context, offset, frame, true)
-            .is_some_and(|(_, _, local_score)| metadata_score >= local_score)
+        && source_prose_scored_location(
+            source,
+            line,
+            context,
+            offset,
+            frame,
+            true,
+            &nonprinting_source_ranges(source),
+        )
+        .is_some_and(|(_, _, local_score)| metadata_score >= local_score)
 }
 
 fn read_source(path: &Path) -> io::Result<String> {
-    use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut bytes = Vec::new();
     let file = fs::OpenOptions::new()
@@ -523,61 +622,475 @@ fn read_source(path: &Path) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// A Beamer fragile frame is copied to a `.vrb` file. SyncTeX may name that
-/// generated file. Map it back only when distinct source lines agree on one
-/// line offset; otherwise keep the original SyncTeX result.
-fn original_source_from_verbatim(
+struct SourceMap {
+    main: PathBuf,
+    page_source: Option<(PathBuf, u32)>,
+    generated_at_point: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SourceBox {
+    bounds: [f64; 4],
+    generated: bool,
+}
+
+fn source_box_bounds(row: &str, position: [f64; 2]) -> io::Result<Option<[f64; 4]>> {
+    let parse = || {
+        let size = row.split(':').nth(2)?;
+        let mut size = size.split(',');
+        let [width, height, depth] = [size.next()?, size.next()?, size.next()?]
+            .map(|value| value.parse::<f64>().ok().filter(|value| value.is_finite()));
+        Some([position[0], position[1], width?, height?, depth?])
+    };
+    let [x, y, width, height, depth] =
+        parse().ok_or_else(|| io::Error::other("SyncTeX horizontal box has invalid geometry"))?;
+    Ok((width > 0.0 && height + depth > 0.0).then_some([x, y - height, x + width, y + depth]))
+}
+
+fn source_map_position(row: &str, last_v: &mut f64) -> io::Result<[f64; 2]> {
+    let position = row
+        .split(':')
+        .nth(1)
+        .and_then(|position| position.split_once(','))
+        .ok_or_else(|| io::Error::other("SyncTeX node has invalid position"))?;
+    let x = source_map_number(position.0)?;
+    let y = if position.1 == "=" {
+        *last_v
+    } else {
+        let y = source_map_number(position.1)?;
+        *last_v = y;
+        y
+    };
+    Ok([x, y])
+}
+
+fn generated_box_at_point(
+    boxes: &[SourceBox],
+    x: f64,
+    y: f64,
+    operation: &Operation,
+) -> io::Result<bool> {
+    let contains =
+        |a: [f64; 4], b: [f64; 4]| a[0] <= b[0] && a[1] <= b[1] && a[2] >= b[2] && a[3] >= b[3];
+    let mut nearest: Vec<SourceBox> = Vec::new();
+    for candidate in boxes {
+        operation.check()?;
+        if !contains(candidate.bounds, [x, y, x, y]) {
+            continue;
+        }
+        if let Some(equal) = nearest
+            .iter_mut()
+            .find(|old| old.bounds == candidate.bounds)
+        {
+            equal.generated &= candidate.generated;
+        } else if !nearest
+            .iter()
+            .any(|old| contains(candidate.bounds, old.bounds))
+        {
+            nearest.retain(|old| !contains(old.bounds, candidate.bounds));
+            nearest.push(*candidate);
+        }
+    }
+    // Conflicting nonnested overlaps and equal boxes with mixed ownership abstain.
+    Ok(nearest.len() == 1 && nearest[0].generated)
+}
+
+fn source_map_number(value: &str) -> io::Result<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| io::Error::other("SyncTeX transform has an invalid number"))
+}
+
+fn source_map_dimension(value: &str) -> io::Result<f64> {
+    let units = [
+        ("in", 72.27 * 65536.0),
+        ("cm", 72.27 * 65536.0 / 2.54),
+        ("mm", 72.27 * 65536.0 / 25.4),
+        ("pt", 65536.0),
+        ("bp", 72.27 / 72.0 * 65536.0),
+        ("pc", 12.0 * 65536.0),
+        ("sp", 1.0),
+        ("dd", 1238.0 / 1157.0 * 65536.0),
+        ("cc", 14856.0 / 1157.0 * 65536.0),
+        ("nd", 685.0 / 642.0 * 65536.0),
+        ("nc", 1370.0 / 107.0 * 65536.0),
+    ];
+    for (suffix, scale) in units {
+        if let Some(number) = value.trim().strip_suffix(suffix) {
+            return source_map_number(number).map(|number| number * scale);
+        }
+    }
+    source_map_number(value)
+}
+
+fn read_source_map(
     pdf: &Path,
+    point: InversePoint,
     generated: &Path,
-    contents: &str,
-    line: u32,
-) -> Option<(String, String, u32)> {
-    if generated.extension()? != "vrb" || generated.file_stem()? != pdf.file_stem()? {
-        return None;
+    geometry_required: bool,
+    operation: &Operation,
+) -> io::Result<SourceMap> {
+    let compressed = pdf.with_extension("synctex.gz");
+    match fs::File::open(&compressed) {
+        Ok(file) => source_map_from_reader(
+            BufReader::new(flate2::read::GzDecoder::new(file).take(128 * 1024 * 1024)),
+            pdf,
+            point,
+            generated,
+            geometry_required,
+            operation,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => source_map_from_reader(
+            BufReader::new(fs::File::open(pdf.with_extension("synctex"))?.take(128 * 1024 * 1024)),
+            pdf,
+            point,
+            generated,
+            geometry_required,
+            operation,
+        ),
+        Err(error) => Err(error),
     }
-    let original = fs::canonicalize(pdf.with_extension("tex")).ok()?;
-    let original_path = original.to_str()?.to_owned();
-    let source = read_source(&original).ok()?;
-    let mut unique = std::collections::HashMap::new();
-    for (index, row) in source.lines().enumerate() {
-        let row = row.trim();
-        if row.len() >= 24 {
-            unique
-                .entry(row)
-                .and_modify(|position| *position = None)
-                .or_insert(Some(index));
+}
+
+fn source_map_from_reader(
+    mut reader: impl BufRead,
+    pdf: &Path,
+    point: InversePoint,
+    generated: &Path,
+    geometry_required: bool,
+    operation: &Operation,
+) -> io::Result<SourceMap> {
+    let mut inputs = std::collections::HashMap::new();
+    let mut generated_tags = std::collections::HashSet::new();
+    let mut row = String::new();
+    let mut in_page = false;
+    let mut page_complete = false;
+    let mut origin = None;
+    let mut generated_on_page = false;
+    let mut stack: Vec<(u8, Option<[f64; 4]>, bool)> = Vec::new();
+    let mut boxes = Vec::new();
+    let mut unit = None;
+    let mut magnification = None;
+    let mut x_offset = None;
+    let mut y_offset = None;
+    let mut post_magnification = 1.0;
+    let mut post_x_offset = None;
+    let mut post_y_offset = None;
+    let mut post_scriptum = false;
+    let mut postamble = false;
+    let mut postamble_count = false;
+    let mut bytes_read = 0;
+    let mut last_v = -1.0;
+    loop {
+        operation.check()?;
+        row.clear();
+        let count = reader.read_line(&mut row)?;
+        bytes_read += count;
+        if bytes_read >= 128 * 1024 * 1024 {
+            return Err(io::Error::other("SyncTeX source map exceeds 128 MiB"));
+        }
+        if count == 0 {
+            break;
+        }
+        let row = row.trim_end();
+        if geometry_required && row == "Postamble:" {
+            postamble = true;
+        } else if geometry_required
+            && postamble
+            && let Some(value) = row.strip_prefix("Count:")
+        {
+            value
+                .parse::<u32>()
+                .map_err(|_| io::Error::other("SyncTeX postamble has invalid Count"))?;
+            postamble_count = true;
+        }
+        if geometry_required && row == "Post scriptum:" {
+            post_scriptum = true;
+        } else if geometry_required && let Some(value) = row.strip_prefix("Unit:") {
+            unit = Some(source_map_number(value)?);
+        } else if geometry_required && let Some(value) = row.strip_prefix("Magnification:") {
+            let value = source_map_number(value)?;
+            if post_scriptum {
+                post_magnification = value;
+            } else {
+                magnification = Some(value);
+            }
+        } else if geometry_required && let Some(value) = row.strip_prefix("X Offset:") {
+            if post_scriptum {
+                post_x_offset = Some(source_map_dimension(value)?);
+            } else {
+                x_offset = Some(source_map_number(value)?);
+            }
+        } else if geometry_required && let Some(value) = row.strip_prefix("Y Offset:") {
+            if post_scriptum {
+                post_y_offset = Some(source_map_dimension(value)?);
+            } else {
+                y_offset = Some(source_map_number(value)?);
+            }
+        }
+        // Compressed ",=" reuses the scanner's global last vertical value,
+        // including records from earlier sheets and form definitions.
+        let position = if geometry_required
+            && matches!(
+                row.as_bytes().first(),
+                Some(b'[' | b'(' | b'v' | b'h' | b'x' | b'k' | b'g' | b'r' | b'$' | b'f')
+            ) {
+            Some(source_map_position(row, &mut last_v)?)
+        } else {
+            None
+        };
+        if let Some(input) = row.strip_prefix("Input:") {
+            if let Some((tag, path)) = input.split_once(':')
+                && let Ok(tag) = tag.parse::<u32>()
+            {
+                let path = Path::new(path);
+                let path = if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    pdf.parent().unwrap_or(Path::new(".")).join(path)
+                };
+                // TeX can emit .vrb in the build cwd while the PDF is in a
+                // separate output directory. Jobname is the map identity;
+                // the final generated file is neither read nor trusted.
+                if path.file_name() == generated.file_name() {
+                    generated_tags.insert(tag);
+                }
+                inputs.insert(tag, path);
+            }
+        } else if let Some(page) = row.strip_prefix('{') {
+            in_page = page.parse::<u32>() == Ok(point.page);
+            if in_page && page_complete {
+                return Err(io::Error::other(
+                    "SyncTeX source map repeats the clicked sheet",
+                ));
+            }
+        } else if in_page && row.starts_with('}') {
+            if row[1..].parse::<u32>() != Ok(point.page) || !stack.is_empty() {
+                return Err(io::Error::other(
+                    "SyncTeX source map has mismatched sheet bounds",
+                ));
+            }
+            page_complete = true;
+            in_page = false;
+            if !geometry_required {
+                let main = inputs
+                    .get(&1)
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
+                let page_source = origin
+                    .filter(|_| generated_on_page)
+                    .and_then(|(tag, line)| inputs.remove(&tag).map(|path| (path, line)));
+                return Ok(SourceMap {
+                    main,
+                    page_source,
+                    generated_at_point: false,
+                });
+            }
+        } else if in_page {
+            if geometry_required && matches!(row.as_bytes().first(), Some(b'<' | b'>' | b'f')) {
+                return Err(io::Error::other(
+                    "SyncTeX fragile body ownership cannot resolve sheet form transforms",
+                ));
+            }
+            let link = row
+                .get(1..)
+                .and_then(|row| row.split_once(':'))
+                .and_then(|(link, _)| link.split_once(','))
+                .and_then(|(tag, rest)| {
+                    Some((
+                        tag.parse::<u32>().ok()?,
+                        rest.split(',').next()?.parse::<u32>().ok()?,
+                    ))
+                });
+            // Only the first box enclosing the whole sheet proves provenance.
+            if origin.is_none() {
+                if !matches!(row.as_bytes().first(), Some(b'[' | b'(')) || link.is_none() {
+                    return Err(io::Error::other(
+                        "SyncTeX sheet has no enclosing source box",
+                    ));
+                }
+                origin = link;
+            }
+            let generated_node = link.is_some_and(|(tag, _)| generated_tags.contains(&tag));
+            if geometry_required {
+                match row.as_bytes().first() {
+                    Some(kind @ (b'[' | b'(')) => {
+                        let bounds = if *kind == b'(' {
+                            source_box_bounds(
+                                row,
+                                position.ok_or_else(|| {
+                                    io::Error::other("SyncTeX horizontal box has no position")
+                                })?,
+                            )?
+                        } else {
+                            None
+                        };
+                        stack.push((*kind, bounds, generated_node));
+                    }
+                    Some(b']' | b')') => {
+                        let (kind, bounds, generated) = stack.pop().ok_or_else(|| {
+                            io::Error::other("SyncTeX sheet has an unmatched box close")
+                        })?;
+                        if (kind == b'(') != row.starts_with(')') {
+                            return Err(io::Error::other(
+                                "SyncTeX sheet has mismatched box bounds",
+                            ));
+                        }
+                        if let Some(bounds) = bounds {
+                            boxes.push(SourceBox { bounds, generated });
+                        }
+                        if let Some(parent) = stack.last_mut() {
+                            parent.2 |= generated;
+                        }
+                    }
+                    _ => {
+                        if generated_node && let Some(parent) = stack.last_mut() {
+                            parent.2 = true;
+                        }
+                    }
+                }
+            }
+            if matches!(
+                row.as_bytes().first(),
+                Some(b'[' | b'(' | b'v' | b'h' | b'k' | b'g' | b'x' | b'$' | b'r')
+            ) && let Some((tag, _)) = link
+            {
+                generated_on_page |= generated_tags.contains(&tag);
+            }
         }
     }
-    let mut offsets = std::collections::HashMap::<isize, usize>::new();
-    for (index, row) in contents.lines().enumerate() {
-        if let Some(Some(position)) = unique.get(row.trim()) {
-            *offsets
-                .entry(*position as isize - index as isize)
-                .or_default() += 1;
-        }
+    if !page_complete || !postamble_count {
+        return Err(io::Error::other("SyncTeX source map is incomplete"));
     }
-    let mut ranked: Vec<_> = offsets.into_iter().collect();
-    ranked.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
-    let (delta, count) = *ranked.first()?;
-    if count < 2 || ranked.get(1).is_some_and(|(_, next)| *next == count) {
-        return None;
+    // Match SyncTeX's effective preamble/Post scriptum transform. The offsets
+    // are not magnified; post offsets are dimensions in scaled TeX points.
+    let unit = unit
+        .filter(|unit| *unit > 0.0)
+        .ok_or_else(|| io::Error::other("SyncTeX source map has no positive Unit"))?;
+    let magnification = magnification
+        .filter(|magnification| *magnification > 0.0)
+        .ok_or_else(|| io::Error::other("SyncTeX source map has no positive Magnification"))?;
+    if post_magnification <= 0.0 {
+        return Err(io::Error::other(
+            "SyncTeX post magnification is not positive",
+        ));
     }
-    let anchor = line.checked_add_signed(delta as i32)?;
-    if anchor == 0 || anchor as usize > source.lines().count() {
-        return None;
+    let pre_unit = unit / 65781.76;
+    let visible_unit = pre_unit * magnification / 1000.0 * post_magnification;
+    let (x_offset, y_offset) = if let Some(x) = post_x_offset {
+        let y = post_y_offset
+            .ok_or_else(|| io::Error::other("SyncTeX post X Offset has no Y Offset"))?;
+        (x / 65781.76, y / 65781.76)
+    } else {
+        (
+            x_offset.ok_or_else(|| io::Error::other("SyncTeX source map has no X Offset"))?
+                * pre_unit,
+            y_offset.ok_or_else(|| io::Error::other("SyncTeX source map has no Y Offset"))?
+                * pre_unit,
+        )
+    };
+    if !visible_unit.is_finite()
+        || visible_unit <= 0.0
+        || !x_offset.is_finite()
+        || !y_offset.is_finite()
+    {
+        return Err(io::Error::other(
+            "SyncTeX effective transform is not finite",
+        ));
     }
-    Some((original_path, source, anchor))
+    let main = inputs
+        .get(&1)
+        .cloned()
+        .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
+    let page_source = origin
+        .filter(|_| generated_on_page)
+        .and_then(|(tag, line)| inputs.remove(&tag).map(|path| (path, line)));
+    let generated_at_point = generated_box_at_point(
+        &boxes,
+        (f64::from(point.x) - x_offset) / visible_unit,
+        (f64::from(point.y_from_top) - y_offset) / visible_unit,
+        operation,
+    )?;
+    Ok(SourceMap {
+        main,
+        page_source,
+        generated_at_point,
+    })
+}
+
+/// Beamer reopens the same .vrb for successive fragile frames. The clicked
+/// sheet's enclosing source-map box identifies the original frame; the final
+/// generated file's contents cannot establish that identity.
+fn original_source_from_verbatim(map: &SourceMap) -> io::Result<(String, String, u32)> {
+    let (original, line) = map.page_source.as_ref().ok_or_else(|| {
+        io::Error::other("clicked sheet has no original generated-file provenance")
+    })?;
+    let original = fs::canonicalize(original)?;
+    let source = read_source(&original)?;
+    fragile_frame_range(&source, *line)
+        .filter(|frame| *line == frame.end as u32)
+        .ok_or_else(|| {
+            io::Error::other("clicked sheet does not identify a fragile frame's closing line")
+        })?;
+    let file = original
+        .to_str()
+        .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
+        .to_owned();
+    Ok((file, source, *line))
+}
+
+fn fragile_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>> {
+    let frame = source_frame_range(source, line)?;
+    let row = source_line_text(source.lines().nth(frame.start)?);
+    let row_start: usize = source
+        .split_inclusive('\n')
+        .take(frame.start)
+        .map(str::len)
+        .sum();
+    let mut at = row
+        .match_indices("\\begin")
+        .filter(|(at, _)| {
+            row[..*at]
+                .bytes()
+                .rev()
+                .take_while(|ch| *ch == b'\\')
+                .count()
+                % 2
+                == 0
+        })
+        .find_map(|(at, _)| {
+            let (environment, end) = math::group(source, row_start + at + "\\begin".len())?;
+            (&source[environment] == "frame").then_some(end)
+        })?;
+    at = skip_source_space(source, at);
+    if source.as_bytes().get(at) == Some(&b'<') {
+        let end = source[at..].find('>')?;
+        at = skip_source_space(source, at + end + 1);
+    }
+    let end = optional_argument_end(source, at)?;
+    let options = &source[at + 1..end - 1];
+    options
+        .split(',')
+        .flat_map(str::lines)
+        .any(|option| {
+            let option = source_line_text(option).trim();
+            option == "fragile" || option.starts_with("fragile=")
+        })
+        .then_some(frame)
 }
 
 /// Title pages and running headers can be produced from declarations far
 /// outside SyncTeX's reported frame. Search only literal document metadata,
 /// including direct preamble inputs, and require neighboring PDF words.
 fn document_metadata_word_location(
-    pdf: &Path,
+    main: &Path,
     context: &str,
     offset: usize,
 ) -> Option<(String, String, u32, usize, isize)> {
-    let main = fs::canonicalize(pdf.with_extension("tex")).ok()?;
+    let main = fs::canonicalize(main).ok()?;
     let main_source = read_source(&main).ok()?;
     let mut files = vec![(main.clone(), main_source)];
     let inputs: Vec<_> = files[0]
@@ -608,6 +1121,7 @@ fn document_metadata_word_location(
     let mut best = None;
     let mut tied = false;
     for (file_index, (_, source)) in files.iter().enumerate() {
+        let hidden = nonprinting_source_ranges(source);
         let mut start = 0;
         for raw_row in source.split_inclusive('\n') {
             let row = raw_row.strip_suffix('\n').unwrap_or(raw_row);
@@ -625,9 +1139,15 @@ fn document_metadata_word_location(
                     .filter(|ch| *ch == b'\n')
                     .count();
                 let last = source[..end].bytes().filter(|ch| *ch == b'\n').count();
-                let Some((line, byte, score)) =
-                    source_prose_scored_location(source, 1, context, offset, first..last + 1, true)
-                else {
+                let Some((line, byte, score)) = source_prose_scored_location(
+                    source,
+                    1,
+                    context,
+                    offset,
+                    first..last + 1,
+                    true,
+                    &hidden,
+                ) else {
                     continue;
                 };
                 if score < 3 {
@@ -815,13 +1335,216 @@ fn source_word_location(
         line.saturating_sub(radius.saturating_add(1)) as usize
             ..(line as usize).saturating_add(radius as usize)
     });
-    let prose =
-        source_prose_scored_location(source, line, context, offset, lines.clone(), within_scope);
+    source_word_location_in_range(source, line, context, offset, lines, within_scope)
+}
+
+fn source_word_location_in_range(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    lines: std::ops::Range<usize>,
+    within_scope: bool,
+) -> Option<(u32, usize)> {
+    let hidden = nonprinting_source_ranges(source);
+    let prose = source_prose_scored_location(
+        source,
+        line,
+        context,
+        offset,
+        lines.clone(),
+        within_scope,
+        &hidden,
+    );
     math::source_location(source, line, lines, within_scope, context, offset, prose).and_then(
         |(row, byte)| {
+            if !hidden.is_empty() {
+                let absolute = source
+                    .split_inclusive('\n')
+                    .take(row as usize - 1)
+                    .map(str::len)
+                    .sum::<usize>()
+                    + byte;
+                if hidden.iter().any(|range| range.contains(&absolute)) {
+                    return None;
+                }
+            }
             ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
         },
     )
+}
+
+fn skip_source_space(source: &str, mut at: usize) -> usize {
+    loop {
+        at += source[at..].len() - source[at..].trim_start().len();
+        if source.as_bytes().get(at) != Some(&b'%') {
+            return at;
+        }
+        at += source[at..].find('\n').unwrap_or(source.len() - at);
+    }
+}
+
+fn optional_argument_end(source: &str, start: usize) -> Option<usize> {
+    let start = skip_source_space(source, start);
+    if source.as_bytes().get(start) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 1;
+    let mut at = start + 1;
+    while at < source.len() {
+        match source.as_bytes()[at] {
+            b'\\' => {
+                at += 1;
+                at += source[at..].chars().next().map_or(0, char::len_utf8);
+                continue;
+            }
+            b'%' => {
+                at += source[at..].find('\n').unwrap_or(source.len() - at);
+                continue;
+            }
+            b'{' => {
+                at = math::group(source, at)?.1;
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+        at += source[at..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+/// Only known nonprinting arguments are masked. This is not macro expansion;
+/// ordinary formatting/caption arguments and href display text remain literal.
+fn nonprinting_source_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while at < source.len() {
+        if source.as_bytes()[at] == b'%' {
+            at += source[at..].find('\n').unwrap_or(source.len() - at);
+        } else if source.as_bytes()[at] == b'\\' {
+            let start = at;
+            at += 1;
+            let end = at
+                + source[at..]
+                    .bytes()
+                    .take_while(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                    .count();
+            if end == at {
+                at += source[at..].chars().next().map_or(0, char::len_utf8);
+                continue;
+            }
+            let command = &source[at..end];
+            at = end + usize::from(source.as_bytes().get(end) == Some(&b'*'));
+            let definition = matches!(
+                command,
+                "newcommand"
+                    | "renewcommand"
+                    | "providecommand"
+                    | "DeclareRobustCommand"
+                    | "NewDocumentCommand"
+                    | "RenewDocumentCommand"
+                    | "ProvideDocumentCommand"
+                    | "DeclareDocumentCommand"
+                    | "newenvironment"
+                    | "renewenvironment"
+                    | "def"
+                    | "gdef"
+                    | "edef"
+                    | "xdef"
+            );
+            if definition {
+                if matches!(command, "def" | "gdef" | "edef" | "xdef") {
+                    while at < source.len() && source.as_bytes()[at] != b'{' {
+                        if source.as_bytes()[at] == b'\\' {
+                            at += 1;
+                            at += source[at..].chars().next().map_or(0, char::len_utf8);
+                        } else if source.as_bytes()[at] == b'%' {
+                            at = skip_source_space(source, at);
+                        } else {
+                            at += source[at..].chars().next().unwrap().len_utf8();
+                        }
+                    }
+                } else {
+                    at = skip_source_space(source, at);
+                    if let Some((_, end)) = math::group(source, at) {
+                        at = end;
+                    } else if source.as_bytes().get(at) == Some(&b'\\') {
+                        at += 1;
+                        at += source[at..]
+                            .bytes()
+                            .take_while(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                            .count();
+                    }
+                    while let Some(end) = optional_argument_end(source, at) {
+                        at = end;
+                    }
+                    if command.contains("Document") {
+                        let Some((_, end)) = math::group(source, skip_source_space(source, at))
+                        else {
+                            continue;
+                        };
+                        at = end;
+                    }
+                }
+                let Some((_, end)) = math::group(source, skip_source_space(source, at)) else {
+                    ranges.push(start..source.len());
+                    break;
+                };
+                at = end;
+                if command.ends_with("environment")
+                    && let Some((_, end)) = math::group(source, skip_source_space(source, at))
+                {
+                    at = end;
+                }
+                ranges.push(start..at);
+            } else if matches!(
+                command,
+                "label"
+                    | "ref"
+                    | "eqref"
+                    | "pageref"
+                    | "autoref"
+                    | "cref"
+                    | "Cref"
+                    | "cite"
+                    | "citep"
+                    | "citet"
+                    | "parencite"
+                    | "textcite"
+                    | "autocite"
+                    | "footcite"
+                    | "nocite"
+                    | "href"
+                    | "includegraphics"
+                    | "input"
+                    | "include"
+                    | "bibliography"
+                    | "addbibresource"
+            ) {
+                while let Some(end) = optional_argument_end(source, at) {
+                    at = end;
+                }
+                if let Some((body, end)) = math::group(source, skip_source_space(source, at)) {
+                    ranges.push(if command == "includegraphics" {
+                        start..end
+                    } else {
+                        body
+                    });
+                    at = end;
+                }
+            }
+        } else {
+            at += source[at..].chars().next().unwrap().len_utf8();
+        }
+    }
+    ranges
 }
 
 fn source_prose_scored_location(
@@ -831,6 +1554,7 @@ fn source_prose_scored_location(
     offset: usize,
     lines: std::ops::Range<usize>,
     within_frame: bool,
+    hidden: &[std::ops::Range<usize>],
 ) -> Option<(u32, usize, isize)> {
     let pdf = words(context);
     let selected = pdf
@@ -843,29 +1567,21 @@ fn source_prose_scored_location(
             .nth(lines.start)
             .is_some_and(|row| source_line_text(row).contains("\\begin{frame}"));
     let mut candidates = Vec::new();
-    for (index, text) in source.lines().enumerate().take(lines.end).skip(lines.start) {
-        let text = source_line_text(text);
-        let graphics: Vec<_> = text
-            .match_indices("\\includegraphics")
-            .filter_map(|(start, _)| {
-                let mut end = start + "\\includegraphics".len();
-                end += text[end..].len() - text[end..].trim_start().len();
-                if text[end..].starts_with('*') {
-                    end += 1;
+    let mut line_start = 0;
+    for (index, raw_row) in source.split_inclusive('\n').enumerate().take(lines.end) {
+        let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
+        if index >= lines.start {
+            for (byte, word) in words(text) {
+                if (byte == 0 || !text[..byte].ends_with('\\'))
+                    && !hidden
+                        .iter()
+                        .any(|range| range.contains(&(line_start + byte)))
+                {
+                    candidates.push((index as u32 + 1, byte, normalized_word(word)));
                 }
-                if text[end..].starts_with('[') {
-                    end += text[end..].find(']')? + 1;
-                }
-                math::group(text, end).map(|(_, end)| start..end)
-            })
-            .collect();
-        for (byte, word) in words(text) {
-            if (byte == 0 || !text[..byte].ends_with('\\'))
-                && !graphics.iter().any(|range| range.contains(&byte))
-            {
-                candidates.push((index as u32 + 1, byte, normalized_word(word)));
             }
         }
+        line_start += raw_row.len();
     }
     let mut best = None;
     let mut tied = false;
@@ -1025,8 +1741,16 @@ mod tests {
                       \\end{frame}";
         let context = "Let’s revisit this example\r\nOrdinary body words:";
         assert_eq!(
-            source_prose_scored_location(source, 6, context, 0, 0..6, true)
-                .map(|(row, byte, _)| (row, byte)),
+            source_prose_scored_location(
+                source,
+                6,
+                context,
+                0,
+                0..6,
+                true,
+                &nonprinting_source_ranges(source)
+            )
+            .map(|(row, byte, _)| (row, byte)),
             Some((1, 23))
         );
         assert_eq!(
@@ -1116,6 +1840,36 @@ mod tests {
     }
 
     #[test]
+    fn inverse_prose_excludes_nonprinting_keys_and_multiline_definitions() {
+        let source = "\\newcommand{\\Hidden}{\nZephyr\n}\n\
+                      \\Hidden\\label% keep key on the next line\n{Zephyr}\n\
+                      \\cite[PrintedNote]{Zephyr}\\ref{Zephyr}\\href{Zephyr}{DisplayAmber}\n\
+                      \\newcommand{\\Unused}{Zephyr} éé PrintedCopper\n";
+        assert_eq!(source_word_location(source, 5, "Zephyr", 0, 10), None);
+        for (word, row) in [
+            ("PrintedNote", 6),
+            ("DisplayAmber", 6),
+            ("PrintedCopper", 7),
+        ] {
+            let byte = source.lines().nth(row - 1).unwrap().find(word).unwrap();
+            assert_eq!(
+                source_word_location(source, row as u32, word, 0, 10),
+                Some((row as u32, byte))
+            );
+        }
+        let source = "\\def\\Hidden#1{Zephyr {NestedKey}} PrintedCopper\n";
+        for word in ["Zephyr", "NestedKey"] {
+            assert_eq!(source_word_location(source, 1, word, 0, 4), None);
+        }
+        assert_eq!(
+            source_word_location(source, 1, "PrintedCopper", 0, 4),
+            Some((1, source.find("PrintedCopper").unwrap()))
+        );
+        let source = "\\newcommand{\\Hidden}{$Zephyr$}\n\\Hidden\\label{Zephyr}\n";
+        assert_eq!(source_word_location(source, 2, "Zephyr", 0, 4), None);
+    }
+
+    #[test]
     fn inverse_repeated_prose_uses_words_past_adjacent_math() {
         let source = "\\begin{frame}{Example}\n\
                       \\item the \\blue{$X_i$}s are random variables in $\\mathcal{X}$, a space of inputs,\n\
@@ -1195,41 +1949,168 @@ mod tests {
     }
 
     #[test]
-    fn inverse_generated_verbatim_maps_to_original_only_with_unique_alignment() {
+    fn inverse_generated_verbatim_uses_clicked_sheet_original_frame() {
         let directory = tempfile::tempdir().unwrap();
-        let pdf = directory.path().join("slides.pdf");
-        let source = "\\begin{frame}[fragile]{A title}\n\
-                      Distinct first sentence in the original frame.\n\
-                      Distinct second sentence in the original frame.\n\
-                      \\end{frame}\n";
-        fs::write(pdf.with_extension("tex"), source).unwrap();
-        let generated = directory.path().join("build/slides.vrb");
-        fs::create_dir(generated.parent().unwrap()).unwrap();
-        let contents = "\\frametitle{A title}\n\
-                        Distinct first sentence in the original frame.\n\
-                        Distinct second sentence in the original frame.\n";
-        assert_eq!(
-            original_source_from_verbatim(&pdf, &generated, contents, 2),
-            Some((
-                fs::canonicalize(pdf.with_extension("tex"))
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned(),
-                source.to_owned(),
-                2
-            ))
+        let source_path = directory.path().join("original.tex");
+        let source = "\\begin {frame}\n[fragile]{First}\nEarlyZephyr.\nFirstCopper.\n\\end{frame}\n\
+                      \\begin{frame}[fragile]{Second}\nLateNebula.\nSecondSilver.\n\\end{frame}\n";
+        fs::write(&source_path, source).unwrap();
+        let pdf = directory.path().join("build/deck.pdf");
+        let generated = directory.path().join("build/deck.vrb");
+        let contents = format!(
+            "SyncTeX Version:1\nInput:1:{}\nInput:2:{}\n\
+             Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
+             {{1\n[1,5:0,0:1,1,0\nx2,2:0,0\n]\n}}1\n\
+             Input:3:{}\n{{2\n[1,9:0,0:1,1,0\nx3,2:0,0\n]\n}}2\n\
+             Postamble:\nCount:8\nPost scriptum:\n",
+            source_path.display(),
+            generated.display(),
+            generated.display()
         );
-        assert!(
-            original_source_from_verbatim(&pdf, &generated, contents.lines().next().unwrap(), 1)
-                .is_none()
-        );
+        for (page, anchor) in [(1, 5), (2, 9)] {
+            let map = source_map_from_reader(
+                contents.as_bytes(),
+                &pdf,
+                InversePoint {
+                    page,
+                    x: 0.0,
+                    y_from_top: 0.0,
+                    page_height_pt: 1.0,
+                },
+                &generated,
+                false,
+                &Operation::default(),
+            )
+            .unwrap();
+            let remapped = original_source_from_verbatim(&map).unwrap();
+            assert_eq!(
+                remapped.0,
+                fs::canonicalize(&source_path).unwrap().to_str().unwrap()
+            );
+            assert_eq!(remapped.1, source);
+            assert_eq!(remapped.2, anchor);
+        }
+        let missing = source_map_from_reader(
+            contents.as_bytes(),
+            &pdf,
+            InversePoint {
+                page: 1,
+                x: 0.0,
+                y_from_top: 0.0,
+                page_height_pt: 1.0,
+            },
+            Path::new("/unrelated.vrb"),
+            false,
+            &Operation::default(),
+        )
+        .unwrap();
+        assert!(original_source_from_verbatim(&missing).is_err());
+    }
+
+    #[test]
+    fn inverse_body_ownership_uses_specific_boxes_and_effective_transform() {
+        let sheet = "SyncTeX Version:1\nInput:1:/source.tex\nInput:2:/deck.vrb\n\
+                     Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+                     {2\n[1,18:0,100:100,100,0\n\
+                     (1,18:0,100:100,100,0\n(1,18:0,100:100,100,0\n)\n)\n\
+                     (1,18:10,20:30,10,0\nx2,2:20,20\n)\n\
+                     (1,18:70,90:20,10,0\nx1,18:80,90\n)\n\
+                     ]\n}2\nPostamble:\nCount:12\nPost scriptum:\n";
+        for (has_post_scriptum, post, magnification, x_offset, y_offset) in [
+            (true, "", 1.0, 0.0, 0.0),
+            (false, "", 1.0, 0.0, 0.0),
+            (
+                true,
+                "Magnification:2\nX Offset:10bp\nY Offset:20bp\n",
+                2.0,
+                10.0,
+                20.0,
+            ),
+        ] {
+            let header = if has_post_scriptum {
+                sheet
+            } else {
+                sheet.strip_suffix("Post scriptum:\n").unwrap()
+            };
+            let contents = format!("{header}{post}");
+            let compressed = contents
+                .replacen(
+                    "{2\n[1,18:0,100",
+                    "{1\n[1,1:0,200:100,200,0\nx1,1:0,100\n]\n}1\n{2\n[1,18:0,=",
+                    1,
+                )
+                .replace("(1,18:10,20:", "$1,18:0,20\n(1,18:10,=:");
+            for (contents, x, y, body) in [
+                (&contents, 20.0, 15.0, true),
+                (&contents, 80.0, 85.0, false),
+                (&contents, 50.0, 50.0, false),
+                (&compressed, 20.0, 15.0, true),
+            ] {
+                let map = source_map_from_reader(
+                    contents.as_bytes(),
+                    Path::new("/deck.pdf"),
+                    InversePoint {
+                        page: 2,
+                        x: (x * 65536.0 / 65781.76 * magnification + x_offset) as f32,
+                        y_from_top: (y * 65536.0 / 65781.76 * magnification + y_offset) as f32,
+                        page_height_pt: 200.0,
+                    },
+                    Path::new("/deck.vrb"),
+                    true,
+                    &Operation::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    map.generated_at_point, body,
+                    "post={post:?}, point=({x},{y})"
+                );
+            }
+        }
+        for contents in [
+            sheet.replace("Unit:65536\n", ""),
+            sheet.replace("(1,18:10,20:30,10,0", "(1,18:invalid"),
+            sheet.replace("Count:12\n", ""),
+        ] {
+            assert!(
+                source_map_from_reader(
+                    contents.as_bytes(),
+                    Path::new("/deck.pdf"),
+                    InversePoint {
+                        page: 2,
+                        x: 20.0,
+                        y_from_top: 15.0,
+                        page_height_pt: 200.0
+                    },
+                    Path::new("/deck.vrb"),
+                    true,
+                    &Operation::default(),
+                )
+                .is_err()
+            );
+        }
+        let operation = Operation::default();
+        let generated = SourceBox {
+            bounds: [0.0, 0.0, 20.0, 20.0],
+            generated: true,
+        };
+        for other in [
+            SourceBox {
+                bounds: generated.bounds,
+                generated: false,
+            },
+            SourceBox {
+                bounds: [10.0, 0.0, 30.0, 20.0],
+                generated: false,
+            },
+        ] {
+            assert!(!generated_box_at_point(&[generated, other], 15.0, 15.0, &operation).unwrap());
+        }
     }
 
     #[test]
     fn inverse_document_metadata_resolves_title_and_direct_input() {
         let directory = tempfile::tempdir().unwrap();
-        let pdf = directory.path().join("slides.pdf");
+        let main_path = directory.path().join("original.tex");
         let main = "\\input{preamble.tex}\n\
                     \\title{Example Report and Results}\n\
                     \\author{Ada Example}\n\
@@ -1237,32 +2118,35 @@ mod tests {
                     \\begin{frame}{Other title}\n\
                     Body text.\n\
                     \\end{frame}\n";
-        fs::write(pdf.with_extension("tex"), main).unwrap();
+        fs::write(&main_path, main).unwrap();
         fs::write(
             directory.path().join("preamble.tex"),
             "\\institute{North Research Center\\\\\nExample School for Mathematics}\n",
         )
         .unwrap();
-        let found =
-            document_metadata_word_location(&pdf, "Example Report and Results", "Example ".len())
-                .unwrap();
+        let found = document_metadata_word_location(
+            &main_path,
+            "Example Report and Results",
+            "Example ".len(),
+        )
+        .unwrap();
         assert_eq!((found.2, found.3), (2, 15));
         assert!(found.4 >= 6);
         let found = document_metadata_word_location(
-            &pdf,
+            &main_path,
             "North Research Center\r\nExample School for Mathematics",
             "North Research Center\r\nExample School for ".len(),
         )
         .unwrap();
         assert!(found.0.ends_with("preamble.tex"));
         assert_eq!((found.2, found.3), (2, 19));
-        assert!(document_metadata_word_location(&pdf, "Report", 0).is_none());
+        assert!(document_metadata_word_location(&main_path, "Report", 0).is_none());
     }
 
     #[test]
     fn inverse_metadata_preserves_crlf_and_unicode_byte_offsets() {
         let directory = tempfile::tempdir().unwrap();
-        let pdf = directory.path().join("slides.pdf");
+        let main_path = directory.path().join("original.tex");
         let declaration = "\\newcommand{\\unused}{éééé}\\title{Example Report}";
         for newline in ["\n", "\r\n"] {
             let mut source = format!("\\documentclass{{beamer}}{newline}");
@@ -1270,8 +2154,8 @@ mod tests {
                 source.push_str(&format!("% padding{newline}"));
             }
             source.push_str(declaration);
-            fs::write(pdf.with_extension("tex"), &source).unwrap();
-            let found = document_metadata_word_location(&pdf, "Example Report", 8).unwrap();
+            fs::write(&main_path, &source).unwrap();
+            let found = document_metadata_word_location(&main_path, "Example Report", 8).unwrap();
             assert_eq!((found.2, found.3), (9, declaration.find("Report").unwrap()));
         }
     }
@@ -1279,17 +2163,17 @@ mod tests {
     #[test]
     fn inverse_frame_title_beats_same_words_in_document_title() {
         let directory = tempfile::tempdir().unwrap();
-        let pdf = directory.path().join("slides.pdf");
+        let main_path = directory.path().join("original.tex");
         let source = "\\title{Persistent Homology and Applications in Topological Data Analysis}\n\
                       \\begin{document}\n\
                       \\begin{frame}{Topological Data Analysis}{Cell cycle TDA application}\n\
                       \\begin{figure}\\includegraphics{cycle.png}\\end{figure}\n\
                       \\end{frame}\n";
-        fs::write(pdf.with_extension("tex"), source).unwrap();
+        fs::write(&main_path, source).unwrap();
         let title = "Topological Data Analysis\nCell cycle TDA application\n\
                      Persistent Homology and Applications in Topological Data Analysis";
         let title_offset = title.find("Data").unwrap();
-        let metadata_score = document_metadata_word_location(&pdf, title, title_offset)
+        let metadata_score = document_metadata_word_location(&main_path, title, title_offset)
             .unwrap()
             .4;
         assert!(metadata_score >= 6);
@@ -1309,7 +2193,7 @@ mod tests {
         let footer = "Topological Data Analysis\nCell cycle TDA application\n\
                       Persistent Homology and Applications in Topological Data Analysis";
         let footer_offset = footer.rfind("Data").unwrap();
-        let footer_score = document_metadata_word_location(&pdf, footer, footer_offset)
+        let footer_score = document_metadata_word_location(&main_path, footer, footer_offset)
             .unwrap()
             .4;
         assert!(metadata_beats_frame(
@@ -1326,21 +2210,29 @@ mod tests {
     #[test]
     fn inverse_identical_running_title_uses_click_height_for_tie() {
         let directory = tempfile::tempdir().unwrap();
-        let pdf = directory.path().join("slides.pdf");
+        let main_path = directory.path().join("original.tex");
         let source = "\\title{Topological Data Analysis}\n\
                       \\begin{frame}{Topological Data Analysis}\n\
                       \\end{frame}\n";
-        fs::write(pdf.with_extension("tex"), source).unwrap();
+        fs::write(&main_path, source).unwrap();
         let context = "Topological Data Analysis";
         let offset = context.find("Data").unwrap();
-        let metadata_score = document_metadata_word_location(&pdf, context, offset)
+        let metadata_score = document_metadata_word_location(&main_path, context, offset)
             .unwrap()
             .4;
         assert_eq!(
             metadata_score,
-            source_prose_scored_location(source, 3, context, offset, 1..3, true)
-                .unwrap()
-                .2
+            source_prose_scored_location(
+                source,
+                3,
+                context,
+                offset,
+                1..3,
+                true,
+                &nonprinting_source_ranges(source)
+            )
+            .unwrap()
+            .2
         );
         assert!(!metadata_beats_frame(
             source,
