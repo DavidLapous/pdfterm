@@ -72,6 +72,9 @@ captures only pages already visible in the viewer, not the full document or a
 terminal/compositor screenshot; the viewer must be running with its forward
 socket available. Requests fail while a search/link picker is open or a newly
 selected render is still pending; retry after the current PDF frame appears.
+In continuous view, the logical scroll anchor can lie between pages. The capture
+uses the actual submitted neighboring page images and their crops, not an
+offscreen anchor page. Missing or stale visible frames fail explicitly.
 
 ### Keys
 
@@ -202,6 +205,9 @@ place the PDF above the links. Links are indexed incrementally behind foreground
 page rendering and grouped by document section and source page when the PDF has
 an outline, with source-page-only headings as a fallback. The
 split repositions Kitty's retained page image without rerendering or retransmitting it.
+Opening a picker from an inter-page gap uses the displayed neighbor's geometry
+and source-page selection. Scaled preview clicks map to that same image; neutral
+closing restores the original gap position.
 In the browser, use `j`/`k`, arrows, or type an entry number to preview that
 link's source location and highlight its annotation in the PDF; rapid selection changes are debounced to
 avoid redundant rendering. Click a row to select it, or press `Enter` to follow

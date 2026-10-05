@@ -340,7 +340,8 @@ struct App {
     generation: u64,
     desired_key: Option<RenderKey>,
     pending: HashSet<RenderKey>,
-    visible_image_id: Option<u32>,
+    visible_page: Option<VisiblePage>,
+    submitted_key: Option<RenderKey>,
     visible_pages: Vec<VisiblePage>,
     missing_visible_page: Option<RenderKey>,
     pending_scale: Option<(RenderKey, FitMode, u16)>,
@@ -788,6 +789,7 @@ fn search_target_page(
     .map(|result| result.page)
 }
 
+#[derive(Clone)]
 struct VisiblePage {
     frame: Arc<Frame>,
     placement: ImagePlacement,
@@ -893,7 +895,8 @@ impl App {
             generation: 0,
             desired_key: None,
             pending: HashSet::new(),
-            visible_image_id: None,
+            visible_page: None,
+            submitted_key: None,
             visible_pages: Vec::new(),
             missing_visible_page: None,
             pending_scale: None,
@@ -1185,7 +1188,7 @@ impl App {
                     self.label_input.clear();
                     self.label_matches.clear();
                     self.clear_label_overlay(output)?;
-                    self.begin_inverse_at(target.0, target.1, output)?;
+                    self.begin_inverse_at(target.0, target.1, self.viewport()?, output)?;
                 } else if self
                     .label_matches
                     .iter()
@@ -2146,53 +2149,7 @@ impl App {
         let viewport = self
             .viewport()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let current_key = self.render_key(viewport);
-        let revision = self.tab().revision;
-        if self.missing_visible_page.is_some() {
-            return Err(io::Error::other(
-                "viewer frame is still rendering; retry the screenshot",
-            ));
-        }
-        let mut pages = self
-            .visible_pages
-            .iter()
-            .filter(|page| {
-                page.frame.revision.pdf == revision && same_render_view(page.frame.key, current_key)
-            })
-            .map(|page| ScreenshotPage {
-                frame: &page.frame,
-                placement: page.placement,
-                row: page.top.saturating_sub(viewport.top),
-            })
-            .collect::<Vec<_>>();
-        if !pages.is_empty() && !pages.iter().any(|page| page.frame.key == current_key) {
-            return Err(io::Error::other(
-                "viewer frame is still rendering; retry the screenshot",
-            ));
-        }
-        if pages.is_empty()
-            && let Some(frame) = self
-                .tab()
-                .cache
-                .get(&current_key)
-                .filter(|frame| frame.revision.pdf == revision)
-        {
-            pages.push(ScreenshotPage {
-                frame,
-                placement: viewport.place(
-                    frame.width,
-                    frame.height,
-                    self.tab().scroll_x,
-                    self.tab().scroll_y,
-                ),
-                row: 0,
-            });
-        }
-        if pages.is_empty() {
-            return Err(io::Error::other(
-                "viewer frame is still rendering; retry the screenshot",
-            ));
-        }
+        let pages = self.screenshot_pages(viewport)?;
         let empty_overlay;
         let overlay = if let Some(overlay) = self.label_overlay.as_deref() {
             overlay
@@ -2207,6 +2164,59 @@ impl App {
             overlay,
             terminal_color_rgb(self.theme.bg),
         )
+    }
+
+    fn current_visible_page(&self, viewport: Viewport) -> Option<&VisiblePage> {
+        let page = self.visible_page.as_ref()?;
+        (self.canvas_viewport == Some(viewport)
+            && self.submitted_key == Some(self.render_key(viewport))
+            && page.frame.revision.pdf == self.tab().revision
+            && same_render_view(page.frame.key, self.render_key(viewport)))
+        .then_some(page)
+    }
+
+    fn picker_image(&self, viewport: Viewport) -> Option<LinkPickerImage> {
+        let page = self.current_visible_page(viewport)?;
+        let mut image = LinkPickerImage::new(page.image_id, &page.frame, page.placement, viewport);
+        image.original.top = page.top;
+        Some(image)
+    }
+
+    fn screenshot_pages(&self, viewport: Viewport) -> io::Result<Vec<ScreenshotPage<'_>>> {
+        let unavailable =
+            || io::Error::other("viewer frame is still rendering; retry the screenshot");
+        if self.missing_visible_page.is_some()
+            || self.canvas_viewport != Some(viewport)
+            || self.submitted_key != Some(self.render_key(viewport))
+        {
+            return Err(unavailable());
+        }
+        let mut pages = Vec::new();
+        if self.visible_pages.is_empty() {
+            let page = self
+                .current_visible_page(viewport)
+                .ok_or_else(unavailable)?;
+            pages.push(ScreenshotPage {
+                frame: &page.frame,
+                placement: page.placement,
+                row: page.top.saturating_sub(viewport.top),
+            });
+        } else {
+            let current_key = self.render_key(viewport);
+            for page in &self.visible_pages {
+                if page.frame.revision.pdf != self.tab().revision
+                    || !same_render_view(page.frame.key, current_key)
+                {
+                    return Err(unavailable());
+                }
+                pages.push(ScreenshotPage {
+                    frame: &page.frame,
+                    placement: page.placement,
+                    row: page.top.saturating_sub(viewport.top),
+                });
+            }
+        }
+        Ok(pages)
     }
 
     fn finish_forward(&mut self, error: Option<String>) {
@@ -2621,22 +2631,21 @@ impl App {
         }
         self.start_link_index();
         let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
-        let Some(frame) = self.tab().cache.get(&key).cloned() else {
-            self.draw_status(output, viewport, "links are still rendering")?;
-            return Ok(());
-        };
-        let Some(image_id) = self.visible_image_id else {
+        let Some(image) = self.picker_image(viewport) else {
             self.draw_status(output, viewport, "page is still rendering")?;
             return Ok(());
         };
+        let page = self
+            .visible_page
+            .as_ref()
+            .expect("picker has a visible image")
+            .frame
+            .key
+            .page;
         self.retain_primary_image(output)?;
-        let tab = self.tab();
-        let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
-        let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
 
         self.pending_link_picker_open = false;
-        self.link_picker = Some(LinkPickerState::new(self.tab().page));
+        self.link_picker = Some(LinkPickerState::new(page));
         show_link_picker_split(
             output,
             link_picker_area(viewport),
@@ -2656,8 +2665,7 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
-        if !self.tab().cache.contains_key(&key) || self.visible_image_id.is_none() {
+        if self.picker_image(viewport).is_none() {
             return Ok(());
         }
         self.open_link_picker(output)
@@ -2668,7 +2676,9 @@ impl App {
             return Ok(());
         };
         let viewport = self.viewport()?;
-        let page = self.tab().page;
+        let page = self
+            .current_visible_page(viewport)
+            .map_or(self.tab().page, |page| page.frame.key.page);
         let links = self.tab().link_index.links.clone();
         let outline = Arc::clone(&self.tab().outline);
         let progress = LinkIndexProgress::from(&self.tab().link_index);
@@ -2707,9 +2717,7 @@ impl App {
         let viewport = self.viewport()?;
         let area = link_picker_area(viewport);
         let previous = self.link_picker_geometry;
-        let key = self.render_key(viewport);
-        let frame = self.tab().cache.get(&key).cloned();
-        let image_id = self.visible_image_id;
+        let image = self.picker_image(viewport);
         self.link_picker_geometry.layout = layout;
         if layout == LinkPickerLayout::Floating
             && let Some(state) = &mut self.link_picker
@@ -2721,10 +2729,7 @@ impl App {
         {
             state.focus = LinkPickerFocus::Links;
         }
-        if let (Some(frame), Some(image_id)) = (frame, image_id) {
-            let tab = self.tab();
-            let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
-            let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
+        if let Some(image) = image {
             restore_link_picker_split(output, area, image, previous, self.theme)?;
             show_link_picker_split(output, area, image, self.link_picker_geometry, self.theme)?;
             self.redraw_active_side_picker(output)
@@ -2783,13 +2788,7 @@ impl App {
         }
         self.retain_primary_image(output)?;
         let viewport = self.viewport()?;
-        let key = self.render_key(viewport);
-        let frame = self.tab().cache.get(&key).cloned();
-        let image_id = self.visible_image_id;
-        if let (Some(frame), Some(image_id)) = (frame, image_id) {
-            let tab = self.tab();
-            let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
-            let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
+        if let Some(image) = self.picker_image(viewport) {
             show_link_picker_split(
                 output,
                 link_picker_area(viewport),
@@ -2809,7 +2808,9 @@ impl App {
             return Ok(());
         };
         let viewport = self.viewport()?;
-        let page = self.tab().page;
+        let page = self
+            .current_visible_page(viewport)
+            .map_or(self.tab().page, |page| page.frame.key.page);
         let search = self.tab().search.clone();
         let outline = Arc::clone(&self.tab().outline);
         let state = self.search_picker.as_mut().expect("search picker state");
@@ -2996,7 +2997,9 @@ impl App {
         let viewport = self.viewport()?;
         let links = self.tab().link_index.links.clone();
         let indexing = self.tab().link_index.indexing;
-        let page = self.tab().page;
+        let page = self
+            .current_visible_page(viewport)
+            .map_or(self.tab().page, |page| page.frame.key.page);
         let visible_height =
             link_picker_visible_height(link_picker_area(viewport), self.link_picker_geometry);
         let state = self.link_picker.as_mut().expect("link picker state");
@@ -3783,9 +3786,6 @@ impl App {
         let key = frame.key;
         self.pending.remove(&key);
         let frame = Arc::new(frame);
-        let Some(index) = self.tab_index(key.document_id) else {
-            return Ok(());
-        };
         let current_page = self.session.tabs[index].page;
         // Keep one on-demand neighbor even with prefetch disabled: continuous
         // scrolling may need its dimensions before it becomes visible.
@@ -3911,7 +3911,7 @@ impl App {
 
     fn draw_frame(
         &mut self,
-        frame: &Frame,
+        frame: &Arc<Frame>,
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
@@ -3987,7 +3987,7 @@ impl App {
 
     fn draw_frame_unsynchronized(
         &mut self,
-        frame: &Frame,
+        frame: &Arc<Frame>,
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
@@ -4056,9 +4056,15 @@ impl App {
             positioned.placement,
         )?;
         let transfer_elapsed = transfer_started.elapsed();
-        if let Some(previous) = self.visible_image_id.replace(image_id) {
-            kitty::delete_image(output, previous)?;
+        if let Some(previous) = self.visible_page.replace(VisiblePage {
+            frame: Arc::clone(frame),
+            placement,
+            top: viewport.top,
+            image_id,
+        }) {
+            kitty::delete_image(output, previous.image_id)?;
         }
+        self.submitted_key = Some(frame.key);
         let snapshot = PerformanceSnapshot {
             render_ms: frame.render_elapsed.as_millis(),
             dark_mode_ms: frame.dark_mode_elapsed.map(|elapsed| elapsed.as_millis()),
@@ -4111,7 +4117,7 @@ impl App {
 
     fn retain_primary_image(&mut self, output: &mut impl Write) -> io::Result<()> {
         for page in self.visible_pages.drain(..) {
-            if Some(page.image_id) != self.visible_image_id {
+            if Some(page.image_id) != self.visible_page.as_ref().map(|page| page.image_id) {
                 kitty::delete_image(output, page.image_id)?;
             }
         }
@@ -4120,7 +4126,7 @@ impl App {
 
     fn draw_continuous(
         &mut self,
-        frame: &Frame,
+        frame: &Arc<Frame>,
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
@@ -4137,9 +4143,9 @@ impl App {
         self.tab_mut().scroll_y = self.tab().scroll_y.min(max_y);
         let old_pages = std::mem::take(&mut self.visible_pages);
         if old_pages.is_empty()
-            && let Some(id) = self.visible_image_id.take()
+            && let Some(previous) = self.visible_page.take()
         {
-            kitty::delete_image(output, id)?;
+            kitty::delete_image(output, previous.image_id)?;
         }
         // Kitty (image id, p=1) replaces the old placement, including its crop.
         // Only text/UI or geometry changes require clearing the canvas.
@@ -4244,7 +4250,8 @@ impl App {
                 kitty::delete_image(output, old.image_id)?;
             }
         }
-        self.visible_image_id = self.visible_pages.first().map(|page| page.image_id);
+        self.visible_page = self.visible_pages.first().cloned();
+        self.submitted_key = Some(frame.key);
         let snapshot = PerformanceSnapshot {
             render_ms: frame.render_elapsed.as_millis(),
             dark_mode_ms: frame.dark_mode_elapsed.map(|elapsed| elapsed.as_millis()),
@@ -4283,19 +4290,16 @@ impl App {
                 })
                 .map(|page| (Arc::clone(&page.frame), page.placement, page.top));
         }
-        let frame = self.tab().cache.get(&self.render_key(viewport))?.clone();
-        let placement = viewport.place(
-            frame.width,
-            frame.height,
-            self.tab().scroll_x,
-            self.tab().scroll_y,
-        );
-        if self.link_picker.is_none() && self.search_picker.is_none() {
-            return Some((frame, placement, viewport.top));
+        let page = self.current_visible_page(viewport)?;
+        let frame = Arc::clone(&page.frame);
+        if (self.link_picker.is_none() && self.search_picker.is_none())
+            || self.link_picker_geometry.layout == LinkPickerLayout::Floating
+        {
+            return Some((frame, page.placement, page.top));
         }
         let (preview, _) = link_picker_panes(link_picker_area(viewport), self.link_picker_geometry);
         let positioned = position_link_picker_image(
-            LinkPickerImage::new(self.visible_image_id?, &frame, placement, viewport),
+            self.picker_image(viewport)?,
             preview,
             self.link_picker_geometry.layout,
         );
@@ -4305,8 +4309,10 @@ impl App {
                 left: positioned.left,
                 columns: positioned.placement.columns,
                 rows: positioned.placement.rows,
+                offset_y: 0,
+                native_cell: None,
                 crop: positioned.placement.crop,
-                ..placement
+                ..page.placement
             },
             positioned.top,
         ))
@@ -4422,7 +4428,8 @@ impl App {
     fn clear_viewer(&mut self, output: &mut impl Write) -> io::Result<()> {
         let theme = self.theme;
         kitty::delete_all(output)?;
-        self.visible_image_id = None;
+        self.visible_page = None;
+        self.submitted_key = None;
         self.visible_pages.clear();
         self.missing_visible_page = None;
         self.canvas_viewport = None;
@@ -4552,26 +4559,24 @@ impl App {
         };
         let pixel_x = cell.x + cell.width / 2;
         let pixel_y = cell.y + cell.height / 2;
-        self.begin_inverse_at(key, (pixel_x, pixel_y), output)
+        self.begin_inverse_at(key, (pixel_x, pixel_y), viewport, output)
     }
     fn begin_inverse_at(
         &mut self,
         key: RenderKey,
         pixel: (u32, u32),
+        viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let frame = self
-            .visible_pages
-            .iter()
-            .find(|page| page.frame.key == key)
+            .visible_page
+            .as_ref()
+            .filter(|page| page.frame.key == key)
+            .or_else(|| self.visible_pages.iter().find(|page| page.frame.key == key))
             .map(|page| Arc::clone(&page.frame))
             .or_else(|| self.tab().cache.get(&key).cloned());
         let Some(frame) = frame else {
-            self.draw_status(
-                output,
-                self.viewport()?,
-                "label target is no longer visible",
-            )?;
+            self.draw_status(output, viewport, "label target is no longer visible")?;
             return Ok(());
         };
         let request_id = self.navigation.next_request_id;
@@ -4586,11 +4591,7 @@ impl App {
         });
         self.worker
             .page_point(frame.revision, request_id, pixel.0, pixel.1, key);
-        self.draw_status(
-            output,
-            self.viewport()?,
-            "inverse search: resolving location...",
-        )?;
+        self.draw_status(output, viewport, "inverse search: resolving location...")?;
         Ok(())
     }
 
@@ -5381,9 +5382,17 @@ impl LinkPickerImage {
                 top: viewport.top,
                 placement: Placement {
                     image_id,
-                    columns: placement.columns,
-                    rows: placement.rows,
-                    offset_y: 0,
+                    columns: if placement.native_cell.is_some() {
+                        0
+                    } else {
+                        placement.columns
+                    },
+                    rows: if placement.native_cell.is_some() {
+                        0
+                    } else {
+                        placement.rows
+                    },
+                    offset_y: placement.offset_y,
                     z_index: PAGE_IMAGE_Z_INDEX,
                     crop: placement.crop,
                 },
@@ -7751,6 +7760,168 @@ mod tests {
         app.tab_mut().cache.retain(|key, _| key.page != 1);
         app.pending.insert(target);
         (app, viewport, file)
+    }
+
+    fn continuous_gap_app() -> (super::App, Viewport, tempfile::NamedTempFile) {
+        let (mut app, viewport, file) = continuous_app();
+        let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+        let key = app.page_key(1, viewport);
+        let mut neighbor = continuous_frame(key, revision, false);
+        let frame = std::sync::Arc::get_mut(&mut neighbor).unwrap();
+        frame.width = 160;
+        frame.height = 120;
+        frame.compressed_rgba =
+            crate::kitty::compress_rgba(&[220, 40, 80, 255].repeat(160 * 120)).unwrap();
+        app.tab_mut().cache.insert(key, neighbor);
+        app.tab_mut().scroll_y = 245;
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        app.draw_continuous(&primary, viewport, &mut Vec::new())
+            .unwrap();
+        (app, viewport, file)
+    }
+
+    #[test]
+    fn continuous_gap_screenshot_uses_submitted_neighbor_pixels() {
+        let (app, viewport, _file) = continuous_gap_app();
+        let pages = app.screenshot_pages(viewport).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gap.png");
+        crate::screenshot::save(
+            &path,
+            viewport,
+            &pages,
+            &crate::screenshot::blank_overlay(viewport).unwrap(),
+            [1, 2, 3],
+        )
+        .unwrap();
+        let mut reader =
+            png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+                .read_info()
+                .unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (80, 200));
+        let at = |x: usize, y: usize| &pixels[(y * 80 + x) * 4..(y * 80 + x + 1) * 4];
+        assert_eq!(at(0, 4), [1, 2, 3, 255]);
+        assert_eq!(at(79, 5), [220, 40, 80, 255]);
+        assert_eq!(at(0, 124), [220, 40, 80, 255]);
+        assert_eq!(at(0, 125), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn continuous_gap_picker_maps_submitted_neighbor_and_preserves_gap_view() {
+        let (mut app, viewport, _file) = continuous_gap_app();
+        let image = app.picker_image(viewport).unwrap();
+        assert_eq!((image.source_width, image.source_height), (80, 120));
+        assert_eq!(image.original.placement.offset_y, 5);
+        assert_eq!(
+            (
+                image.original.placement.columns,
+                image.original.placement.rows
+            ),
+            (0, 0)
+        );
+        app.retain_primary_image(&mut Vec::new()).unwrap();
+        app.link_picker = Some(LinkPickerState::new(1));
+        app.link_picker_geometry.layout = LinkPickerLayout::Vertical;
+        let (preview, _) =
+            link_picker_panes(super::link_picker_area(viewport), app.link_picker_geometry);
+        let positioned =
+            super::position_link_picker_image(image, preview, LinkPickerLayout::Vertical);
+        let mouse = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: positioned.left + positioned.placement.columns - 1,
+            row: positioned.top + positioned.placement.rows - 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (frame, placement, top) = app.page_at_mouse(mouse, viewport).unwrap();
+        let hit = placement
+            .source_cell(mouse.column, mouse.row - top, frame.width, frame.height)
+            .unwrap();
+        assert_eq!(frame.key.page, 1);
+        assert_eq!((hit.x + hit.width, hit.y + hit.height), (80, 120));
+        app.link_picker_geometry.layout = LinkPickerLayout::Floating;
+        let mouse = crossterm::event::MouseEvent {
+            column: 0,
+            row: viewport.top,
+            ..mouse
+        };
+        let (frame, placement, top) = app.page_at_mouse(mouse, viewport).unwrap();
+        let hit = placement
+            .source_cell(mouse.column, mouse.row - top, frame.width, frame.height)
+            .unwrap();
+        assert_eq!((hit.y, hit.height), (0, 5));
+        assert_eq!((app.tab().page, app.tab().scroll_y), (0, 245));
+    }
+
+    #[test]
+    fn retained_picker_inverse_survives_render_cache_eviction() {
+        let (mut app, viewport, _file) = continuous_gap_app();
+        let visible = app.current_visible_page(viewport).unwrap();
+        let key = visible.frame.key;
+        let revision = visible.frame.revision;
+        app.retain_primary_image(&mut Vec::new()).unwrap();
+        app.link_picker = Some(LinkPickerState::new(1));
+        app.tab_mut().cache.clear();
+        let mut output = Vec::new();
+        app.begin_inverse_at(key, (80, 60), viewport, &mut output)
+            .unwrap();
+        let inverse = app.navigation.inverse.as_ref().unwrap();
+        assert_eq!(inverse.page, 1);
+        assert_eq!(inverse.revision, revision);
+        assert!(matches!(inverse.stage, super::InverseStage::HitTest));
+
+        app.navigation.inverse = None;
+        app.visible_page = None;
+        output.clear();
+        app.begin_inverse_at(key, (80, 60), viewport, &mut output)
+            .unwrap();
+        assert!(app.navigation.inverse.is_none());
+    }
+
+    #[test]
+    fn screenshot_rejects_missing_or_stale_visible_neighbors() {
+        let (mut app, viewport, file) = continuous_app();
+        let target = app.page_key(1, viewport);
+        app.missing_visible_page = Some(target);
+        assert!(
+            app.screenshot_pages(viewport)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("still rendering")
+        );
+        app.missing_visible_page = None;
+        fs::write(file.path(), b"changed PDF revision").unwrap();
+        let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+        app.visible_pages[1].frame = continuous_frame(target, revision, false);
+        assert!(
+            app.screenshot_pages(viewport)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("still rendering")
+        );
+    }
+
+    #[test]
+    fn screenshot_rejects_new_anchor_until_its_view_is_submitted() {
+        let (mut app, viewport, _file) = continuous_gap_app();
+        app.tab_mut().page = 1;
+        app.tab_mut().scroll_y = 0;
+        assert!(
+            app.screenshot_pages(viewport)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("still rendering")
+        );
+        let frame = app.tab().cache[&app.page_key(1, viewport)].clone();
+        app.draw_continuous(&frame, viewport, &mut Vec::new())
+            .unwrap();
+        let pages = app.screenshot_pages(viewport).unwrap();
+        assert_eq!(pages[0].placement.offset_y, 0);
+        assert_eq!(pages[0].frame.key.page, 1);
     }
 
     #[test]
