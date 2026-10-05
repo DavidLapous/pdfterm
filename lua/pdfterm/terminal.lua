@@ -21,18 +21,70 @@ on run argv
     set wait after command of cfg to false
     set environment variables of cfg to {"PATH=" & (item 3 of argv), "XDG_CONFIG_HOME=" & (item 4 of argv)}
     set viewer to split sourceTerminal direction right with configuration cfg
-    focus sourceTerminal
     return id of viewer
   end tell
 end run
 ]]
+
+local function finish_ghostty_launch(result, callback)
+  local ok, failure = xpcall(callback, debug.traceback, result)
+  if ok then
+    return
+  end
+  local id = vim.trim(result.stdout or '')
+  if (result.code == 0 or result.unclosed) and id ~= '' then
+    local closed, close_error = pcall(ghostty.close, { id = id })
+    if not closed then
+      result.code, result.unclosed = 1, true
+      result.stderr = failure .. '; could not close unowned Ghostty surface: ' .. tostring(close_error)
+      error(result.stderr)
+    end
+    result.unclosed = nil
+  end
+  error(failure)
+end
 
 function ghostty.launch(source, argv, callback)
   local command = table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' ')
   return platform.applescript(
     split_script,
     { command, source.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' },
-    callback
+    vim.schedule_wrap(function(split)
+      if split.code ~= 0 then
+        finish_ghostty_launch(split, callback)
+        return
+      end
+      -- Acquire the exact child before any fallible post-create operation.
+      local id = vim.trim(split.stdout or '')
+      if id == '' or id == source.id then
+        finish_ghostty_launch({
+          code = 1,
+          stderr = 'Ghostty split returned no distinct terminal ID; created surface ownership is unknown',
+        }, callback)
+        return
+      end
+      local function refocused(focus)
+        if focus.code == 0 then
+          finish_ghostty_launch(split, callback)
+          return
+        end
+        local closed, close_error = pcall(ghostty.close, { id = id })
+        local result = {
+          code = 1,
+          stdout = closed and '' or id,
+          stderr = 'pdfterm: could not refocus Ghostty source: ' .. (focus.stderr or ''),
+        }
+        if not closed then
+          result.unclosed = true
+          result.stderr = result.stderr .. '; could not close unowned Ghostty surface: ' .. tostring(close_error)
+        end
+        finish_ghostty_launch(result, callback)
+      end
+      local focused, focus_error = pcall(ghostty.focus, source, vim.schedule_wrap(refocused))
+      if not focused then
+        refocused({ code = 1, stderr = tostring(focus_error) })
+      end
+    end)
   )
 end
 
@@ -90,18 +142,7 @@ end run
       vim.env.XDG_CONFIG_HOME or '',
     },
     vim.schedule_wrap(function(result)
-      local ok, failure = xpcall(callback, debug.traceback, result)
-      if not ok then
-        -- The OS window exists before its handle is recorded. Roll back only
-        -- that exact surface if the ownership callback fails.
-        if result.code == 0 and result.stdout and vim.trim(result.stdout) ~= '' then
-          local closed, close_error = pcall(ghostty.close, { id = vim.trim(result.stdout) })
-          if not closed then
-            error(failure .. '; could not close unowned Ghostty window: ' .. tostring(close_error))
-          end
-        end
-        error(failure)
-      end
+      finish_ghostty_launch(result, callback)
     end)
   )
 end
@@ -191,13 +232,14 @@ function M.launch_split(source, executable, pdf, callback, session, focus_token)
   end)
   return {
     wait = function(_, timeout)
-      if not vim.wait(timeout or 8500, function()
+      -- Local Ghostty may create, refocus, then roll back at three seconds each.
+      if not vim.wait(timeout or (source.kind == 'ghostty' and 10000 or 8500), function()
         return done
       end, 10) then
         error('pdfterm: terminal launch timed out')
       end
       if callback_failure then
-        error(callback_failure)
+        error(reply.unclosed and reply.stderr or callback_failure)
       end
       return reply
     end,

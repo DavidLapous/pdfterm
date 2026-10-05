@@ -56,6 +56,14 @@ return rows as text''')
             if (parts := row.split())}
 
 
+def ghostty_source():
+    return applescript('''set cfg to new surface configuration
+set command of cfg to "/bin/sleep 60"
+set wait after command of cfg to false
+set w to new window with configuration cfg
+return id of focused terminal of selected tab of w''')
+
+
 def focused(kind, identifier):
     if kind == 'kitty':
         return snapshot(kind)[identifier][2]['is_active']
@@ -162,12 +170,50 @@ if action == 'capture' then
 elseif action == 'launch' then
   terminal.launch_split(source,arg[3],arg[4],finish,arg[5]):wait()
   assert(done,'launch wait returned before ownership callback')
+elseif action == 'ghostty-refocus-failure' then
+  assert(source.kind == 'ghostty')
+  local platform, control = require('pdfterm.platform'), require('pdfterm.ghostty')
+  local applescript, request = platform.applescript, control.request
+  -- Persist only the exact ID returned by creation, so a failed assertion or
+  -- timeout still permits cleanup without discovering/guessing another window.
+  platform.applescript = function(script, argv, callback)
+    if callback and script:find('split sourceTerminal direction right', 1, true) then
+      return applescript(script, argv, vim.schedule_wrap(function(reply)
+        if reply.code == 0 and vim.trim(reply.stdout or '') ~= '' then
+          vim.fn.writefile({ vim.trim(reply.stdout) }, vim.env.XDG_CONFIG_HOME .. '/refocus-child')
+        end
+        callback(reply)
+      end))
+    end
+    return applescript(script, argv, callback)
+  end
+  control.request = function(operation, id, callback)
+    if operation == 'focus' and id == source.id then
+      assert(vim.wait(3000, function()
+        return vim.uv.fs_stat(vim.env.XDG_CONFIG_HOME .. '/ready.json') ~= nil
+      end, 10), 'native refocus reader did not start')
+      local closed = applescript([[
+on run argv
+  tell application "Ghostty" to close terminal id (item 1 of argv)
+end run
+]], { source.id }):wait()
+      assert(closed.code == 0, closed.stderr)
+    end
+    -- This really asks Ghostty to focus the now-gone, test-owned source.
+    return request(operation, id, callback)
+  end
+  terminal.launch_split(source, arg[3], arg[4], function(reply, handle)
+    finish({ code=0, stderr='', stdout=vim.json.encode({
+      code=reply.code, error=reply.stderr, unclosed=reply.unclosed or false,
+      id=handle and handle.id or '',
+    }) })
+  end, arg[5]):wait()
 elseif action == 'focus' then
   terminal.focus(source,finish)
 elseif action == 'close' then
   terminal.close(source); finish({code=0})
 else error('unknown native test action') end
-assert(vim.wait(5000,function() return done end,10),'terminal callback timed out')
+assert(vim.wait(10000, function() return done end, 10), 'native terminal callback timed out')
 if vim.env.PDFTERM_EXPECT_KITTY_TTY_FAILURE == '1' then
   assert(result.code ~= 0 and result.stderr:find('requires a listen_on socket',1,true),result.stderr)
 else
@@ -183,9 +229,9 @@ io.write(vim.json.encode(result), '\\n')
                 environment['PDFTERM_EXPECT_KITTY_TTY_FAILURE'] = '1'
             result = subprocess.run(['nvim', '--headless', '-u', 'NONE', '-i', 'NONE',
                                      '-l', str(lua), action, identifier, *argv],
-                                    stdin=subprocess.DEVNULL, capture_output=True,
-                                    text=True, timeout=8, start_new_session=True,
-                                    env=environment)
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=15 if action == 'ghostty-refocus-failure' else 10,
+                start_new_session=True, env=environment)
             assert result.returncode == 0, result.stderr or result.stdout
             assert not result.stderr, result.stderr
             reply = json.loads(result.stdout)
@@ -215,13 +261,7 @@ io.write(vim.json.encode(result), '\\n')
                 os.environ['WEZTERM_PANE'] = source
             else:
                 source = (run(['kitten', '@', 'launch', '--type=os-window', '/bin/sleep', '60'])
-                          if args.terminal == 'kitty' else applescript('''set cfg to new surface configuration
-set command of cfg to "/bin/sleep 60"
-set wait after command of cfg to false
-set w to new window with configuration cfg
-set s to focused terminal of selected tab of w
-focus s
-return id of s'''))
+                          if args.terminal == 'kitty' else ghostty_source())
                 if args.terminal == 'kitty':
                     os.environ['KITTY_WINDOW_ID'] = source
             viewer = None
@@ -252,6 +292,65 @@ return id of s'''))
                     finally:
                         os.environ['WEZTERM_PANE'] = source
                     assert snapshot('wezterm') == before, 'invalid source changed WezTerm panes'
+                if args.terminal == 'ghostty':
+                    before = set(snapshot('ghostty'))
+                    failure_source = ghostty_source()
+                    failure_backend = launcher['GhosttyTerminal'](failure_source)
+                    offered = directory / 'refocus-child'
+                    ready = directory / 'ready.json'
+                    try:
+                        if route == 'local':
+                            rejection = json.loads(local('ghostty-refocus-failure', failure_source,
+                                                         sys.executable, str(reader), 'refocus-probe'))
+                            assert rejection['code'] != 0 and not rejection['unclosed'], rejection
+                            assert 'could not refocus Ghostty source' in rejection['error'], rejection
+                        else:
+                            globals_ = failure_backend.launch.__func__.__globals__
+                            real_applescript = globals_['applescript']
+                            real_focus = failure_backend.focus
+
+                            def remember_creation(body, *arguments, deadline=None):
+                                result = real_applescript(body, *arguments, deadline=deadline)
+                                if 'split sourceTerminal direction right' in body:
+                                    offered.write_text(result)
+                                return result
+
+                            def remove_source(identifier, deadline=None):
+                                assert identifier == failure_source
+                                wait(ready.exists, timeout=3)
+                                real_applescript('close terminal id (item 1 of argv)',
+                                                 identifier, deadline=deadline)
+                                real_focus(identifier, deadline=deadline)
+
+                            globals_['applescript'] = remember_creation
+                            failure_backend.focus = remove_source
+                            try:
+                                try:
+                                    failure_backend.launch([
+                                        'env', 'PATH=' + os.environ['PATH'],
+                                        'XDG_CONFIG_HOME=' + temporary, sys.executable,
+                                        str(reader), '--session', 'refocus-probe'])
+                                except RuntimeError as error:
+                                    assert 'terminal id' in str(error), error
+                                    assert not isinstance(error, launcher['UnclosedPane']), error
+                                else:
+                                    raise AssertionError('native Ghostty source focus failure was ignored')
+                            finally:
+                                globals_['applescript'] = real_applescript
+                                failure_backend.focus = real_focus
+                        wait(lambda: set(snapshot('ghostty')) == before)
+                        print(f'ghostty/{route}: native gone-source refocus failure rolled back exact child')
+                    finally:
+                        try:
+                            if offered.exists():
+                                child = offered.read_text().strip()
+                                assert child and child != failure_source
+                                failure_backend.close(child)
+                                offered.unlink()
+                        finally:
+                            failure_backend.close(failure_source)
+                            if ready.exists():
+                                ready.unlink()
                 if args.terminal == 'wezterm' and route == 'ssh':
                     before = set(snapshot('wezterm'))
                     restore = backend.focus

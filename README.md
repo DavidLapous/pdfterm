@@ -674,6 +674,13 @@ window ID without a subprocess and uses the compiled `kitten` client for control
 Its backend lives in `lua/pdfterm/kitty.lua`; `terminal.lua` owns shared launch
 and window-ownership policy.
 
+Ghostty creation returns the exact child UUID before restoring source focus.
+If refocus fails, the adapter closes that child; failed rollback reports both
+errors and retains its handle for later owned cleanup. Local editor exit waits
+up to ten seconds for the three bounded create/refocus/rollback stages.
+If creation fails before returning an exact UUID, cleanup cannot safely guess
+which terminal was created.
+
 WezTerm requires `wezterm` on Neovim's `PATH` and the inherited
 `TERM_PROGRAM=WezTerm`, `WEZTERM_PANE`, and `WEZTERM_UNIX_SOCKET` from the
 source pane. The adapter verifies that pane in the captured GUI socket before

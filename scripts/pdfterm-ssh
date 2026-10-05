@@ -245,13 +245,23 @@ class WezTermTerminal(Terminal):
 
 class GhosttyTerminal(Terminal):
     def launch(self, argv, deadline=None):
-        return applescript('''set cfg to new surface configuration
+        identifier = applescript('''set cfg to new surface configuration
 set command of cfg to item 1 of argv
 set wait after command of cfg to false
 set sourceTerminal to terminal id (item 2 of argv)
 set viewer to split sourceTerminal direction right with configuration cfg
-focus terminal id (item 2 of argv)
 return id of viewer''', shlex.join(argv), self.source, deadline=deadline)
+        if not identifier or identifier == self.source:
+            raise RuntimeError('Ghostty split returned no distinct terminal ID; created surface ownership is unknown')
+        try:
+            self.focus(self.source, deadline=deadline)
+        except Exception as error:
+            try:
+                self.close(identifier, deadline=time.monotonic() + 2)
+            except Exception as cleanup:
+                raise UnclosedPane(identifier, f'Ghostty launch failed: {error}; cleanup failed: {cleanup}') from error
+            raise
+        return identifier
 
     def focus(self, identifier, deadline=None):
         applescript('focus terminal id (item 1 of argv)', identifier, deadline=deadline)

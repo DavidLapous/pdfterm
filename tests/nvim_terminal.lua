@@ -123,7 +123,7 @@ terminal.capture_source(function(problem, handle)
   gui_source = handle
 end)
 assert(gui_source.kind == 'neovide' and gui_source.id == tostring(vim.fn.getpid()))
-local scripts = {}
+local scripts, gui_close_error = {}, false
 package.loaded['pdfterm.platform'].applescript = function(script, argv, callback)
   scripts[#scripts + 1] = { script = script, argv = argv }
   if callback then
@@ -131,7 +131,7 @@ package.loaded['pdfterm.platform'].applescript = function(script, argv, callback
     return
   end
   return { wait = function()
-    return { code = 0 }
+    return { code = gui_close_error and 1 or 0, stderr = gui_close_error and 'GUI cleanup rejected' or '' }
   end }
 end
 local gui_viewer
@@ -187,8 +187,128 @@ local owned_ok, owned_error = pcall(unowned.wait, unowned, 1000)
 assert(not owned_ok and tostring(owned_error):find('deliberate GUI ownership failure', 1, true))
 assert(#scripts == 2 and scripts[2].argv[1] == 'ghostty-viewer-7')
 assert(#failures == 1 and failures[1]:find('deliberate GUI ownership failure', 1, true))
+-- If the callback recorded the offered ID before throwing, failed rollback
+-- must preserve that ownership and expose both errors to wait() and the editor.
+scripts, failures, gui_close_error = {}, {}, true
+local retained_gui, retained_gui_result
+local gui_stranded = terminal.launch_split(gui_source, 'viewer', 'paper.pdf', function(result, handle)
+  retained_gui, retained_gui_result = handle, result
+  error('deliberate GUI recording failure')
+end)
+local stranded_ok, stranded_error = pcall(gui_stranded.wait, gui_stranded, 1000)
+assert(not stranded_ok and tostring(stranded_error):find('deliberate GUI recording failure', 1, true))
+assert(tostring(stranded_error):find('GUI cleanup rejected', 1, true))
+assert(retained_gui.kind == 'ghostty' and retained_gui.id == 'ghostty-viewer-7')
+assert(retained_gui_result.unclosed and retained_gui_result.stdout == 'ghostty-viewer-7\n')
+assert(#scripts == 2 and scripts[2].argv[1] == retained_gui.id)
+assert(not scripts[1].script:find('front window', 1, true), 'new-window launch must keep its own returned window')
+gui_close_error = false
+terminal.close(retained_gui)
+assert(#scripts == 3 and scripts[3].argv[1] == retained_gui.id)
+assert(#failures == 1 and failures[1]:find('GUI cleanup rejected', 1, true))
 vim.schedule = schedule
 vim.g.neovide, vim.env.KITTY_WINDOW_ID, vim.env.TERM_PROGRAM = nil, nil, nil
+
+-- A Ghostty child is returned before refocusing the exact source. Both launch
+-- failure paths must clean up only that child, never the source or another window.
+local ghostty_source = { kind = 'ghostty', id = 'ghostty-source' }
+local ghostty_calls, ghostty_live = {}, { ['ghostty-source'] = true, independent = true }
+local ghostty_refocus_error, ghostty_cleanup_error, ghostty_creation_id = false, false, 'ghostty-child'
+package.loaded['pdfterm.platform'].applescript = function(script, argv, callback)
+  if callback then
+    assert(script:find('split sourceTerminal direction right', 1, true))
+    assert(not script:find('focus sourceTerminal', 1, true), 'creation must publish the child before refocus')
+    assert(argv[2] == ghostty_source.id)
+    ghostty_calls[#ghostty_calls + 1] = { 'create', argv[2] }
+    if ghostty_creation_id == 'ghostty-child' then
+      ghostty_live['ghostty-child'] = true
+    end
+    callback({ code = 0, stdout = ghostty_creation_id .. '\n', stderr = '' })
+    return
+  end
+  assert(script:find('send key "c"', 1, true))
+  assert(argv[1] == 'ghostty-child', 'rollback must never target the source or an independent surface')
+  ghostty_calls[#ghostty_calls + 1] = { 'close', argv[1] }
+  return { wait = function()
+    if ghostty_cleanup_error then
+      return { code = 1, stderr = 'Ghostty cleanup rejected' }
+    end
+    ghostty_live[argv[1]] = nil
+    return { code = 0 }
+  end }
+end
+package.loaded['pdfterm.ghostty'].request = function(action, id, callback)
+  assert(action == 'focus' and id == ghostty_source.id, 'refocus must keep the captured source')
+  ghostty_calls[#ghostty_calls + 1] = { 'focus', id }
+  if ghostty_refocus_error == 'throw' then
+    error('Ghostty refocus threw')
+  end
+  callback({
+    code = ghostty_refocus_error and 1 or 0,
+    stderr = ghostty_refocus_error and 'Ghostty refocus rejected' or '',
+  })
+end
+local ghostty_child
+local ghostty_success = terminal.launch_split(ghostty_source, 'viewer', 'paper.pdf', function(result, handle)
+  assert(result.code == 0)
+  ghostty_child = assert(handle)
+end)
+local before_ghostty_wait, ghostty_default_limit = vim.wait, nil
+vim.wait = function(limit, ...)
+  ghostty_default_limit = limit
+  return before_ghostty_wait(limit, ...)
+end
+assert(ghostty_success:wait().code == 0 and ghostty_default_limit == 10000)
+vim.wait = before_ghostty_wait
+assert(ghostty_child.kind == 'ghostty' and ghostty_child.id == 'ghostty-child')
+assert(#ghostty_calls == 2 and ghostty_calls[1][1] == 'create' and ghostty_calls[2][1] == 'focus')
+terminal.close(ghostty_child)
+
+ghostty_calls, ghostty_refocus_error = {}, true
+local ghostty_rejected, ghostty_count = nil, 0
+local ghostty_failure = terminal.launch_split(ghostty_source, 'viewer', 'paper.pdf', function(result, handle)
+  ghostty_count = ghostty_count + 1
+  assert(result.code ~= 0 and not handle and not result.unclosed)
+  ghostty_rejected = result
+end)
+assert(ghostty_failure:wait(1000).code ~= 0 and ghostty_count == 1)
+assert(ghostty_rejected.stderr:find('Ghostty refocus rejected', 1, true))
+assert(#ghostty_calls == 3 and ghostty_calls[3][1] == 'close')
+assert(not ghostty_live['ghostty-child'] and ghostty_live['ghostty-source'] and ghostty_live.independent)
+
+ghostty_calls, ghostty_cleanup_error = {}, true
+local ghostty_provisional, ghostty_stranded_result
+local ghostty_stranded = terminal.launch_split(ghostty_source, 'viewer', 'paper.pdf', function(result, handle)
+  ghostty_provisional, ghostty_stranded_result = handle, result
+end)
+assert(ghostty_stranded:wait(1000).code ~= 0)
+assert(ghostty_stranded_result.unclosed and ghostty_provisional.id == 'ghostty-child')
+assert(ghostty_stranded_result.stderr:find('Ghostty refocus rejected', 1, true))
+assert(ghostty_stranded_result.stderr:find('Ghostty cleanup rejected', 1, true))
+assert(ghostty_live['ghostty-child'] and ghostty_live['ghostty-source'] and ghostty_live.independent)
+ghostty_refocus_error, ghostty_cleanup_error = false, false
+terminal.close(ghostty_provisional)
+assert(not ghostty_live['ghostty-child'] and ghostty_live['ghostty-source'] and ghostty_live.independent)
+
+-- A helper start exception after creation is the same provisional-child failure.
+ghostty_refocus_error = 'throw'
+local ghostty_thrown = terminal.launch_split(ghostty_source, 'viewer', 'paper.pdf', function(result, handle)
+  assert(result.code ~= 0 and not handle and result.stderr:find('Ghostty refocus threw', 1, true))
+end)
+assert(ghostty_thrown:wait(1000).code ~= 0 and not ghostty_live['ghostty-child'])
+ghostty_refocus_error = false
+for _, missing_id in ipairs({ '', ghostty_source.id }) do
+  ghostty_calls, ghostty_creation_id = {}, missing_id
+  local unknown = terminal.launch_split(ghostty_source, 'viewer', 'paper.pdf', function(result, handle)
+    assert(result.code ~= 0 and not handle)
+    assert(result.stderr:find('created surface ownership is unknown', 1, true))
+  end)
+  assert(unknown:wait(1000).code ~= 0)
+  assert(#ghostty_calls == 1 and ghostty_calls[1][1] == 'create', 'unknown child must not authorize effects')
+  assert(ghostty_live['ghostty-source'] and ghostty_live.independent)
+end
+ghostty_creation_id = 'ghostty-child'
+print('Ghostty exact child transfer, refocus rollback, retained ownership, and later cleanup covered')
 
 -- A WezTerm pane ID alone is not sufficient: all operations use the captured
 -- GUI socket and an explicit target even if Neovim's environment later changes.

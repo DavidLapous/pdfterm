@@ -311,6 +311,64 @@ error('editor did not exit during launch')
         self.assertNotIn(reply['id'], self.bridge.owned)
         self.assertTrue(self.bridge.thread.is_alive())
 
+    def test_ghostty_refocus_failure_rolls_back_or_retains_exact_child(self):
+        for rollback_fails in (False, True):
+            with self.subTest(rollback_fails=rollback_fails):
+                ghostty = launcher['GhosttyTerminal']('ghostty-source')
+                live = {'ghostty-source', 'independent'}
+                cleanup = {'fail': rollback_fails}
+                calls = []
+
+                def control(body, *arguments, deadline=None):
+                    calls.append((body, arguments, deadline))
+                    if 'split sourceTerminal direction right' in body:
+                        self.assertNotIn('focus ', body, 'creation must return its ID before refocus')
+                        self.assertEqual(arguments[1], 'ghostty-source')
+                        live.add('ghostty-child')
+                        return 'ghostty-child'
+                    if body.startswith('focus terminal id'):
+                        self.assertEqual(arguments, ('ghostty-source',))
+                        raise RuntimeError('Ghostty source refocus failed')
+                    if body.startswith('repeat 15 times'):
+                        self.assertEqual(arguments, ('ghostty-child',), 'only the exact child may be closed')
+                        if cleanup['fail']:
+                            raise RuntimeError('Ghostty child cleanup unavailable')
+                        live.discard('ghostty-child')
+                        return ''
+                    if body.startswith('set liveIDs'):
+                        return '\n'.join(live & set(arguments[0].splitlines()))
+                    self.fail('unexpected Ghostty terminal effect: ' + body)
+
+                self.bridge.windows = ghostty
+                with patch.dict(ghostty.launch.__func__.__globals__, applescript=control):
+                    reply = self.request({'action': 'launch', 'argv': ['viewer', 'paper.pdf']})
+                    self.assertFalse(reply['ok'])
+                    self.assertIn('Ghostty source refocus failed', reply['error'])
+                    self.assertEqual(len(calls), 3, 'creation, exact refocus, then exact rollback')
+                    if rollback_fails:
+                        self.assertIn('Ghostty child cleanup unavailable', reply['error'])
+                        self.assertEqual(self.bridge.owned, {'ghostty-child'})
+                        self.assertIn('ghostty-child', live)
+                        before = list(calls)
+                        self.assertFalse(self.request({'action': 'close', 'id': 'source'})['ok'])
+                        self.assertFalse(self.request({'action': 'focus', 'id': 'independent'})['ok'])
+                        self.assertEqual(calls, before, 'unowned handles must not reach terminal control')
+                        cleanup['fail'] = False
+                        self.assertTrue(self.request({'action': 'close', 'id': 'ghostty-child'})['ok'])
+                    self.assertFalse(self.bridge.owned)
+                    self.assertEqual(live, {'ghostty-source', 'independent'})
+
+    def test_ghostty_unknown_creation_id_never_guesses_refocus_or_cleanup(self):
+        ghostty = launcher['GhosttyTerminal']('ghostty-source')
+        for identifier in ('', 'ghostty-source'):
+            with self.subTest(identifier=identifier), \
+                    patch.dict(ghostty.launch.__func__.__globals__, applescript=lambda *args, **kwargs: identifier), \
+                    patch.object(ghostty, 'focus') as focus, patch.object(ghostty, 'close') as close:
+                with self.assertRaisesRegex(RuntimeError, 'created surface ownership is unknown'):
+                    ghostty.launch(['viewer', 'paper.pdf'])
+                focus.assert_not_called()
+                close.assert_not_called()
+
     def test_wezterm_failed_rollback_retains_exact_pane_for_bridge_cleanup(self):
         wezterm = launcher['WezTermTerminal'].__new__(launcher['WezTermTerminal'])
         wezterm.source, wezterm.socket_path = '11', 'owned.sock'
