@@ -7,10 +7,19 @@ local directory = vim.fn.tempname() .. ' typst navigation'
 vim.fn.mkdir(directory, 'p')
 directory = assert(vim.uv.fs_realpath(directory))
 local alias = directory .. ' alias'
-local original_root = vim.env.TYPST_ROOT
-vim.env.TYPST_ROOT = nil
+local original_root, original_fonts = vim.env.TYPST_ROOT, vim.env.TYPST_FONT_PATHS
+vim.env.TYPST_ROOT, vim.env.TYPST_FONT_PATHS = nil, nil
 local start_rpc = vim.lsp.rpc.start
-local endpoints = {}
+local endpoints, initialized_args = {}, nil
+vim.lsp.rpc.start = function(...)
+  local rpc = start_rpc(...)
+  local request = rpc.request
+  rpc.request = function(method, params, ...)
+    if method == 'initialize' then initialized_args = params.initializationOptions.typstExtraArgs end
+    return request(method, params, ...)
+  end
+  return rpc
+end
 local function resolve(p, file, line, column)
   local result
   local cancel = typst.resolve(p, file, line, column, function(value)
@@ -88,6 +97,52 @@ local ok, failure = xpcall(function()
   local explicit_position = resolve(nested, nested.main, 3, 7)
   assert(explicit_position.page == 2, vim.inspect(explicit_position))
 
+  -- The font CLI has path-list semantics, but its relative paths are resolved
+  -- from the build cwd, independently of the legitimate Typst import root.
+  local separator = vim.fn.has('win32') == 1 and ';' or ':'
+  for _, name in ipairs({ 'cli one', 'cli-two', 'absolute', 'env one', 'env-two', 'ignored' }) do
+    vim.fn.mkdir(directory .. '/fonts/' .. name, 'p')
+  end
+  local saved_build = nested.build
+  local function font_paths(argv, inherited, expected, page)
+    nested.build, vim.env.TYPST_FONT_PATHS = argv, inherited
+    local built_fonts = vim.system(nested.build, { cwd = nested.cwd, text = true }):wait()
+    assert(built_fonts.code == 0, built_fonts.stderr)
+    local mapped = resolve(nested, nested.main, 3, 7)
+    assert(mapped.page == page, vim.inspect(mapped))
+    assert(vim.deep_equal(initialized_args, expected), vim.inspect(initialized_args))
+  end
+  vim.env.TYPST_ROOT = nil
+  font_paths({
+    'typst', 'compile', '--ignore-system-fonts',
+    '--font-path=fonts/cli one' .. separator .. 'fonts/cli-two',
+    '--font-path', directory .. '/fonts/absolute',
+    '--package-path', 'packages', '--package-cache-path', 'cache', nested.main, nested.pdf,
+  }, 'fonts/ignored', {
+    '--ignore-system-fonts',
+    '--font-path', directory .. '/fonts/cli one',
+    '--font-path', directory .. '/fonts/cli-two',
+    '--font-path', directory .. '/fonts/absolute',
+    '--package-path', 'packages', '--package-cache-path', 'cache',
+    '--root', directory .. '/sources', nested.main,
+  }, 2)
+  font_paths({
+    'typst', 'compile', '--ignore-system-fonts', '--root', 'sources', nested.main, nested.pdf,
+  }, 'fonts/env one' .. separator .. 'fonts/env-two', {
+    '--ignore-system-fonts', '--root', directory .. '/sources',
+    '--font-path', directory .. '/fonts/env one',
+    '--font-path', directory .. '/fonts/env-two', nested.main,
+  }, 2)
+  font_paths({
+    'typst', 'compile', '--root', directory, '--font-path', directory .. '/fonts/absolute',
+    nested.main, nested.pdf,
+  }, nil, {
+    '--root', directory, '--font-path', directory .. '/fonts/absolute', nested.main,
+  }, 1)
+  nested.build, vim.env.TYPST_FONT_PATHS, vim.env.TYPST_ROOT = saved_build, nil, directory
+  nested_build = vim.system(nested.build, { cwd = nested.cwd, text = true }):wait()
+  assert(nested_build.code == 0, nested_build.stderr)
+
   -- Save an included source after the real PDF export, before the real jump.
   -- The resolver must keep the original PDF instead of publishing mixed state.
   local unchanged = assert(vim.uv.fs_stat(nested.pdf))
@@ -113,7 +168,7 @@ local ok, failure = xpcall(function()
   assert(retained.ino == unchanged.ino and vim.deep_equal(retained.mtime, unchanged.mtime))
 end, debug.traceback)
 vim.lsp.rpc.start = start_rpc
-vim.env.TYPST_ROOT = original_root
+vim.env.TYPST_ROOT, vim.env.TYPST_FONT_PATHS = original_root, original_fonts
 project.close()
 vim.api.nvim_exec_autocmds('VimLeavePre', {})
 local cleaned = vim.wait(5000, function()

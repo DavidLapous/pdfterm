@@ -862,6 +862,11 @@ targets, before and after resolution. Source or asset changes abort positioning;
 unrelated files and editor swap files do not invalidate the map. The effective
 root follows the compiler's `--root`, `TYPST_ROOT`, then entry-directory
 precedence, not the Neovim workspace root.
+Tinymist receives font paths with the same meaning as the build: relative
+`--font-path` entries and inherited `TYPST_FONT_PATHS` entries are resolved
+against the original build working directory, not the import root. Path lists
+use the host's path separator; explicit CLI font paths replace the inherited
+font-path list. Import-root and package-path arguments remain unchanged.
 This second compilation keeps the displayed PDF consistent with Tinymist's
 compiler even when the installed `typst` version differs. A successful forward
 search retains a private inverse-search socket until another forward search

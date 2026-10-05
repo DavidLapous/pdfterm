@@ -40,7 +40,14 @@ local function compile_args(project)
     ['--creation-timestamp'] = true, ['--pdf-standard'] = true,
   }
   local switches = { ['--ignore-system-fonts'] = true, ['--no-pdf-tags'] = true }
-  local args, positional, index, root = {}, {}, 3, nil
+  local args, positional, index, root, cli_fonts = {}, {}, 3, nil, false
+  local separator = vim.fn.has('win32') == 1 and ';' or ':'
+  local function fonts(value)
+    for _, path in ipairs(vim.split(value, separator, { plain = true })) do
+      assert(path ~= '', 'Typst font path must not be empty')
+      args[#args + 1], args[#args + 2] = '--font-path', canonical(path, project.cwd)
+    end
+  end
   while index <= #argv do
     local arg = argv[index]
     local flag, value = arg:match('^(%-%-[^=]+)=(.*)$')
@@ -52,6 +59,9 @@ local function compile_args(project)
       end
       if flag == '--format' or flag == '-f' then
         assert(value == 'pdf', 'Typst forward search requires PDF output')
+      elseif flag == '--font-path' then
+        cli_fonts = true
+        fonts(value)
       else
         if flag == '--root' then
           value = canonical(value, project.cwd)
@@ -72,6 +82,11 @@ local function compile_args(project)
     and canonical(positional[1], project.cwd) == project.main
     and (not positional[2] or canonical(positional[2], project.cwd) == canonical(project.pdf, project.cwd)),
     'Typst build input/output do not match the selected project')
+  -- CLI font paths replace the inherited list; Tinymist otherwise resolves
+  -- relative font paths against the import root instead of the build cwd.
+  if not cli_fonts and vim.env.TYPST_FONT_PATHS ~= nil then
+    fonts(vim.env.TYPST_FONT_PATHS)
+  end
   -- LSP workspace roots otherwise override the CLI's entry-directory default.
   if not root then
     root = canonical(vim.env.TYPST_ROOT or vim.fs.dirname(project.main), project.cwd)
