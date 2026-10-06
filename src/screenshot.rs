@@ -337,7 +337,7 @@ fn compose(
     let width = u32::from(viewport.pixel_width);
     let height = u32::from(viewport.pixel_height);
     let mut output = vec![0; expected];
-    for pixel in output.chunks_exact_mut(4) {
+    for pixel in output.as_chunks_mut::<4>().0 {
         pixel[..3].copy_from_slice(&background);
         pixel[3] = 255;
     }
@@ -392,7 +392,12 @@ fn compose(
             }
         }
     }
-    for (dst, src) in output.chunks_exact_mut(4).zip(overlay.chunks_exact(4)) {
+    for (dst, src) in output
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(overlay.as_chunks::<4>().0)
+    {
         blend(dst, src);
     }
     Ok(output)
@@ -594,7 +599,7 @@ mod tests {
         let zoom = overlay(&mut mono, viewport, &[], &[zoom_badge]).unwrap();
         assert_ne!(fit, zoom, "zoom-sized glyphs must rasterize differently");
         assert!(
-            fit.chunks_exact(4).any(|pixel| {
+            fit.as_chunks::<4>().0.iter().any(|pixel| {
                 pixel[3] == 255 && pixel[..3] != [255, 0, 124] && pixel[..3] != [192, 202, 245]
             }),
             "glyph edges should blend against the opaque label background"

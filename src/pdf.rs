@@ -1748,15 +1748,13 @@ fn darken_rgba(rgba: &mut [u8], mask: Option<&[u8]>, style: DarkModeStyle) {
 }
 
 fn darken_rgba_chunk(rgba: &mut [u8], mask: Option<&[u8]>, transform: DarkModeTransform) {
-    for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+    for (index, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let mask_value = mask.map_or(0, |mask| mask[index]);
         if mask_value == 255 {
             continue;
         }
 
-        let [red, green, blue, _alpha] = pixel else {
-            unreachable!();
-        };
+        let [red, green, blue, _alpha] = pixel;
         let original = [*red, *green, *blue];
         let transformed = dark_mode_pixel(original, transform);
         if mask_value == 0 {
@@ -4020,8 +4018,10 @@ mod tests {
                 let after = coordinate_rgba(&precise);
                 let mut changed = (u32::MAX, 0, u32::MAX, 0);
                 for (pixel, (before, after)) in before
-                    .chunks_exact(4)
-                    .zip(after.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(after.as_chunks::<4>().0)
                     .enumerate()
                 {
                     if before != after {
