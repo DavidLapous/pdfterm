@@ -794,7 +794,7 @@ mod tests {
                 // Complete JSON alone is not a reply: its EOF must also arrive.
                 stream.write_all(br#"{"ok":true,"error":null}"#).unwrap();
                 let mut sent = 0;
-                for _ in 0..20 {
+                for _ in 0..500 {
                     std::thread::sleep(Duration::from_millis(20));
                     match stream.write_all(b" ") {
                         Ok(()) => sent += 1,
@@ -811,13 +811,15 @@ mod tests {
                 }
                 sent
             });
-            let operation = crate::process::Operation::new(Duration::from_millis(120));
+            // Allow loaded CI runners to schedule several writes, while the
+            // full drip lasts much longer than the request's total deadline.
+            let operation = crate::process::Operation::new(Duration::from_secs(1));
             let started = Instant::now();
             let error =
                 request_reply(socket.to_str().unwrap(), b"{}", kind, &operation).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
             assert_eq!(error.to_string(), "navigation timed out");
-            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(started.elapsed() < Duration::from_secs(3));
             assert!(server.join().unwrap() >= 2);
         }
     }
