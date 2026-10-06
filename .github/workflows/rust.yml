@@ -53,3 +53,14 @@ jobs:
       run: nvim --headless -u NONE -l tests/nvim_ghostty.lua
     - name: Exercise bounded SSH launcher protocol
       run: python3 tests/ssh_launcher.py
+
+  build-check:
+    name: build
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require all platform builds
+      env:
+        BUILD_RESULT: ${{ needs.build.result }}
+      run: test "$BUILD_RESULT" = success
