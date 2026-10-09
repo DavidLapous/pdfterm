@@ -468,6 +468,21 @@ vim.cmd('qa!')
 """)
         self.assertEqual(self.windows.focused, ['editor'])
 
+    def test_snapshot_launch_keeps_expanded_argv_bounded_and_owned(self):
+        argv = ['viewer', 'paper.pdf', '--synctex-best-guess',
+                '--session', 'session', '--focus-token', 'f' * 32,
+                '--source-snapshot', '/compiled/sources/manifest.json']
+        rejected = self.request({'action': 'launch', 'argv': [*argv, 'unexpected']})
+        self.assertFalse(rejected['ok'])
+        self.assertFalse(self.windows.live)
+        viewer = self.request({'action': 'launch', 'argv': argv})
+        self.assertTrue(viewer['ok'], viewer)
+        self.assertEqual(self.bridge.owned, {viewer['id']})
+        self.assertEqual(self.windows.live, {viewer['id']})
+        self.assertTrue(self.request({'action': 'close', 'id': viewer['id']})['ok'])
+        self.assertFalse(self.bridge.owned)
+        self.assertFalse(self.windows.live)
+
     def test_malformed_requests_do_not_kill_listener_or_control_unowned_windows(self):
         for payload in (b'{', [], {'action': 'close', 'id': []}, {'action': 'close', 'id': 'editor'},
                         {'action': 'launch', 'argv': ['viewer', None]}, b' ' * 32769):

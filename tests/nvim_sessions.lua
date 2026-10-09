@@ -21,18 +21,24 @@ if case then
     vim.uv.kill(vim.fn.getpid(), 9)
     return
   end
-  local messages = {}
-  vim.notify = function(message)
+  local messages, levels = {}, {}
+  vim.notify = function(message, level)
     messages[#messages + 1] = tostring(message)
+    levels[#levels + 1] = level or vim.log.levels.INFO
   end
+  local clipboard_writes = 0
   local copied
+  local function record_clipboard_write()
+    clipboard_writes = clipboard_writes + 1
+  end
   vim.g.clipboard = {
     name = 'test clipboard',
     copy = {
       ['+'] = function(lines)
+        record_clipboard_write()
         copied = table.concat(lines, '\n')
       end,
-      ['*'] = function() end,
+      ['*'] = record_clipboard_write,
     },
     paste = {
       ['+'] = function() return {}, 'v' end,
@@ -112,14 +118,33 @@ if case then
     ticks = ticks + 1
   end)
   local pdf = directory .. '/a document\'s.pdf'
-  adapter.viewer_command(pdf)
-  wait(function()
-    return #messages > 0
+  local denied_directory
+  if case == 'denied_pdf' then
+    denied_directory = directory .. '/denied-' .. vim.fn.getpid()
+    vim.fn.mkdir(denied_directory, 'p')
+    pdf = denied_directory .. '/paper.pdf'
+    vim.fn.writefile({ '%PDF-1.4' }, pdf)
+    assert(vim.uv.fs_chmod(denied_directory, 0))
+  end
+  local success, failure = pcall(function()
+    adapter.viewer_command(pdf)
+    wait(function()
+      return #messages > 0
+    end)
   end)
+  if denied_directory then assert(vim.uv.fs_chmod(denied_directory, 448)) end
+  assert(success, failure)
   timer:stop()
   timer:close()
   if case ~= 'defaults' then
     assert(ticks > 2, 'configuration blocked editor events')
+  end
+  if case == 'denied_pdf' then
+    assert(clipboard_writes == 0 and levels[1] == vim.log.levels.ERROR)
+    assert(vim.api.nvim_get_current_line() == 'still editable')
+    print(vim.json.encode({ case = case, setup_ns = setup_ns, ticks = ticks }))
+    vim.cmd('qa!')
+    return
   end
   if case == 'live' or case == 'stale' then
     assert(messages[1]:match(case == 'live' and 'live editor' or 'stale socket'), messages[1])
@@ -129,7 +154,10 @@ if case then
     return
   end
   local command = messages[1]
-  assert(copied == command, 'viewer command was not sent to clipboard')
+  assert(
+    clipboard_writes == 1 and copied == command,
+    'manual pairing did not copy its launch command'
+  )
   local resolved = vim
     .system({ '/bin/sh', '-c', command .. ' --print-config' }, { text = true })
     :wait(10000)
@@ -154,12 +182,14 @@ if case then
     return vim.api.nvim_buf_get_name(0) == source
   end)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 2, 3 }), 'inverse-first pairing failed')
+  assert(clipboard_writes == 1 and copied == command, 'inverse navigation changed the clipboard')
   adapter.forward_search(pdf, '{}', { kind = 'kitty', id = '123' })
   wait(function()
     return #messages > 1
   end)
   assert(messages[2]:find('PdfTermViewerCommand', 1, true), messages[2])
   assert(messages[2]:match('viewer unavailable'), messages[2])
+  assert(clipboard_writes == 1 and copied == command, 'forward navigation changed the clipboard')
   print(vim.json.encode({
     case = case,
     setup_ns = setup_ns,
@@ -223,6 +253,7 @@ local ok, failure = xpcall(function()
   assert(vim.uv.fs_lstat(config.editor.path).ino == inode, 'live endpoint was stolen')
   local missing = run('missing')
   run('invalid')
+  run('denied_pdf')
   local defaults = run('defaults')
   assert(not vim.uv.fs_lstat(defaults.endpoint), 'default setup leaked its inverse endpoint')
   local results = {}

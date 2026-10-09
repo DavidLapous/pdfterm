@@ -1,6 +1,21 @@
 -- Run: PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua
 local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root)
+local copied_commands = {}
+local function capture_clipboard(lines)
+  copied_commands[#copied_commands + 1] = table.concat(lines, '\n')
+end
+vim.g.clipboard = {
+  name = 'test clipboard',
+  copy = {
+    ['+'] = capture_clipboard,
+    ['*'] = capture_clipboard,
+  },
+  paste = {
+    ['+'] = function() return {}, 'v' end,
+    ['*'] = function() return {}, 'v' end,
+  },
+}
 local directory = assert(vim.uv.fs_mkdtemp(root .. '/.nvim-test-XXXXXX'))
 vim.fn.mkdir(directory .. '/pdfterm', 'p', 448)
 vim.env.XDG_CONFIG_HOME = directory
@@ -175,12 +190,16 @@ local ok, failure = xpcall(function()
   local missing = root_file('missing.tex', { '% !TEX root = absent.tex' })
   local wrong_type = root_file('wrong-type.tex', { '% !TEX root = notes.txt' })
   root_file('notes.txt', { 'Not a TeX project.' })
+  vim.fn.mkdir(root_directory .. '/unreadable.tex')
+  local unreadable = root_file('unreadable-root.tex', { '% !TEX root = unreadable.tex' })
   local cycle = root_file('cycle.tex', { '% !TEX root = chapters/cycle.tex' })
   root_file('chapters/cycle.tex', { '% !TEX root = ../cycle-alias.tex' })
   assert(vim.uv.fs_symlink(cycle, root_directory .. '/cycle-alias.tex'))
-  for _, invalid in ipairs({ missing, wrong_type, cycle }) do
-    local accepted, error = pcall(project.describe, nil, invalid)
-    assert(not accepted and type(error) == 'string', 'invalid root project was accepted: ' .. invalid)
+  for _, invalid in ipairs({ missing, wrong_type, unreadable, cycle }) do
+    for _, current in ipairs({ false, table.concat(vim.fn.readfile(invalid), '\n') }) do
+      local accepted, error = pcall(project.describe, nil, invalid, current or nil)
+      assert(not accepted and type(error) == 'string', 'invalid root project was accepted: ' .. invalid)
+    end
   end
 
   vim.fn.mkdir(root_directory .. '/output')
@@ -422,12 +441,32 @@ local ok, failure = xpcall(function()
   vim.fn.writefile({
     '#!/bin/sh',
     'echo selected >> ' .. vim.fn.shellescape(directory .. '/bootstrap.log'),
-    'if test -f ' .. vim.fn.shellescape(directory .. '/hold-resolution') .. '; then',
-    '  touch ' .. vim.fn.shellescape(directory .. '/resolution-started'),
-    '  while test -f '
+    'for argument do',
+    '  if test "$argument" = --synctex-view && test -f ' .. vim.fn.shellescape(directory .. '/hold-resolution') .. '; then',
+    '    touch ' .. vim.fn.shellescape(directory .. '/resolution-started'),
+    '    while test -f '
       .. vim.fn.shellescape(directory .. '/hold-resolution')
       .. '; do sleep .01; done',
-    'fi',
+    '  fi',
+    '  if test "$argument" = --synctex-source-info && test -f '
+      .. vim.fn.shellescape(directory .. '/hold-metadata') .. '; then',
+    '    touch ' .. vim.fn.shellescape(directory .. '/metadata-started'),
+    '    while test -f ' .. vim.fn.shellescape(directory .. '/hold-metadata') .. '; do sleep .01; done',
+    '  fi',
+    '  if test "$argument" = --synctex-source-info && test -f '
+      .. vim.fn.shellescape(directory .. '/hold-build-preflight') .. '; then',
+    '    count=0',
+    '    if test -f ' .. vim.fn.shellescape(directory .. '/build-metadata-count')
+      .. '; then count=$(cat ' .. vim.fn.shellescape(directory .. '/build-metadata-count') .. '); fi',
+    '    count=$((count + 1))',
+    '    printf "%s" "$count" > ' .. vim.fn.shellescape(directory .. '/build-metadata-count'),
+    '    if test "$count" = 2; then',
+    '      touch ' .. vim.fn.shellescape(directory .. '/build-preflight-started'),
+    '      while test -f ' .. vim.fn.shellescape(directory .. '/hold-build-preflight')
+      .. '; do sleep .01; done',
+    '    fi',
+    '  fi',
+    'done',
     'exec ' .. vim.fn.shellescape(binary) .. ' "$@"',
   }, wrapper)
   assert(vim.uv.fs_chmod(wrapper, 448))
@@ -536,9 +575,10 @@ local ok, failure = xpcall(function()
   assert(resolved.code == 0, resolved.stderr)
   local expected = vim.json.decode(resolved.stdout)
   assert(requests[1].v == expected.v and requests[1].h == expected.h, 'latest forward intent lost')
-  assert(#vim.fn.readfile(directory .. '/bootstrap.log') == 2, 'obsolete build reached resolution')
   -- Opening an existing PDF must not invoke TeX/SyncTeX, even with compile enabled.
-  assert(vim.uv.fs_unlink(directory .. '/artifacts/navigation.synctex.gz'))
+  local sidecar = directory .. '/artifacts/navigation.synctex.gz'
+  local preserved_sidecar = sidecar .. '.saved'
+  assert(vim.uv.fs_rename(sidecar, preserved_sidecar))
   local linked_pdf = directory .. '/linked PDF.PDF'
   assert(vim.uv.fs_symlink(pdf, linked_pdf))
   adapter.open(linked_pdf)
@@ -554,7 +594,7 @@ local ok, failure = xpcall(function()
     not vim.uv.fs_stat(directory .. '/artifacts/navigation.synctex.gz'),
     'opening PDF unexpectedly rebuilt TeX'
   )
-  -- A missing SyncTeX sidecar must not prevent opening the existing PDF.
+  -- Unavailable source geometry warns without sending unrelated page-one navigation.
   adapter.toggle_compile()
   local navigation_notices = {}
   vim.notify = function(message, level)
@@ -563,17 +603,19 @@ local ok, failure = xpcall(function()
   end
   adapter.forward()
   wait(function()
+    return #navigation_notices > 0
+  end)
+  assert(#requests == 2, 'missing source geometry changed the viewer position')
+  for _, notice in ipairs(navigation_notices) do
+    assert(notice.level == vim.log.levels.WARN, 'unavailable source geometry did not warn')
+  end
+  -- A usable source line resumes navigation after the sidecar becomes available.
+  assert(vim.uv.fs_rename(preserved_sidecar, sidecar))
+  adapter.forward()
+  wait(function()
     return #requests == 3
   end)
-  assert(requests[3].pdf == vim.uv.fs_realpath(pdf) and requests[3].page == 1)
-  wait(function()
-    return #navigation_notices >= 2
-  end)
-  assert(
-    #navigation_notices == 2
-      and navigation_notices[1].level == vim.log.levels.WARN
-      and navigation_notices[2].message:find('viewer focus unavailable', 1, true)
-  )
+  assert(requests[3].page == expected.page, 'restored source geometry lost the requested line')
   -- Superseding an in-flight resolution must suppress its warning and fallback.
   navigation_notices = {}
   vim.fn.writefile({}, directory .. '/hold-resolution')
@@ -673,9 +715,11 @@ local ok, failure = xpcall(function()
     manual_capture = callback
   end
   local command_notices = #focus_notices
+  local copy_count = #copied_commands
   adapter.viewer_command(pdf)
   assert(manual_capture and #focus_notices == command_notices)
   assert(adapter._source_terminal == nil, 'old source survived a new manual pairing')
+  assert(#copied_commands == copy_count, 'manual command copied before source capture')
   manual_capture(nil, { kind = 'ghostty', id = 'manual-source' })
   wait(function()
     return adapter._source_terminal and adapter._source_terminal.id == 'manual-source'
@@ -684,6 +728,11 @@ local ok, failure = xpcall(function()
   assert(
     focus_notices[#focus_notices]:find(root .. '/scripts/pdfterm-viewer', 1, true),
     'focused manual command omitted the terminal-aware launcher'
+  )
+  assert(
+    #copied_commands == copy_count + 1
+      and copied_commands[#copied_commands] == focus_notices[#focus_notices],
+    'manual command was not copied after source capture'
   )
   focused = nil
   inverse_jump()
@@ -939,11 +988,268 @@ local ok, failure = xpcall(function()
       local request = requests[#requests]
       assert(request.pdf == vim.uv.fs_realpath(included_pdf), 'forward opened an included-file PDF')
       assert(request.page == case.page, 'forward lost the included source page')
-      assert(
-        request.word and request.word.words[request.word.selected + 1] == case.word,
-        'forward lost the original included text or Unicode cursor column'
-      )
+      assert(request.word == nil or request.word == vim.NIL,
+        'untraced TeX forward fabricated printed-word ownership')
+      assert(type(request.warning) == 'string',
+        'line-only navigation must report its source-ownership limitation')
     end
+  end
+  do
+    -- Public commands must choose a live directive before saving, while keeping
+    -- the selected PDF's compiled anchors alive across that save.
+    local base = directory .. '/edited root intent'
+    vim.fn.mkdir(base .. '/.git', 'p')
+    local child, main_a, main_b = base .. '/child.tex', base .. '/main-a.tex', base .. '/main-b.tex'
+    local pdf_a, pdf_b = base .. '/main-a.pdf', base .. '/main-b.pdf'
+    local literal = 'Copper owner needle glows among quiet amber stones.'
+    local directive_a, directive_b = '% !TEX root = main-a.tex', '% !TEX root = main-b.tex'
+    vim.fn.writefile({ directive_a, '', literal }, child)
+    for _, main in ipairs({ main_a, main_b }) do
+      local lines = {
+        '\\documentclass{article}', '\\pagestyle{empty}', '\\begin{document}',
+        main == main_a and 'Independent first root.' or 'Independent second root.',
+        '\\newpage',
+      }
+      if main == main_b then
+        vim.list_extend(lines, {
+          'An extra root page distinguishes source ownership.', '\\newpage',
+        })
+      end
+      lines[#lines + 1] = '\\input{child}'
+      lines[#lines + 1] = '\\end{document}'
+      vim.fn.writefile(lines, main)
+    end
+    local child_buffer = vim.fn.bufadd(child)
+    vim.fn.bufload(child_buffer)
+    local root_notices = {}
+    vim.notify = function(message, level)
+      root_notices[#root_notices + 1] = { message = tostring(message), level = level }
+    end
+    local function reset()
+      vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
+      wait(function() return not vim.uv.fs_lstat(config.editor.path) end)
+      package.loaded['pdfterm'] = nil
+      adapter = require('pdfterm')
+      adapter.setup({
+        executable = wrapper, session = 'adapter', attach_only = true,
+        focus_on_inverse = false, focus_on_forward = false, compile = true,
+      })
+    end
+    local function finish_build()
+      wait(function()
+        for _, notice in ipairs(root_notices) do
+          if notice.message:match('^Compilation OK') or notice.level == vim.log.levels.ERROR then
+            return true
+          end
+        end
+        return false
+      end)
+      local last = root_notices[#root_notices]
+      assert(last.message:match('^Compilation OK'), last.message)
+    end
+    local function digest(path)
+      local fd = assert(vim.uv.fs_open(path, 'r', 0))
+      local bytes = assert(vim.uv.fs_read(fd, assert(vim.uv.fs_fstat(fd)).size, 0))
+      assert(vim.uv.fs_close(fd))
+      return vim.fn.sha256(bytes)
+    end
+    local function include(name)
+      -- Use literal includes and change a recorded compiler input. A previously
+      -- absent IfFileExists branch need not invalidate latexmk's old output.
+      vim.api.nvim_buf_call(vim.fn.bufnr(main_b), function()
+        vim.api.nvim_buf_set_lines(0, -2, -2, false, { '\\newpage', '\\input{' .. name .. '}' })
+        vim.cmd('write')
+      end)
+    end
+    local function navigate(pdf_path, page, word, row, text)
+      vim.api.nvim_win_set_cursor(0, { row, assert(text:find(word, 1, true)) - 1 })
+      local previous = #requests
+      vim.cmd('PdfTermForward')
+      wait(function() return #requests == previous + 1 end)
+      local request = requests[#requests]
+      assert(request.pdf == vim.uv.fs_realpath(pdf_path), 'live root selected the wrong PDF')
+      assert(request.page == page,
+        'root selection lost the included source cursor; expected page ' .. page .. ': '
+          .. vim.json.encode(request))
+      assert(request.word == nil or request.word == vim.NIL,
+        'unchanged source text cannot prove TeX execution ownership: ' .. vim.json.encode(request))
+      assert(type(request.warning) == 'string',
+        'unchanged source anchor must retain its compiler line with a warning')
+      return request
+    end
+    reset()
+    for _, main in ipairs({ main_a, main_b }) do
+      vim.cmd.edit(vim.fn.fnameescape(main))
+      root_notices = {}
+      vim.cmd('PdfTermBuild')
+      finish_build()
+    end
+    local original_a, original_b = digest(pdf_a), digest(pdf_b)
+    local raw = vim.system({
+      binary, pdf_b, '--synctex-view', child, '--line', '3',
+      '--column', tostring(assert(literal:find('needle', 1, true))),
+    }, { text = true }):wait(10000)
+    assert(raw.code == 0, raw.stderr)
+    local expected = vim.json.decode(raw.stdout)
+    vim.cmd.edit(vim.fn.fnameescape(child))
+    adapter.toggle_compile()
+    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_b })
+    vim.api.nvim_buf_set_lines(child_buffer, 2, 2, false, { '% A new comment moves only the live cursor.' })
+    local request = navigate(pdf_b, 3, 'needle', 4, literal)
+    assert(request.h == expected.h and request.v == expected.v,
+      'saving an edited directive rebased an unchanged compiled source span')
+    assert(vim.fn.readfile(child)[1] == directive_b, 'forward did not save its selected source')
+    assert(digest(pdf_a) == original_a and digest(pdf_b) == original_b,
+      'noncompiling forward rebuilt a root')
+
+    -- Editing A to B must rebuild B, not merely resolve a B-shaped argument vector.
+    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_a })
+    vim.cmd('write')
+    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_b })
+    vim.api.nvim_buf_set_lines(child_buffer, -1, -1, false, {
+      '', 'Newly printed turquoise lanterns distinguish the rebuilt second document.',
+    })
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    finish_build()
+    assert(vim.fn.readfile(child)[1] == directive_b, 'build saved the wrong source directive')
+    assert(digest(pdf_a) == original_a and digest(pdf_b) ~= original_b,
+      'public build compiled the old root after saving the new directive')
+
+    -- New unsaved children work with both a live directive and automatic ownership.
+    local fresh_build = base .. '/fresh-build.tex'
+    local fresh_literal = 'Silver owner silverneedle glows among quiet amber stones.'
+    include('fresh-build')
+    vim.cmd.edit(vim.fn.fnameescape(fresh_build))
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { directive_b, fresh_literal })
+    assert(vim.fn.filereadable(fresh_build) == 0)
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    finish_build()
+    assert(vim.fn.filereadable(fresh_build) == 1, 'new build source was not saved')
+    navigate(pdf_b, 4, 'silverneedle', 2, fresh_literal)
+    local fresh_forward = base .. '/fresh-forward.tex'
+    local forward_literal = 'Violet grove orchard glows across mellow saffron hills.'
+    include('fresh-forward')
+    vim.cmd.edit(vim.fn.fnameescape(fresh_forward))
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { '% A new child without a directive.', forward_literal })
+    assert(vim.fn.filereadable(fresh_forward) == 0)
+    adapter.toggle_compile()
+    navigate(pdf_b, 5, 'orchard', 2, forward_literal)
+    assert(vim.fn.filereadable(fresh_forward) == 1, 'new forward source was not saved')
+    assert(digest(pdf_a) == original_a, 'new included sources rebuilt the independent first root')
+
+    adapter.toggle_compile()
+    vim.cmd('PdfTermMain ' .. vim.fn.fnameescape(main_a))
+    vim.cmd.edit(vim.fn.fnameescape(child))
+    navigate(pdf_a, 2, 'needle', 4, literal)
+
+    -- Changes during metadata acquisition reselect the root before the write.
+    reset()
+    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_a })
+    vim.fn.delete(directory .. '/metadata-started')
+    vim.fn.writefile({}, directory .. '/hold-metadata')
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    wait(function() return vim.fn.filereadable(directory .. '/metadata-started') == 1 end)
+    assert(vim.fn.readfile(child)[1] == directive_b, 'build saved before preserving compiled metadata')
+    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_b })
+    vim.api.nvim_buf_set_lines(child_buffer, -1, -1, false, {
+      '', 'Chartreuse compasses distinguish the latest source intent.',
+    })
+    assert(vim.uv.fs_unlink(directory .. '/hold-metadata'))
+    finish_build()
+    assert(digest(pdf_a) == original_a and vim.fn.readfile(child)[1] == directive_b,
+      'an asynchronous root change compiled stale ownership')
+
+    -- Supersession must leave the old dirty buffer unsaved and navigate nowhere.
+    local saved_child = vim.fn.readfile(child)
+    vim.api.nvim_buf_set_lines(child_buffer, -1, -1, false, { 'Obsolete unsaved intent.' })
+    local previous = #requests
+    vim.fn.delete(directory .. '/metadata-started')
+    vim.fn.writefile({}, directory .. '/hold-metadata')
+    vim.cmd('PdfTermForward')
+    wait(function() return vim.fn.filereadable(directory .. '/metadata-started') == 1 end)
+    vim.cmd('hide edit ' .. vim.fn.fnameescape(fresh_build))
+    vim.api.nvim_buf_set_lines(0, -1, -1, false, { '', 'Only the active build intent is saved.' })
+    assert(vim.uv.fs_unlink(directory .. '/hold-metadata'))
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    finish_build()
+    assert(vim.deep_equal(vim.fn.readfile(child), saved_child) and vim.bo[child_buffer].modified,
+      'superseded forward saved the old source buffer')
+    assert(#requests == previous, 'superseded root resolution navigated')
+    assert(vim.fn.readfile(fresh_build)[4] == 'Only the active build intent is saved.',
+      'latest build saved a different buffer')
+    vim.api.nvim_buf_set_lines(child_buffer, 0, -1, false, saved_child)
+    vim.bo[child_buffer].modified = false
+
+    -- A post-save build preflight cannot start an obsolete compiler or strand
+    -- the current successor queued behind the same working directory.
+    local before_preflight_b = digest(pdf_b)
+    local obsolete_text = 'An obsolete compiler must not print this new paragraph.'
+    vim.cmd.edit(vim.fn.fnameescape(child))
+    vim.api.nvim_buf_set_lines(child_buffer, -1, -1, false, { '', obsolete_text })
+    vim.fn.delete(directory .. '/build-metadata-count')
+    vim.fn.delete(directory .. '/build-preflight-started')
+    vim.fn.writefile({}, directory .. '/hold-build-preflight')
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    wait(function() return vim.fn.filereadable(directory .. '/build-preflight-started') == 1 end)
+    local written_child = vim.fn.readfile(child)
+    assert(written_child[#written_child] == obsolete_text, 'preflight test did not reach the post-save stage')
+    vim.cmd.edit(vim.fn.fnameescape(main_a))
+    local latest_text = 'The latest independent root rebuilds its real output.'
+    vim.api.nvim_buf_set_lines(0, 3, 4, false, { latest_text })
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    wait(function() return vim.fn.readfile(main_a)[4] == latest_text end)
+    assert(vim.uv.fs_unlink(directory .. '/hold-build-preflight'))
+    finish_build()
+    assert(digest(pdf_b) == before_preflight_b, 'superseded preflight started the old compiler')
+    assert(digest(pdf_a) ~= original_a, 'retiring the stale preflight stranded the current queued build')
+
+    -- An unsaved standalone document may explicitly name itself through a
+    -- parent-directory alias; no unrelated missing root gains that permission.
+    local self_directory, self_alias = base .. '/self roots', base .. '/self alias'
+    vim.fn.mkdir(self_directory)
+    assert(vim.uv.fs_symlink(self_directory, self_alias))
+    for _, case in ipairs({
+      { name = 'new-build', action = 'build', target = 'buildneedle' },
+      { name = 'new-forward', action = 'forward', target = 'forwardneedle' },
+    }) do
+      reset()
+      local path = self_alias .. '/' .. case.name .. '.tex'
+      local self_pdf = self_directory .. '/' .. case.name .. '.pdf'
+      local self_literal = 'Copper owner glows ' .. case.target .. ' among quiet amber stones.'
+      vim.cmd.edit(vim.fn.fnameescape(path))
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, {
+        '% !TEX root = ./' .. case.name .. '.tex',
+        '\\documentclass{article}', '\\pagestyle{empty}', '\\begin{document}',
+        self_literal, '\\end{document}',
+      })
+      assert(vim.fn.filereadable(path) == 0 and not vim.uv.fs_stat(self_pdf))
+      if case.action == 'build' then
+        root_notices = {}
+        vim.cmd('PdfTermBuild')
+        finish_build()
+        adapter.toggle_compile()
+      end
+      navigate(self_pdf, 1, case.target, 5, self_literal)
+      assert(vim.fn.filereadable(path) == 1, 'self-root command did not perform the first save')
+    end
+    local missing_source = self_alias .. '/missing-child.tex'
+    vim.cmd.edit(vim.fn.fnameescape(missing_source))
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { '% !TEX root = missing-other.tex' })
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    wait(function() return #root_notices > 0 end)
+    assert(root_notices[#root_notices].level == vim.log.levels.ERROR
+      and root_notices[#root_notices].message:find('TeX root file does not exist', 1, true),
+      'a missing unrelated root was accepted as an unsaved self-root')
+    assert(vim.fn.filereadable(missing_source) == 0, 'invalid root command saved its source')
+    vim.bo.modified = false
+    vim.notify = original_notify
   end
   -- Attaching never requires capture, but requested inverse focus retains a
   -- manually paired terminal when discovery is temporarily unavailable.

@@ -76,14 +76,20 @@ The bundled plugin works with [Lazy.nvim](https://github.com/folke/lazy.nvim); i
 
 `:PdfTermOpen` opens a PDF. `:PdfTermForwardSplit` opens/navigates the viewer beside Neovim; `:PdfTermForward` navigates an existing viewer.
 
-Kitty splits require `allow_remote_control yes`; detached Neovim also needs a private `listen_on` socket. Ghostty control is macOS-only. WezTerm requires `wezterm` on `PATH`. For manual pairing, use `:PdfTermViewerCommand`.
+Kitty splits require `allow_remote_control yes`; detached Neovim also needs a private `listen_on` socket. Ghostty control is macOS-only. WezTerm requires `wezterm` on `PATH`. For manual pairing, `:PdfTermViewerCommand` prints the Neovim-attached launch command and copies it to the clipboard.
 
 ## SyncTeX
 
-LaTeX navigation requires `synctex` on `PATH` and a matching `.synctex.gz` sidecar:
+LaTeX navigation requires `synctex` on `PATH` and a matching PDF/`.synctex.gz` build:
 
 ```console
 latexmk -pdf -synctex=1 main.tex
 ```
 
 Forward search uses the source cursor; `Alt`/`Option` + click or `x` navigates from PDF text back to its source. Neither direction changes terminal focus by default.
+
+The Neovim adapter tracks compiled source with immutable snapshots and native line-range anchors. Unchanged text follows insertions, deletions, undo, reload, and known buffer renames. New or changed text, deleted inverse targets, and unavailable history use a warned compiled/live anchor; new text is not treated as printed text. A successful plugin build captures saved inputs when compilation starts. Existing or externally rebuilt PDFs have unverified source history and warn until a captured build establishes it. Build and forward commands use edited root directives without losing pre-save anchors.
+
+SyncTeX forward search uses warned compiler LINE geometry, not exact WORD ownership: saved-source hashes and matching text cannot prove which tokens arbitrary TeX hooks or macros printed. A captured build verifies source history, not TeX execution. The existing overlay/page selection is retained, but does not prove ownership of a particular printed word or table row. Without a usable line target, Neovim warns and leaves the current PDF position unchanged; it never substitutes the document beginning. Inverse search remains enabled; strict inverse search rejects competing targets and invalid source bounds. Invalid required source-cache data, missing PDFs, failed compilation, required-tool failures, and viewer/socket failures remain errors. A coarse forward warning does not enable best-guess inverse navigation in a standalone viewer.
+
+Socket/command navigation leaves the clipboard untouched. `editor.transport = "none"` copies source locations via OSC 52; explicit `y` still copies page text.

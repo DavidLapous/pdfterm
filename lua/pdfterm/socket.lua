@@ -178,6 +178,40 @@ function M.diagnose(path, callback)
   end)
 end
 
+local function absolute_path(path)
+  return type(path) == 'string' and path:sub(1, 1) == '/' and not path:find('%z')
+end
+
+local function revision(value, expected)
+  if type(value) ~= 'table' then return false end
+  for _, field in ipairs({
+    'device', 'inode', 'length', 'modified_seconds', 'modified_nanoseconds',
+    'changed_seconds', 'changed_nanoseconds',
+  }) do
+    local number = value[field]
+    if type(number) ~= 'number' or number % 1 ~= 0
+      or number < 0 and field ~= 'modified_seconds' and field ~= 'changed_seconds'
+      or expected and number ~= expected[field] then return false end
+  end
+  return value.modified_nanoseconds < 1000000000 and value.changed_nanoseconds < 1000000000
+end
+
+local function document_context(location)
+  local snapshot, warning = location.source_snapshot, location.warning
+  if snapshot ~= nil and snapshot ~= vim.NIL and not absolute_path(snapshot) then return false end
+  if warning ~= nil and warning ~= vim.NIL
+    and (type(warning) ~= 'string' or #warning > 4096 or warning:find('%z')) then return false end
+  local document = location.document_revision
+  if document == nil then return snapshot == nil end
+  if not absolute_path(location.pdf) or type(document) ~= 'table'
+    or not revision(document.pdf) or not revision(location.revision, document.pdf) then return false end
+  local companion = document.companion
+  return companion == nil or companion == vim.NIL or (
+    type(companion) == 'table' and #companion == 2
+    and type(companion[1]) == 'boolean' and revision(companion[2])
+  )
+end
+
 function M.listen(path, on_location)
   local parent = assert(vim.uv.fs_lstat(vim.fs.dirname(path)))
   assert(
@@ -256,6 +290,7 @@ function M.listen(path, on_location)
             or type(location.byte_column) ~= 'number'
             or location.byte_column < 0
             or location.byte_column % 1 ~= 0
+            or not document_context(location)
           then
             vim.notify('pdfterm: invalid inverse-search JSON location', vim.log.levels.ERROR)
           else

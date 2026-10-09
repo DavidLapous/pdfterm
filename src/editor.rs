@@ -1,7 +1,8 @@
 use crate::process::Operation;
-use crate::synctex::SourceLocation;
+use crate::synctex::{DocumentRevision, SourceLocation};
 use serde::{Deserialize, Serialize};
 use std::io;
+use std::path::Path;
 use std::process::Command;
 
 /// Editor selection is trusted configuration. Document paths are arguments, never shell code.
@@ -16,6 +17,25 @@ pub enum Editor {
     Command {
         argv: Vec<String>,
     },
+}
+
+#[derive(Serialize)]
+pub struct SourceDocument<'a> {
+    pub pdf: &'a Path,
+    pub revision: crate::synctex::PdfRevision,
+    pub document_revision: DocumentRevision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_snapshot: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct EditorLocation<'a> {
+    #[serde(flatten)]
+    location: &'a SourceLocation,
+    #[serde(flatten)]
+    document: Option<SourceDocument<'a>>,
 }
 
 impl Editor {
@@ -54,13 +74,22 @@ impl Editor {
         }
     }
 
-    pub fn deliver(&self, location: &SourceLocation, operation: &Operation) -> io::Result<()> {
+    pub fn deliver(
+        &self,
+        location: &SourceLocation,
+        operation: &Operation,
+        document: Option<SourceDocument<'_>>,
+    ) -> io::Result<()> {
         operation.check()?;
         match self {
             Self::None => Ok(()),
             Self::Socket { path } => {
                 let mut stream = crate::ipc::connect(path, operation)?;
-                crate::ipc::send(&mut stream, &serde_json::to_vec(location)?, operation)
+                crate::ipc::send(
+                    &mut stream,
+                    &serde_json::to_vec(&EditorLocation { location, document })?,
+                    operation,
+                )
             }
             Self::Command { argv } => {
                 self.validate()?;
@@ -139,7 +168,9 @@ mod tests {
             column_char: 3,
             precise: true,
         };
-        editor.deliver(&location, &Operation::default()).unwrap();
+        editor
+            .deliver(&location, &Operation::default(), None)
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
             format!("{}\n7:4:3:5:6\n", location.file)
@@ -148,7 +179,7 @@ mod tests {
             Editor::Command {
                 argv: vec!["false".into()]
             }
-            .deliver(&location, &Operation::default())
+            .deliver(&location, &Operation::default(), None)
             .is_err()
         );
         assert!(

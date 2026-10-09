@@ -2,7 +2,9 @@ mod math;
 
 use crate::pdf::SearchRect;
 use crate::process::Operation;
+use crate::source_snapshot::{SourceSnapshot, valid_absolute_path, valid_warning};
 use serde::{Deserialize, Serialize};
+use std::rc::Rc;
 use std::{
     fs,
     io::{self, BufRead, BufReader, Read},
@@ -14,7 +16,7 @@ use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 /// Source coordinates: one-based line, zero-based UTF-8 byte offset;
 /// column is one-based UTF-16 (VS Code), column_char is one-based Unicode scalar.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceLocation {
     pub file: String,
@@ -66,7 +68,8 @@ impl PdfRevision {
 /// Metadata identity of both files observed when PDFium opens a document.
 /// Stability does not prove a common build; producers must publish a completed
 /// PDF/SyncTeX pair before requesting navigation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DocumentRevision {
     pub pdf: PdfRevision,
     companion: Option<(bool, PdfRevision)>,
@@ -152,6 +155,13 @@ impl ForwardWord {
     }
 }
 
+/// Compact raw or qualified forward geometry in original compiler coordinates.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForwardCandidate {
+    pub page: u32,
+    pub rect: SearchRect,
+}
+
 // Editor adapters can supply a literal saved line and UTF-8 cursor offset.
 // Tokenize here so every adapter shares PDF matching's Unicode word rules.
 fn deserialize_forward_word<'de, D>(deserializer: D) -> Result<Option<ForwardWord>, D::Error>
@@ -197,6 +207,13 @@ pub struct ForwardRequest {
     /// Revision-bound compiler source-map service supplied by an editor adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inverse_search: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot: Option<PathBuf>,
+    /// Explicit opt-in to warned inverse anchors; a refinement warning alone is not opt-in.
+    #[serde(default)]
+    pub best_guess: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 impl ForwardRequest {
@@ -210,6 +227,26 @@ impl ForwardRequest {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self
+            .source_snapshot
+            .as_ref()
+            .is_some_and(|path| !valid_absolute_path(path))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source snapshot must be an absolute UTF-8 path",
+            ));
+        }
+        if self
+            .warning
+            .as_ref()
+            .is_some_and(|warning| !valid_warning(warning))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid forward navigation warning",
+            ));
+        }
         if self
             .inverse_search
             .as_ref()
@@ -226,20 +263,8 @@ impl ForwardRequest {
                 "invalid forward word context",
             ));
         }
-        if !self.pdf.is_absolute()
-            || self.page == 0
-            || self.width < 0.0
-            || self.height < 0.0
-            || ![
-                self.h,
-                self.v,
-                self.width,
-                self.height,
-                self.h + self.width,
-                self.v - self.height,
-            ]
-            .into_iter()
-            .all(f32::is_finite)
+        if !valid_absolute_path(&self.pdf)
+            || !forward_geometry_valid(self.page, self.h, self.v, self.width, self.height)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -256,13 +281,40 @@ pub fn parse_forward_request(payload: &str) -> io::Result<ForwardRequest> {
     Ok(request)
 }
 
+/// Explicit editor context; standalone navigation keeps the strict default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ForwardSource<'a> {
+    pub snapshot: Option<&'a Path>,
+    pub best_guess: bool,
+    pub anchor_only: bool,
+}
+
+/// No usable compiler geometry exists for this otherwise valid request.
+/// Explicit editor best-guess commands distinguish this from operational errors.
+#[derive(Debug)]
+pub struct ForwardUnavailable(&'static str);
+
+impl std::fmt::Display for ForwardUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ForwardUnavailable {}
+
+pub fn is_forward_unavailable(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<ForwardUnavailable>())
+}
+
 pub fn resolve_forward(
     pdf: &Path,
     file: &Path,
     line: u32,
     column: u32,
 ) -> io::Result<ForwardRequest> {
-    resolve_forward_with_library(pdf, file, line, column, None)
+    resolve_forward_with_library(pdf, file, line, column, None, ForwardSource::default())
 }
 
 pub fn resolve_forward_with_library(
@@ -271,21 +323,149 @@ pub fn resolve_forward_with_library(
     line: u32,
     column: u32,
     library: Option<&Path>,
+    context: ForwardSource<'_>,
 ) -> io::Result<ForwardRequest> {
     if line == 0 || column == 0 {
         return Err(io::Error::other("source line and column must be positive"));
     }
     let pdf = fs::canonicalize(pdf)?;
-    let file = fs::canonicalize(file)?;
-    let revision = PdfRevision::read(&pdf)?;
-    let source = read_source(&file)?;
-    let word = source
-        .lines()
-        .nth(line as usize - 1)
-        .and_then(|text| ForwardWord::at(text, column));
-    // Beamer records frame bodies at the closing line; query that line so the
-    // resolver cannot pick an earlier frame's mapping.
-    let view_line = frame_closing_line(&source, line).unwrap_or(line);
+    let snapshot = context
+        .snapshot
+        .map(|path| SourceSnapshot::load(path, &pdf))
+        .transpose()?;
+    let allow_anchor = context.best_guess || context.anchor_only;
+    let mut document_revision = match &snapshot {
+        Some(snapshot) => Some(snapshot.revision),
+        None if allow_anchor => {
+            drop(crate::source_snapshot::open_regular(&pdf, false)?);
+            Some(DocumentRevision::read(&pdf)?)
+        }
+        None => None,
+    };
+    if snapshot.is_none()
+        && allow_anchor
+        && document_revision.is_some_and(|revision| revision.companion.is_none())
+    {
+        return Err(io::Error::other(ForwardUnavailable(
+            "no SyncTeX sidecar is available for source positioning",
+        )));
+    }
+    let file = match &snapshot {
+        Some(snapshot) => snapshot.normalize(file)?,
+        None if context.anchor_only => match fs::canonicalize(file) {
+            Ok(file) => file,
+            Err(_) => crate::source_snapshot::normalize_absolute(file, &std::env::current_dir()?)?,
+        },
+        None => fs::canonicalize(file)?,
+    };
+    let revision = match document_revision {
+        Some(revision) => revision.pdf,
+        None => PdfRevision::read(&pdf)?,
+    };
+    // Root identity is compiler metadata, never a basename or a live-source
+    // guess. A published root cache remains required even for LINE fallback.
+    let (root_source, cached_root) = match &snapshot {
+        Some(snapshot) => {
+            let root = snapshot.read(&snapshot.main).map_err(|error| {
+                if crate::source_snapshot::required_cache_error(&error) {
+                    error
+                } else {
+                    io::Error::new(
+                        error.kind(),
+                        crate::source_snapshot::SnapshotReadError(error),
+                    )
+                }
+            })?;
+            let root_source = snapshot.main == file;
+            (root_source, root_source.then_some(root))
+        }
+        None => {
+            let inputs = crate::source_snapshot::SourceInfo::read(&pdf)?;
+            let main = inputs
+                .main
+                .as_ref()
+                .ok_or_else(|| io::Error::other("compiler root source identity is unavailable"))?;
+            if inputs.revision.pdf != revision
+                || document_revision.is_some_and(|revision| revision != inputs.revision)
+            {
+                return Err(io::Error::other(
+                    "document changed while reading compiler root identity",
+                ));
+            }
+            document_revision = Some(inputs.revision);
+            (main == &file, None)
+        }
+    };
+    let mut warning = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.warning(&file))
+        .map(str::to_owned);
+    if snapshot.is_none() && context.anchor_only {
+        warning = Some(
+            "best-guess navigation: compiled source history unavailable; using the compiler line anchor"
+                .into(),
+        );
+    }
+    let source = match &snapshot {
+        Some(_) if root_source => cached_root,
+        Some(snapshot) => match snapshot.read(&file) {
+            Ok(source) => Some(source),
+            Err(error) if allow_anchor && !crate::source_snapshot::required_cache_error(&error) => {
+                warning = Some(format!(
+                    "best-guess navigation: compiled source unavailable: {error}"
+                ));
+                None
+            }
+            Err(error) => return Err(error),
+        },
+        None if context.anchor_only => None,
+        None => Some(read_source(&file)?),
+    };
+    if snapshot.is_some()
+        && allow_anchor
+        && document_revision.is_some_and(|revision| revision.companion.is_none())
+    {
+        return Err(io::Error::other(ForwardUnavailable(
+            "no SyncTeX sidecar is available for source positioning",
+        )));
+    }
+    if warning.is_some() && !allow_anchor {
+        return Err(io::Error::other(
+            "compiled source snapshot provenance is unverified",
+        ));
+    }
+    let original_line = match source
+        .as_deref()
+        .map(|source| validate_forward_source_position(source, line, column))
+    {
+        Some(Ok(text)) => Some(text),
+        Some(Err(_))
+            if context.anchor_only && source.as_deref() == Some("") && line == 1 && column == 1 =>
+        {
+            return Err(io::Error::other(ForwardUnavailable(
+                "compiled source is empty; no printed source position is available",
+            )));
+        }
+        Some(Err(error)) if warning.is_some() && allow_anchor => {
+            warning = Some(format!(
+                "best-guess navigation: compiled source position cannot be qualified: {error}"
+            ));
+            None
+        }
+        Some(Err(error)) => return Err(error),
+        None => None,
+    };
+    let page_hint = if context.anchor_only || warning.is_some() {
+        None
+    } else {
+        original_line.and_then(|text| ForwardWord::at(text, column))
+    };
+    // Beamer records frame bodies at the closing line; retain the original
+    // compiled source's frame ownership even when the live source was edited.
+    let view_line = source
+        .as_deref()
+        .and_then(|source| frame_closing_line(source, line))
+        .unwrap_or(line);
     let spec = format!(
         "{view_line}:{column}:{}",
         file.to_str()
@@ -302,76 +482,165 @@ pub fn resolve_forward_with_library(
                 .ok_or_else(|| io::Error::other("PDF path is not UTF-8"))?,
         ],
     )?;
-    let (mut page, mut h, mut v, mut width, mut height) = (None, None, None, None, None);
-    let mut candidates = Vec::new();
-    let mut captured = false;
-    for row in stdout.lines() {
-        if let Some((key, value)) = row.split_once(':') {
-            match key {
-                "Page" => {
-                    page = value.trim().parse::<u32>().ok();
-                    h = None;
-                    v = None;
-                    width = None;
-                    height = None;
-                    captured = false;
-                }
-                "h" => h = value.trim().parse::<f32>().ok(),
-                "v" => v = value.trim().parse::<f32>().ok(),
-                "W" => width = value.trim().parse::<f32>().ok(),
-                "H" => height = value.trim().parse::<f32>().ok(),
-                _ => {}
+    let candidates = parse_synctex_view(&stdout)?;
+    let line_candidate = |hint: Option<&ForwardWord>| {
+        let anchor = best_guess_forward_candidate(&candidates)?;
+        match hint {
+            Some(hint) => {
+                crate::pdf::select_forward_line_candidate(&pdf, &candidates, hint, anchor, library)
+                    .map_err(io::Error::other)
             }
+            None => Ok(anchor),
         }
-        if !captured
-            && let (Some(page), Some(h), Some(v), Some(width), Some(height)) =
-                (page, h, v, width, height)
-        {
-            let result = ForwardRequest {
-                revision,
-                pdf: pdf.clone(),
-                page,
-                h,
-                v,
-                width,
-                height,
-                word: word.clone(),
-                inverse_search: None,
-            };
-            match result.validate() {
-                Ok(()) => candidates.push(result),
-                Err(error) if candidates.is_empty() => return Err(error),
-                Err(_) => {}
-            }
-            captured = true;
-        }
+    };
+    let selected = if context.anchor_only || warning.is_some() {
+        warning.get_or_insert_with(|| "line-only navigation: using the SyncTeX line anchor".into());
+        best_guess_forward_candidate(&candidates)?
+    } else {
+        // Saved bytes and input identities do not trace TeX's hooks, imported
+        // code, or token execution. Text similarity cannot prove source ownership.
+        // Keep the legacy overlay page policy without publishing a WORD hint.
+        let selected = line_candidate(page_hint.as_ref())?;
+        warning = Some(
+            "line-only navigation: compiled TeX execution cannot be verified; using the SyncTeX line anchor"
+                .into(),
+        );
+        selected
+    };
+    let result = ForwardRequest {
+        pdf,
+        revision,
+        page: selected.page,
+        h: selected.rect.left,
+        v: selected.rect.bottom,
+        width: selected.rect.right - selected.rect.left,
+        height: selected.rect.bottom - selected.rect.top,
+        word: None,
+        inverse_search: None,
+        source_snapshot: snapshot.as_ref().map(|snapshot| snapshot.path.clone()),
+        best_guess: context.best_guess,
+        warning,
+    };
+    result.validate()?;
+    if let Some(revision) = document_revision {
+        revision.check(&result.pdf)?;
+    } else {
+        revision.check(&result.pdf)?;
     }
-    let mut result = candidates
-        .first()
-        .cloned()
-        .ok_or_else(|| io::Error::other("synctex view returned no complete match"))?;
-    if let Some(hint) = &word {
-        let mut pages = Vec::new();
-        for candidate in &candidates {
-            if !pages.contains(&candidate.page) {
-                pages.push(candidate.page);
-            }
-        }
-        // SyncTeX returns overlay matches in traversal order, which need not
-        // be page order. Keep its first result as fallback, then inspect the
-        // remaining overlays in the order a reader sees them.
-        if pages.len() > 1 {
-            pages[1..].sort_unstable();
-        }
-        if let Some(page) = crate::pdf::first_visible_forward_page(&pdf, &pages, hint, library)
-            .map_err(io::Error::other)?
-            && let Some(candidate) = candidates.iter().find(|candidate| candidate.page == page)
-        {
-            result = candidate.clone();
-        }
-    }
-    revision.check(&pdf)?;
     Ok(result)
+}
+
+fn best_guess_forward_candidate(candidates: &[ForwardCandidate]) -> io::Result<ForwardCandidate> {
+    // SyncTeX orders results by its nearest source anchor. Preserve that order,
+    // skipping only empty geometry; never claim a particular printed word.
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.rect.right > candidate.rect.left || candidate.rect.bottom > candidate.rect.top
+        })
+        .copied()
+        .ok_or_else(|| {
+            io::Error::other(ForwardUnavailable(
+                "synctex view returned no usable compiler anchor geometry",
+            ))
+        })
+}
+
+fn forward_geometry_valid(page: u32, h: f32, v: f32, width: f32, height: f32) -> bool {
+    page > 0
+        && width >= 0.0
+        && height >= 0.0
+        && [h, v, width, height, h + width, v - height]
+            .into_iter()
+            .all(f32::is_finite)
+}
+
+fn append_forward_record(
+    candidates: &mut Vec<ForwardCandidate>,
+    page: u32,
+    bounds: [Option<f32>; 4],
+) -> io::Result<()> {
+    let [Some(h), Some(v), Some(width), Some(height)] = bounds else {
+        return Err(io::Error::other(
+            "synctex view returned an incomplete match",
+        ));
+    };
+    if page == 0
+        || ![h, v, width, height, h + width, v - height]
+            .into_iter()
+            .all(f32::is_finite)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "synctex view returned invalid forward geometry",
+        ));
+    }
+    // SyncTeX emits signed, non-display layout boxes for ordinary Beamer
+    // overlays. They are not selectable regions; retain the usable records.
+    if width < 0.0 || height < 0.0 {
+        return Ok(());
+    }
+    let candidate = ForwardCandidate {
+        page,
+        rect: SearchRect {
+            left: h,
+            top: v - height,
+            right: h + width,
+            bottom: v,
+        },
+    };
+    if !candidates
+        .iter()
+        .any(|old| old.page == candidate.page && old.rect == candidate.rect)
+    {
+        candidates.push(candidate);
+    }
+    Ok(())
+}
+
+fn parse_synctex_view(stdout: &str) -> io::Result<Vec<ForwardCandidate>> {
+    let mut candidates = Vec::new();
+    let mut record = None;
+    for row in stdout.lines() {
+        let Some((key, value)) = row.split_once(':') else {
+            continue;
+        };
+        if key == "Page" {
+            if let Some((page, bounds)) = record.take() {
+                append_forward_record(&mut candidates, page, bounds)?;
+            }
+            let page = value.trim().parse::<u32>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid SyncTeX page: {error}"),
+                )
+            })?;
+            record = Some((page, [None; 4]));
+        } else if let Some((_, bounds)) = record.as_mut() {
+            let index = match key {
+                "h" => 0,
+                "v" => 1,
+                "W" => 2,
+                "H" => 3,
+                _ => continue,
+            };
+            bounds[index] = Some(value.trim().parse::<f32>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid SyncTeX {key}: {error}"),
+                )
+            })?);
+        }
+    }
+    if let Some((page, bounds)) = record {
+        append_forward_record(&mut candidates, page, bounds)?;
+    }
+    if candidates.is_empty() {
+        return Err(io::Error::other(ForwardUnavailable(
+            "synctex view returned no complete match",
+        )));
+    }
+    Ok(candidates)
 }
 
 fn run(operation: &Operation, args: &[&str]) -> io::Result<String> {
@@ -400,8 +669,32 @@ pub fn resolve_inverse(
     word: Option<(&str, usize)>,
     radius: u32,
     operation: &Operation,
+    source_snapshot: Option<&Path>,
+    best_guess: bool,
 ) -> io::Result<InverseResolution> {
+    operation.check()?;
+    if point.page == 0
+        || point.page_height_pt <= 0.0
+        || ![point.x, point.y_from_top, point.page_height_pt]
+            .into_iter()
+            .all(f32::is_finite)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inverse search requires a positive page and finite compiler coordinates",
+        ));
+    }
     let pdf = std::path::absolute(pdf)?;
+    let snapshot = source_snapshot
+        .map(|path| SourceSnapshot::load(path, &pdf))
+        .transpose()?;
+    let raw_revision = if best_guess && snapshot.is_none() {
+        drop(crate::source_snapshot::open_regular(&pdf, false)?);
+        Some(DocumentRevision::read(&pdf)?)
+    } else {
+        None
+    };
+    operation.check()?;
     let spec = format!(
         "{}:{:.2}:{:.2}:{}",
         point.page,
@@ -410,76 +703,443 @@ pub fn resolve_inverse(
         pdf.display()
     );
     let stdout = run(operation, &["edit", "-o", &spec])?;
-    let mut target = parse_synctex_edit(&stdout)
-        .ok_or_else(|| io::Error::other("synctex edit returned no match"))?;
-    let path = Path::new(&target.file);
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        pdf.parent().unwrap_or(Path::new(".")).join(path)
+    let sources = QuerySources {
+        snapshot: snapshot.as_ref(),
+        best_guess,
+        ..QuerySources::default()
     };
-    let mut warning = None;
-    let resolved = match fs::canonicalize(&absolute) {
-        Ok(path) => path,
-        Err(error) => {
-            warning = Some(format!(
-                "line-only navigation: source path unavailable: {error}"
-            ));
-            absolute
-        }
+    let result = resolve_inverse_output(&pdf, point, word, radius, operation, &stdout, sources)?;
+    if let Some(snapshot) = snapshot {
+        snapshot.revision.check(&pdf)?;
+    }
+    if let Some(revision) = raw_revision {
+        revision.check(&pdf)?;
+    }
+    operation.check()?;
+    Ok(result)
+}
+
+fn same_source_position(a: &SourceLocation, b: &SourceLocation) -> bool {
+    Path::new(&a.file) == Path::new(&b.file) && a.line == b.line && a.byte_column == b.byte_column
+}
+
+fn resolve_inverse_output(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    operation: &Operation,
+    stdout: &str,
+    sources: QuerySources<'_>,
+) -> io::Result<InverseResolution> {
+    let targets = parse_synctex_edit(stdout);
+    if targets.is_empty() {
+        return Err(io::Error::other("synctex edit returned no match"));
+    }
+    let best_guess = sources.best_guess;
+    let mut query = InverseQuery {
+        pdf,
+        point,
+        word,
+        radius,
+        operation,
+        sources,
+        structural_map: None,
+        geometry_map: None,
+        metadata: None,
     };
-    target.file = resolved
-        .into_os_string()
-        .into_string()
-        .map_err(|_| io::Error::other("source path is not UTF-8"))?;
-    let generated = Path::new(&target.file)
-        .extension()
-        .is_some_and(|ext| ext == "vrb")
-        && Path::new(&target.file).file_stem() == pdf.file_stem();
-    // A fragile-body hit can instead be reported at unrelated document
-    // metadata. Keep that raw coarse location, but allow the clicked sheet's
-    // original frame as a bounded literal-word refinement candidate.
-    let generated_path = if generated {
-        PathBuf::from(&target.file)
-    } else {
-        pdf.with_extension("vrb")
-    };
-    let source_map = (generated || word.is_some())
-        .then(|| read_source_map(&pdf, point, &generated_path, !generated, operation));
-    let mut remapped_source = None;
-    if generated && let Some(map) = &source_map {
-        match map
-            .as_ref()
-            .map_err(|error| error.to_string())
-            .and_then(|map| original_source_from_verbatim(map).map_err(|error| error.to_string()))
+    let mut resolutions = Vec::with_capacity(targets.len());
+    for target in targets {
+        operation.check()?;
+        resolutions.push(query.resolve_target(target)?);
+    }
+    operation.check()?;
+    let mut precise = resolutions
+        .iter()
+        .enumerate()
+        .filter(|(_, (result, _))| result.location.precise);
+    let mut ambiguous = None;
+    let selected = if let Some((index, (supported, _))) = precise.next() {
+        if precise
+            .any(|(_, (other, _))| !same_source_position(&supported.location, &other.location))
         {
-            Ok((file, original, anchor)) => {
-                target.file = file;
-                target.line = anchor;
-                remapped_source = Some(original);
-            }
-            Err(error) => {
-                warning = Some(format!(
-                    "line-only navigation: original fragile frame unavailable: {error}"
-                ));
-            }
+            ambiguous = Some("ambiguous inverse search: multiple precise source locations");
+        }
+        index
+    } else {
+        if resolutions[1..]
+            .iter()
+            .any(|(other, _)| !same_source_position(&resolutions[0].0.location, &other.location))
+        {
+            ambiguous = Some("ambiguous inverse search: multiple coarse source anchors");
+        }
+        0
+    };
+    if let Some(reason) = ambiguous
+        && !best_guess
+    {
+        return Err(io::Error::other(reason));
+    }
+    // The executable's first result is its nearest compiler anchor. Explicit
+    // best-guess mode cannot turn an ambiguous word refinement into precision.
+    let (mut chosen, raw) = resolutions.swap_remove(if ambiguous.is_some() { 0 } else { selected });
+    let mut warnings = std::collections::BTreeSet::new();
+    if let Some(reason) = ambiguous {
+        if let Some(raw) = raw {
+            chosen.location = raw;
+        }
+        chosen.location.precise = false;
+        warnings.insert(format!(
+            "best-guess navigation: {reason}; using the first compiler anchor"
+        ));
+    }
+    if let Some(warning) = chosen.warning {
+        warnings.insert(warning);
+    }
+    for (other, _) in resolutions {
+        if same_source_position(&chosen.location, &other.location)
+            && let Some(warning) = other.warning
+        {
+            warnings.insert(warning);
         }
     }
-    // The final .vrb may belong to a different frame. Never refine against it.
-    if let Some((context, offset)) = word
-        && (!generated || remapped_source.is_some())
-    {
+    if best_guess && !chosen.location.precise && warnings.is_empty() {
+        warnings.insert("best-guess navigation: no literal source position was qualified; using the compiler line anchor".into());
+    }
+    operation.check()?;
+    Ok(InverseResolution {
+        location: chosen.location,
+        warning: (!warnings.is_empty())
+            .then(|| warnings.into_iter().collect::<Vec<_>>().join("; ")),
+    })
+}
+
+#[derive(Default)]
+struct QuerySources<'a> {
+    snapshot: Option<&'a SourceSnapshot>,
+    best_guess: bool,
+    files: std::collections::HashMap<PathBuf, Result<Rc<String>, (String, bool)>>,
+}
+
+impl QuerySources<'_> {
+    fn normalize(&self, path: &Path) -> io::Result<PathBuf> {
+        match self.snapshot {
+            Some(snapshot) => snapshot.normalize(path),
+            None => fs::canonicalize(path),
+        }
+    }
+
+    fn warning(&self, path: &Path) -> Option<&str> {
+        self.snapshot.and_then(|snapshot| snapshot.warning(path))
+    }
+
+    fn read_error((message, required): (String, bool)) -> io::Error {
+        let error = io::Error::other(message);
+        if required {
+            io::Error::other(crate::source_snapshot::SnapshotReadError(error))
+        } else {
+            error
+        }
+    }
+
+    fn read(&mut self, path: &Path, operation: &Operation) -> io::Result<Rc<String>> {
         operation.check()?;
-        let source = remapped_source.map_or_else(|| read_source(Path::new(&target.file)), Ok);
-        if let Err(error) = &source {
-            warning = Some(format!(
-                "line-only navigation: source refinement unavailable: {error}"
+        if let Some(result) = self.files.get(path) {
+            return result.clone().map_err(Self::read_error);
+        }
+        let result = match self.snapshot {
+            Some(snapshot) => snapshot.read(path),
+            None => read_source(path),
+        }
+        .map(Rc::new)
+        .map_err(|error| {
+            let required = crate::source_snapshot::required_cache_error(&error);
+            (error.to_string(), required)
+        });
+        operation.check()?;
+        let value = result.clone().map_err(Self::read_error);
+        self.files.insert(path.to_owned(), result);
+        value
+    }
+}
+
+type MetadataLocation = (String, Rc<String>, u32, usize, isize);
+
+struct InverseQuery<'a> {
+    pdf: &'a Path,
+    point: InversePoint,
+    word: Option<(&'a str, usize)>,
+    radius: u32,
+    operation: &'a Operation,
+    sources: QuerySources<'a>,
+    structural_map: Option<Result<Rc<SourceMap>, String>>,
+    geometry_map: Option<Result<Rc<SourceMap>, String>>,
+    metadata: Option<Option<MetadataLocation>>,
+}
+
+impl InverseQuery<'_> {
+    fn source_map(&mut self, generated: bool) -> io::Result<Rc<SourceMap>> {
+        self.operation.check()?;
+        let current_dir = if self.sources.best_guess && self.sources.snapshot.is_none() {
+            Some(std::env::current_dir()?)
+        } else {
+            None
+        };
+        let input_cwd = self
+            .sources
+            .snapshot
+            .map(|snapshot| snapshot.cwd.as_path())
+            .or(current_dir.as_deref());
+        let cache = if generated {
+            &mut self.structural_map
+        } else {
+            &mut self.geometry_map
+        };
+        let result = cache.get_or_insert_with(|| {
+            read_source_map(
+                self.pdf,
+                self.point,
+                &self.pdf.with_extension("vrb"),
+                !generated,
+                self.operation,
+                input_cwd,
+            )
+            .map(Rc::new)
+            .map_err(|error| error.to_string())
+        });
+        self.operation.check()?;
+        result.clone().map_err(io::Error::other)
+    }
+
+    fn resolve_target(
+        &mut self,
+        mut target: SourceLocation,
+    ) -> io::Result<(InverseResolution, Option<SourceLocation>)> {
+        let path = Path::new(&target.file);
+        let absolute = if let Some(snapshot) = self.sources.snapshot {
+            snapshot.normalize(path)?
+        } else if self.sources.best_guess {
+            std::path::absolute(path)?
+        } else if path.is_absolute() {
+            path.to_owned()
+        } else {
+            self.pdf.parent().unwrap_or(Path::new(".")).join(path)
+        };
+        let mut warning = None;
+        let resolved = if self.sources.snapshot.is_some() || self.sources.best_guess {
+            absolute.components().collect()
+        } else {
+            match fs::canonicalize(&absolute) {
+                Ok(path) => path,
+                Err(error) => {
+                    warning = Some(format!(
+                        "line-only navigation: source path unavailable: {error}"
+                    ));
+                    absolute
+                }
+            }
+        };
+        target.file = resolved
+            .into_os_string()
+            .into_string()
+            .map_err(|_| io::Error::other("source path is not UTF-8"))?;
+        let generated = Path::new(&target.file)
+            .extension()
+            .is_some_and(|ext| ext == "vrb")
+            && Path::new(&target.file).file_stem() == self.pdf.file_stem();
+        // Known generated hits use structural sheet provenance before any
+        // source bounds, and never read the final reused .vrb file.
+        let mut source_map = generated.then(|| self.source_map(true));
+        if self.sources.best_guess
+            && let Some(Err(error)) = &source_map
+        {
+            self.operation.check()?;
+            return Err(io::Error::other(error.to_string()));
+        }
+        if self.sources.best_guess && self.sources.snapshot.is_none() {
+            if let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok()) {
+                let (original, line) = map
+                    .page_source
+                    .as_ref()
+                    .map(|(path, line)| (path.as_path(), *line))
+                    .unwrap_or((&map.main, 1));
+                if line == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SyncTeX original compiler anchor line must be positive",
+                    ));
+                }
+                target.file = original
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("source path is not UTF-8"))?
+                    .to_owned();
+                target.line = line;
+            }
+            // Preserve compiled coordinates for Lua's historical extmarks.
+            // Reading or clamping against current disk text would erase them.
+            self.operation.check()?;
+            return Ok((InverseResolution {
+                location: target,
+                warning: Some("best-guess navigation: compiled source snapshot unavailable; using the original compiler line anchor without disk text qualification".into()),
+            }, None));
+        }
+        if !generated
+            && let Some(reason) = self
+                .sources
+                .warning(Path::new(&target.file))
+                .map(str::to_owned)
+        {
+            // A provenance warning cannot waive authority for a recorded input.
+            // Uncaptured inputs still retain their original coarse anchor.
+            if let Err(error) = self.sources.read(Path::new(&target.file), self.operation)
+                && crate::source_snapshot::required_cache_error(&error)
+            {
+                return Err(error);
+            }
+            self.operation.check()?;
+            return Ok((
+                InverseResolution {
+                    location: target,
+                    warning: Some(reason),
+                },
+                None,
             ));
         }
-        if let Ok(mut source) = source {
+        let mut source = if generated {
+            let remapped = source_map
+                .as_ref()
+                .and_then(|map| map.as_ref().ok())
+                .ok_or_else(|| {
+                    io::Error::other(
+                        source_map
+                            .as_ref()
+                            .and_then(|map| map.as_ref().err())
+                            .map_or(
+                                "original source map is unavailable".to_owned(),
+                                ToString::to_string,
+                            ),
+                    )
+                })
+                .and_then(|map| {
+                    original_source_from_verbatim(map, &mut self.sources, self.operation)
+                });
+            match remapped {
+                Ok((file, original, anchor)) => {
+                    target.file = file;
+                    target.line = anchor;
+                    original
+                }
+                Err(error) => {
+                    self.operation.check()?;
+                    if crate::source_snapshot::required_cache_error(&error) {
+                        return Err(error);
+                    }
+                    if self.sources.best_guess
+                        && let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok())
+                    {
+                        let (original, line) = map
+                            .page_source
+                            .as_ref()
+                            .map(|(path, line)| (path.as_path(), *line))
+                            .unwrap_or((&map.main, 1));
+                        if line == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "SyncTeX original compiler anchor line must be positive",
+                            ));
+                        }
+                        let original = if let Some(snapshot) = self.sources.snapshot {
+                            snapshot.normalize(original)?
+                        } else {
+                            fs::canonicalize(original).unwrap_or(original.to_owned())
+                        };
+                        target.file = original
+                            .into_os_string()
+                            .into_string()
+                            .map_err(|_| io::Error::other("source path is not UTF-8"))?;
+                        target.line = line;
+                        self.operation.check()?;
+                    }
+                    return Ok((
+                        InverseResolution {
+                            location: target,
+                            warning: Some(format!(
+                                "line-only navigation: original fragile frame unavailable: {error}"
+                            )),
+                        },
+                        None,
+                    ));
+                }
+            }
+        } else {
+            match self.sources.read(Path::new(&target.file), self.operation) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.operation.check()?;
+                    if crate::source_snapshot::required_cache_error(&error) {
+                        return Err(error);
+                    }
+                    return Ok((
+                        InverseResolution {
+                            location: target,
+                            warning: Some(format!(
+                                "line-only navigation: source refinement unavailable: {error}"
+                            )),
+                        },
+                        None,
+                    ));
+                }
+            }
+        };
+        if let Err(error) = validate_source_line(&source, target.line) {
+            if !self.sources.best_guess {
+                return Err(error);
+            }
+            return Ok((
+                InverseResolution {
+                    location: target,
+                    warning: Some(format!(
+                        "best-guess navigation: {error}; preserving the original compiler anchor for editor mapping"
+                    )),
+                },
+                None,
+            ));
+        }
+        if let Some(reason) = self.sources.warning(Path::new(&target.file)) {
+            return Ok((
+                InverseResolution {
+                    location: target,
+                    warning: Some(reason.to_owned()),
+                },
+                None,
+            ));
+        }
+        let anchor = (self.sources.best_guess && self.word.is_some()).then(|| target.clone());
+        if let Some((context, offset)) = self.word {
+            let fragile_frame = fragile_frame_range(&source, target.line);
+            if !generated {
+                // Ordinary source refinement and document metadata need only
+                // structural provenance, not fragile-body geometry.
+                source_map = Some(self.source_map(fragile_frame.is_none()));
+                if fragile_frame.is_none()
+                    && source_map
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                        .is_some_and(|map| map.page_source.is_some())
+                {
+                    source_map = Some(self.source_map(false));
+                }
+            }
+            if self.sources.best_guess
+                && let Some(Err(error)) = &source_map
+            {
+                self.operation.check()?;
+                return Err(io::Error::other(error.to_string()));
+            }
+            self.operation.check()?;
             // A fragile sheet also contains nongenerated headings and footers.
             // Sheet-wide .vrb participation does not prove this point is body text.
-            let scope_proven = fragile_frame_range(&source, target.line).is_none_or(|frame| {
+            let scope_proven = fragile_frame.is_none_or(|frame| {
                 generated
                     || source_map
                         .as_ref()
@@ -488,13 +1148,15 @@ pub fn resolve_inverse(
                             map.generated_at_point
                                 && map.page_source.as_ref().is_some_and(|(path, line)| {
                                     *line == frame.end as u32
-                                        && fs::canonicalize(path)
+                                        && self
+                                            .sources
+                                            .normalize(path)
                                             .is_ok_and(|path| path == Path::new(&target.file))
                                 })
                         })
             });
             let mut location = if scope_proven {
-                source_word_location(&source, target.line, context, offset, radius)
+                source_word_location(&source, target.line, context, offset, self.radius)
             } else {
                 source_word_location_in_range(
                     &source,
@@ -512,10 +1174,16 @@ pub fn resolve_inverse(
                     .and_then(|result| result.as_ref().ok())
                     .filter(|map| map.generated_at_point && map.page_source.is_some())
             {
-                match original_source_from_verbatim(map) {
+                match original_source_from_verbatim(map, &mut self.sources, self.operation) {
                     Ok((file, original, anchor)) => {
-                        if let Some(candidate) =
-                            source_word_location(&original, anchor, context, offset, radius)
+                        if self.sources.warning(Path::new(&file)).is_none()
+                            && let Some(candidate) = source_word_location(
+                                &original,
+                                anchor,
+                                context,
+                                offset,
+                                self.radius,
+                            )
                         {
                             target.file = file;
                             target.line = anchor;
@@ -524,6 +1192,10 @@ pub fn resolve_inverse(
                         }
                     }
                     Err(error) => {
+                        self.operation.check()?;
+                        if crate::source_snapshot::required_cache_error(&error) {
+                            return Err(error);
+                        }
                         warning = Some(format!(
                             "line-only navigation: original fragile frame unavailable: {error}"
                         ));
@@ -531,33 +1203,40 @@ pub fn resolve_inverse(
                 }
             }
             if let Some(Err(error)) = &source_map {
+                self.operation.check()?;
                 warning = Some(format!("source-map refinement unavailable: {error}"));
             }
-            if let Some((file, original, line, byte, score)) = source_map
-                .as_ref()
-                .and_then(|result| result.as_ref().ok())
-                .and_then(|map| document_metadata_word_location(&map.main, context, offset))
-                && (location.is_none()
-                    || score >= 6
-                        && metadata_beats_frame(
-                            &source,
-                            target.line,
-                            context,
-                            offset,
-                            point.y_from_top,
-                            point.page_height_pt,
-                            score,
-                        ))
-            {
-                target.file = file;
-                source = original;
-                location = Some((line, byte));
+            if let Some(map) = source_map.as_ref().and_then(|result| result.as_ref().ok()) {
+                if self.metadata.is_none() {
+                    self.metadata = Some(document_metadata_word_location(
+                        &map.main,
+                        context,
+                        offset,
+                        &mut self.sources,
+                        self.operation,
+                    )?);
+                }
+                if let Some((file, original, line, byte, score)) =
+                    self.metadata.as_ref().and_then(Option::as_ref)
+                    && (location.is_none()
+                        || *score >= 6
+                            && metadata_beats_frame(
+                                &source,
+                                target.line,
+                                context,
+                                offset,
+                                self.point.y_from_top,
+                                self.point.page_height_pt,
+                                *score,
+                            ))
+                {
+                    target.file = file.clone();
+                    source = Rc::clone(original);
+                    location = Some((*line, *byte));
+                }
             }
             if let Some((line, byte)) = location {
-                let text = source
-                    .lines()
-                    .nth(line as usize - 1)
-                    .ok_or_else(|| io::Error::other("source line is missing"))?;
+                let text = validate_source_line(&source, line)?;
                 let prefix = text
                     .get(..byte)
                     .ok_or_else(|| io::Error::other("source column is not a UTF-8 boundary"))?;
@@ -568,12 +1247,29 @@ pub fn resolve_inverse(
                 target.precise = true;
             }
         }
+        self.operation.check()?;
+        Ok((
+            InverseResolution {
+                location: target,
+                warning,
+            },
+            anchor,
+        ))
     }
-    operation.check()?;
-    Ok(InverseResolution {
-        location: target,
-        warning,
-    })
+}
+
+fn validate_source_line(source: &str, line: u32) -> io::Result<&str> {
+    line.checked_sub(1)
+        .and_then(|index| source.lines().nth(index as usize))
+        .ok_or_else(|| io::Error::other(format!("source line {line} is out of range")))
+}
+
+fn validate_forward_source_position(source: &str, line: u32, column: u32) -> io::Result<&str> {
+    let text = validate_source_line(source, line)?;
+    if column == 0 || column as usize > text.chars().count() + 1 {
+        return Err(io::Error::other("source scalar column is out of range"));
+    }
+    Ok(text)
 }
 
 /// A frame title and the running document title may contain the same words.
@@ -605,11 +1301,15 @@ fn metadata_beats_frame(
 
 fn read_source(path: &Path) -> io::Result<String> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut bytes = Vec::new();
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
+    read_source_file(file)
+}
+
+pub(crate) fn read_source_file(file: fs::File) -> io::Result<String> {
+    let mut bytes = Vec::new();
     if !file.metadata()?.is_file() {
         return Err(io::Error::other(
             "source refinement requires a regular file",
@@ -732,6 +1432,7 @@ fn read_source_map(
     generated: &Path,
     geometry_required: bool,
     operation: &Operation,
+    input_cwd: Option<&Path>,
 ) -> io::Result<SourceMap> {
     let compressed = pdf.with_extension("synctex.gz");
     match fs::File::open(&compressed) {
@@ -742,6 +1443,7 @@ fn read_source_map(
             generated,
             geometry_required,
             operation,
+            input_cwd,
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => source_map_from_reader(
             BufReader::new(fs::File::open(pdf.with_extension("synctex"))?.take(128 * 1024 * 1024)),
@@ -750,6 +1452,7 @@ fn read_source_map(
             generated,
             geometry_required,
             operation,
+            input_cwd,
         ),
         Err(error) => Err(error),
     }
@@ -762,6 +1465,7 @@ fn source_map_from_reader(
     generated: &Path,
     geometry_required: bool,
     operation: &Operation,
+    input_cwd: Option<&Path>,
 ) -> io::Result<SourceMap> {
     let mut inputs = std::collections::HashMap::new();
     let mut generated_tags = std::collections::HashSet::new();
@@ -770,8 +1474,11 @@ fn source_map_from_reader(
     let mut page_complete = false;
     let mut origin = None;
     let mut generated_on_page = false;
+    let mut page_tags = std::collections::HashSet::new();
     let mut stack: Vec<(u8, Option<[f64; 4]>, bool)> = Vec::new();
     let mut boxes = Vec::new();
+    let mut defined_forms = std::collections::HashSet::new();
+    let mut sheet_form_refs = std::collections::HashSet::new();
     let mut unit = None;
     let mut magnification = None;
     let mut x_offset = None;
@@ -795,10 +1502,14 @@ fn source_map_from_reader(
         if count == 0 {
             break;
         }
-        let row = row.trim_end();
-        if geometry_required && row == "Postamble:" {
+        let row = if input_cwd.is_some() {
+            row.trim_end_matches(['\r', '\n'])
+        } else {
+            row.trim_end()
+        };
+        if (geometry_required || input_cwd.is_some()) && row == "Postamble:" {
             postamble = true;
-        } else if geometry_required
+        } else if (geometry_required || input_cwd.is_some())
             && postamble
             && let Some(value) = row.strip_prefix("Count:")
         {
@@ -833,7 +1544,10 @@ fn source_map_from_reader(
         }
         // Compressed ",=" reuses the scanner's global last vertical value,
         // including records from earlier sheets and form definitions.
+        // Later positions cannot affect this query's completed sheet, but the
+        // remaining input tags, transforms, and postamble still require a scan.
         let position = if geometry_required
+            && !page_complete
             && matches!(
                 row.as_bytes().first(),
                 Some(b'[' | b'(' | b'v' | b'h' | b'x' | b'k' | b'g' | b'r' | b'$' | b'f')
@@ -842,23 +1556,65 @@ fn source_map_from_reader(
         } else {
             None
         };
+        if geometry_required && let Some(tag) = row.strip_prefix('<') {
+            let tag = tag
+                .parse::<u32>()
+                .ok()
+                .filter(|tag| *tag > 0)
+                .ok_or_else(|| io::Error::other("SyncTeX form has an invalid tag"))?;
+            defined_forms.insert(tag);
+        }
         if let Some(input) = row.strip_prefix("Input:") {
             if let Some((tag, path)) = input.split_once(':')
                 && let Ok(tag) = tag.parse::<u32>()
             {
                 let path = Path::new(path);
+                if input_cwd.is_some() && (tag == 0 || path.as_os_str().is_empty()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid SyncTeX input declaration",
+                    ));
+                }
                 let path = if path.is_absolute() {
                     path.to_owned()
                 } else {
-                    pdf.parent().unwrap_or(Path::new(".")).join(path)
+                    input_cwd
+                        .unwrap_or_else(|| pdf.parent().unwrap_or(Path::new(".")))
+                        .join(path)
                 };
+                if input_cwd.is_some() && !valid_absolute_path(&path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid SyncTeX input path",
+                    ));
+                }
                 // TeX can emit .vrb in the build cwd while the PDF is in a
                 // separate output directory. Jobname is the map identity;
                 // the final generated file is neither read nor trusted.
                 if path.file_name() == generated.file_name() {
                     generated_tags.insert(tag);
                 }
-                inputs.insert(tag, path);
+                match inputs.entry(tag) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        if input_cwd.is_some() && entry.get() != &path {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "conflicting SyncTeX input tag",
+                            ));
+                        }
+                        if input_cwd.is_none() {
+                            entry.insert(path);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(path);
+                    }
+                }
+            } else if input_cwd.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed SyncTeX input declaration",
+                ));
             }
         } else if let Some(page) = row.strip_prefix('{') {
             in_page = page.parse::<u32>() == Ok(point.page);
@@ -875,7 +1631,7 @@ fn source_map_from_reader(
             }
             page_complete = true;
             in_page = false;
-            if !geometry_required {
+            if !geometry_required && input_cwd.is_none() {
                 let main = inputs
                     .get(&1)
                     .cloned()
@@ -890,10 +1646,18 @@ fn source_map_from_reader(
                 });
             }
         } else if in_page {
-            if geometry_required && matches!(row.as_bytes().first(), Some(b'<' | b'>' | b'f')) {
+            if geometry_required && matches!(row.as_bytes().first(), Some(b'<' | b'>')) {
                 return Err(io::Error::other(
                     "SyncTeX fragile body ownership cannot resolve sheet form transforms",
                 ));
+            }
+            if geometry_required && let Some(reference) = row.strip_prefix('f') {
+                let tag = reference
+                    .split_once(':')
+                    .and_then(|(tag, _)| tag.parse::<u32>().ok())
+                    .filter(|tag| *tag > 0)
+                    .ok_or_else(|| io::Error::other("SyncTeX form reference has an invalid tag"))?;
+                sheet_form_refs.insert(tag);
             }
             let link = row
                 .get(1..)
@@ -959,11 +1723,40 @@ fn source_map_from_reader(
             ) && let Some((tag, _)) = link
             {
                 generated_on_page |= generated_tags.contains(&tag);
+                if input_cwd.is_some() && !geometry_required {
+                    page_tags.insert(tag);
+                }
             }
         }
     }
     if !page_complete || !postamble_count {
         return Err(io::Error::other("SyncTeX source map is incomplete"));
+    }
+    if !geometry_required {
+        generated_on_page |= page_tags.iter().any(|tag| generated_tags.contains(tag));
+        let main = inputs
+            .get(&1)
+            .cloned()
+            .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
+        let page_source = origin
+            .filter(|_| generated_on_page)
+            .and_then(|(tag, line)| inputs.remove(&tag).map(|path| (path, line)));
+        return Ok(SourceMap {
+            main,
+            page_source,
+            generated_at_point: false,
+        });
+    }
+    // With form recording disabled, TeX still emits sheet references whose
+    // definitions are absent. The native SyncTeX parser removes those refs:
+    // they carry no source ownership. Do not invent geometry or source tags.
+    if sheet_form_refs
+        .iter()
+        .any(|tag| defined_forms.contains(tag))
+    {
+        return Err(io::Error::other(
+            "SyncTeX fragile body ownership cannot resolve recorded sheet form transforms",
+        ));
     }
     // Match SyncTeX's effective preamble/Post scriptum transform. The offsets
     // are not magnified; post offsets are dimensions in scaled TeX points.
@@ -1024,12 +1817,17 @@ fn source_map_from_reader(
 /// Beamer reopens the same .vrb for successive fragile frames. The clicked
 /// sheet's enclosing source-map box identifies the original frame; the final
 /// generated file's contents cannot establish that identity.
-fn original_source_from_verbatim(map: &SourceMap) -> io::Result<(String, String, u32)> {
+fn original_source_from_verbatim(
+    map: &SourceMap,
+    sources: &mut QuerySources<'_>,
+    operation: &Operation,
+) -> io::Result<(String, Rc<String>, u32)> {
     let (original, line) = map.page_source.as_ref().ok_or_else(|| {
         io::Error::other("clicked sheet has no original generated-file provenance")
     })?;
-    let original = fs::canonicalize(original)?;
-    let source = read_source(&original)?;
+    let original = sources.normalize(original)?;
+    let source = sources.read(&original, operation)?;
+    validate_source_line(&source, *line)?;
     fragile_frame_range(&source, *line)
         .filter(|frame| *line == frame.end as u32)
         .ok_or_else(|| {
@@ -1089,9 +1887,24 @@ fn document_metadata_word_location(
     main: &Path,
     context: &str,
     offset: usize,
-) -> Option<(String, String, u32, usize, isize)> {
-    let main = fs::canonicalize(main).ok()?;
-    let main_source = read_source(&main).ok()?;
+    sources: &mut QuerySources<'_>,
+    operation: &Operation,
+) -> io::Result<Option<MetadataLocation>> {
+    operation.check()?;
+    let Ok(main) = sources.normalize(main) else {
+        return Ok(None);
+    };
+    if sources.warning(&main).is_some() {
+        return Ok(None);
+    }
+    let main_source = match sources.read(&main, operation) {
+        Ok(source) => source,
+        Err(error) if crate::source_snapshot::required_cache_error(&error) => return Err(error),
+        Err(_) => {
+            operation.check()?;
+            return Ok(None);
+        }
+    };
     let mut files = vec![(main.clone(), main_source)];
     let inputs: Vec<_> = files[0]
         .1
@@ -1107,23 +1920,35 @@ fn document_metadata_word_location(
         .take(8)
         .collect();
     for name in inputs {
-        let mut path = main.parent()?.join(name);
+        operation.check()?;
+        let Some(parent) = main.parent() else {
+            return Ok(None);
+        };
+        let mut path = parent.join(name);
         if path.extension().is_none() {
             path.set_extension("tex");
         }
-        if let Ok(path) = fs::canonicalize(path)
+        if let Ok(path) = sources.normalize(&path)
             && !files.iter().any(|(known, _)| *known == path)
-            && let Ok(source) = read_source(&path)
+            && sources.warning(&path).is_none()
         {
-            files.push((path, source));
+            match sources.read(&path, operation) {
+                Ok(source) => files.push((path, source)),
+                Err(error) if crate::source_snapshot::required_cache_error(&error) => {
+                    return Err(error);
+                }
+                Err(_) => operation.check()?,
+            }
         }
     }
     let mut best = None;
     let mut tied = false;
     for (file_index, (_, source)) in files.iter().enumerate() {
+        operation.check()?;
         let hidden = nonprinting_source_ranges(source);
         let mut start = 0;
         for raw_row in source.split_inclusive('\n') {
+            operation.check()?;
             let row = raw_row.strip_suffix('\n').unwrap_or(raw_row);
             let row = row.strip_suffix('\r').unwrap_or(row);
             let visible = source_line_text(row);
@@ -1167,26 +1992,33 @@ fn document_metadata_word_location(
             start += raw_row.len();
         }
     }
-    let (score, index, line, byte) = best.filter(|_| !tied)?;
+    operation.check()?;
+    let Some((score, index, line, byte)) = best.filter(|_| !tied) else {
+        return Ok(None);
+    };
     let (path, source) = files.swap_remove(index);
-    Some((path.to_str()?.to_owned(), source, line, byte, score))
+    let Some(file) = path.to_str() else {
+        return Ok(None);
+    };
+    Ok(Some((file.to_owned(), source, line, byte, score)))
 }
 
-pub(crate) fn parse_synctex_edit(stdout: &str) -> Option<SourceLocation> {
-    let (mut input, mut line) = (None, None);
-    let mut result = None;
+pub(crate) fn parse_synctex_edit(stdout: &str) -> Vec<SourceLocation> {
+    let mut input = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
     for row in stdout.lines() {
         if let Some(value) = row.strip_prefix("Input:") {
-            input = Some(value.trim().to_owned());
-            line = None;
-        } else if let Some(value) = row.strip_prefix("Line:") {
-            line = value.trim().parse::<u32>().ok().filter(|line| *line > 0);
-        }
-        if let (Some(file), Some(line)) = (&input, line)
+            input = Some(value.trim());
+        } else if let Some(value) = row.strip_prefix("Line:")
+            && let Some(file) = input.take()
             && !file.is_empty()
+            && let Ok(line) = value.trim().parse::<u32>()
+            && line > 0
+            && seen.insert((file, line))
         {
-            result = Some(SourceLocation {
-                file: file.clone(),
+            results.push(SourceLocation {
+                file: file.to_owned(),
                 line,
                 byte_column: 0,
                 column: 1,
@@ -1195,7 +2027,7 @@ pub(crate) fn parse_synctex_edit(stdout: &str) -> Option<SourceLocation> {
             });
         }
     }
-    result
+    results
 }
 /// TeX comments start at an unescaped percent sign.
 fn source_line_text(text: &str) -> &str {
@@ -1347,6 +2179,24 @@ fn source_word_location_in_range(
     within_scope: bool,
 ) -> Option<(u32, usize)> {
     let hidden = nonprinting_source_ranges(source);
+    // A closing layout environment can alias every row to one source line.
+    // A search radius alone does not identify neighboring prose or math;
+    // independently established frame/caption and math scopes remain eligible.
+    let closing_layout = source
+        .lines()
+        .nth(line.saturating_sub(1) as usize)
+        .map(source_line_text)
+        .and_then(|text| text.trim_start().strip_prefix("\\end"))
+        .and_then(|rest| {
+            let rest = rest.trim_start();
+            math::group(rest, 0).map(|(name, _)| !math::math_environment(&rest[name]))
+        })
+        .unwrap_or(false);
+    let lines = if !within_scope && closing_layout {
+        line.saturating_sub(1) as usize..line as usize
+    } else {
+        lines
+    };
     let prose = source_prose_scored_location(
         source,
         line,
@@ -1652,6 +2502,95 @@ fn source_prose_scored_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_inverse_guess_preserves_compiled_coordinates_and_warns_on_ambiguity() {
+        let root = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root.path()).unwrap();
+        let source = root.join("edited.tex");
+        fs::write(&source, "only one current line\n").unwrap();
+        let pdf = root.join("paper.pdf");
+        let point = InversePoint {
+            page: 1,
+            x: 10.0,
+            y_from_top: 20.0,
+            page_height_pt: 100.0,
+        };
+        let output = format!(
+            "Input:{}\nLine:9\nInput:{}\nLine:12\n",
+            source.display(),
+            source.display()
+        );
+        let guessed = resolve_inverse_output(
+            &pdf,
+            point,
+            Some(("current", 0)),
+            4,
+            &Operation::default(),
+            &output,
+            QuerySources {
+                best_guess: true,
+                ..QuerySources::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(guessed.location.line, 9);
+        assert_eq!(
+            (
+                guessed.location.byte_column,
+                guessed.location.column,
+                guessed.location.column_char
+            ),
+            (0, 1, 1)
+        );
+        assert!(!guessed.location.precise);
+        assert!(guessed.warning.unwrap().contains("multiple coarse"));
+        assert!(
+            resolve_inverse_output(
+                &pdf,
+                point,
+                None,
+                4,
+                &Operation::default(),
+                &output,
+                QuerySources::default(),
+            )
+            .is_err()
+        );
+        fs::write(&source, "current source line\n".repeat(12)).unwrap();
+        assert!(
+            resolve_inverse_output(
+                &pdf,
+                point,
+                None,
+                4,
+                &Operation::default(),
+                &output,
+                QuerySources::default(),
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("multiple coarse")
+        );
+        let operation = Operation::default();
+        operation.cancel();
+        assert!(
+            resolve_inverse_output(
+                &pdf,
+                point,
+                None,
+                4,
+                &operation,
+                &output,
+                QuerySources {
+                    best_guess: true,
+                    ..QuerySources::default()
+                },
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn pdf_revision_rejects_rewrites_and_atomic_replacements() {
@@ -1980,14 +2919,20 @@ mod tests {
                 &generated,
                 false,
                 &Operation::default(),
+                None,
             )
             .unwrap();
-            let remapped = original_source_from_verbatim(&map).unwrap();
+            let remapped = original_source_from_verbatim(
+                &map,
+                &mut QuerySources::default(),
+                &Operation::default(),
+            )
+            .unwrap();
             assert_eq!(
                 remapped.0,
                 fs::canonicalize(&source_path).unwrap().to_str().unwrap()
             );
-            assert_eq!(remapped.1, source);
+            assert_eq!(remapped.1.as_str(), source);
             assert_eq!(remapped.2, anchor);
         }
         let missing = source_map_from_reader(
@@ -2002,9 +2947,17 @@ mod tests {
             Path::new("/unrelated.vrb"),
             false,
             &Operation::default(),
+            None,
         )
         .unwrap();
-        assert!(original_source_from_verbatim(&missing).is_err());
+        assert!(
+            original_source_from_verbatim(
+                &missing,
+                &mut QuerySources::default(),
+                &Operation::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2040,11 +2993,17 @@ mod tests {
                     1,
                 )
                 .replace("(1,18:10,20:", "$1,18:0,20\n(1,18:10,=:");
+            let compressed_form = contents.replace("(1,18:10,20:", "f481:0,20\n(1,18:10,=:");
+            let form_only_footer = contents.replace("x1,18:80,90", "f2:80,90");
+            let form_without_generated = contents.replace("x2,2:20,20", "f2:20,20");
             for (contents, x, y, body) in [
                 (&contents, 20.0, 15.0, true),
                 (&contents, 80.0, 85.0, false),
                 (&contents, 50.0, 50.0, false),
                 (&compressed, 20.0, 15.0, true),
+                (&compressed_form, 20.0, 15.0, true),
+                (&form_only_footer, 80.0, 85.0, false),
+                (&form_without_generated, 20.0, 15.0, false),
             ] {
                 let map = source_map_from_reader(
                     contents.as_bytes(),
@@ -2058,6 +3017,7 @@ mod tests {
                     Path::new("/deck.vrb"),
                     true,
                     &Operation::default(),
+                    None,
                 )
                 .unwrap();
                 assert_eq!(
@@ -2070,6 +3030,11 @@ mod tests {
             sheet.replace("Unit:65536\n", ""),
             sheet.replace("(1,18:10,20:30,10,0", "(1,18:invalid"),
             sheet.replace("Count:12\n", ""),
+            sheet.replace("x2,2:20,20", "finvalid:20,20"),
+            format!(
+                "{}<2\n(2,2:0,20:30,10,0\n)\n>\n",
+                sheet.replace("x2,2:20,20", "f2:20,20")
+            ),
         ] {
             assert!(
                 source_map_from_reader(
@@ -2084,6 +3049,7 @@ mod tests {
                     Path::new("/deck.vrb"),
                     true,
                     &Operation::default(),
+                    None,
                 )
                 .is_err()
             );
@@ -2128,7 +3094,10 @@ mod tests {
             &main_path,
             "Example Report and Results",
             "Example ".len(),
+            &mut QuerySources::default(),
+            &Operation::default(),
         )
+        .unwrap()
         .unwrap();
         assert_eq!((found.2, found.3), (2, 15));
         assert!(found.4 >= 6);
@@ -2136,11 +3105,24 @@ mod tests {
             &main_path,
             "North Research Center\r\nExample School for Mathematics",
             "North Research Center\r\nExample School for ".len(),
+            &mut QuerySources::default(),
+            &Operation::default(),
         )
+        .unwrap()
         .unwrap();
         assert!(found.0.ends_with("preamble.tex"));
         assert_eq!((found.2, found.3), (2, 19));
-        assert!(document_metadata_word_location(&main_path, "Report", 0).is_none());
+        assert!(
+            document_metadata_word_location(
+                &main_path,
+                "Report",
+                0,
+                &mut QuerySources::default(),
+                &Operation::default(),
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -2155,7 +3137,15 @@ mod tests {
             }
             source.push_str(declaration);
             fs::write(&main_path, &source).unwrap();
-            let found = document_metadata_word_location(&main_path, "Example Report", 8).unwrap();
+            let found = document_metadata_word_location(
+                &main_path,
+                "Example Report",
+                8,
+                &mut QuerySources::default(),
+                &Operation::default(),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!((found.2, found.3), (9, declaration.find("Report").unwrap()));
         }
     }
@@ -2173,9 +3163,16 @@ mod tests {
         let title = "Topological Data Analysis\nCell cycle TDA application\n\
                      Persistent Homology and Applications in Topological Data Analysis";
         let title_offset = title.find("Data").unwrap();
-        let metadata_score = document_metadata_word_location(&main_path, title, title_offset)
-            .unwrap()
-            .4;
+        let metadata_score = document_metadata_word_location(
+            &main_path,
+            title,
+            title_offset,
+            &mut QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .4;
         assert!(metadata_score >= 6);
         assert_eq!(
             source_word_location(source, 5, title, title_offset, 4),
@@ -2193,9 +3190,16 @@ mod tests {
         let footer = "Topological Data Analysis\nCell cycle TDA application\n\
                       Persistent Homology and Applications in Topological Data Analysis";
         let footer_offset = footer.rfind("Data").unwrap();
-        let footer_score = document_metadata_word_location(&main_path, footer, footer_offset)
-            .unwrap()
-            .4;
+        let footer_score = document_metadata_word_location(
+            &main_path,
+            footer,
+            footer_offset,
+            &mut QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .4;
         assert!(metadata_beats_frame(
             source,
             5,
@@ -2217,9 +3221,16 @@ mod tests {
         fs::write(&main_path, source).unwrap();
         let context = "Topological Data Analysis";
         let offset = context.find("Data").unwrap();
-        let metadata_score = document_metadata_word_location(&main_path, context, offset)
-            .unwrap()
-            .4;
+        let metadata_score = document_metadata_word_location(
+            &main_path,
+            context,
+            offset,
+            &mut QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .4;
         assert_eq!(
             metadata_score,
             source_prose_scored_location(
@@ -2307,27 +3318,279 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_synctex_edit_finds_file_and_line() {
-        let stdout = "Output: paper.pdf\nInput: /private/tmp/synctex-test/./paper.tex\nLine: 3\nColumn: -1\n";
-        let target = parse_synctex_edit(stdout).expect("synctex match");
-        assert_eq!(target.file, "/private/tmp/synctex-test/./paper.tex");
-        assert_eq!(target.line, 3);
+    fn inverse_output(
+        pdf: &Path,
+        stdout: &str,
+        word: Option<(&str, usize)>,
+    ) -> io::Result<InverseResolution> {
+        resolve_inverse_output(
+            pdf,
+            InversePoint {
+                page: 1,
+                x: 72.0,
+                y_from_top: 120.0,
+                page_height_pt: 792.0,
+            },
+            word,
+            0,
+            &Operation::default(),
+            stdout,
+            QuerySources::default(),
+        )
     }
 
     #[test]
-    fn parse_synctex_edit_takes_last_input() {
-        let stdout = "Input: preamble.tex\nLine: 9\nInput: paper.tex\nLine: 3\n";
-        let target = parse_synctex_edit(stdout).expect("synctex match");
-        assert_eq!(target.file, "paper.tex");
-        assert_eq!(target.line, 3);
+    fn inverse_raw_hits_preserve_distinct_records_without_trailing_duplicates() {
+        let stdout = "Output: paper.pdf\nInput: preamble.tex\nLine: 9\nColumn: -1\n\
+                      Offset: 0\nContext: ignored\nInput: paper.tex\nLine: 3\n\
+                      Column: -1\nInput: preamble.tex\nLine: 9\nColumn: -1\n";
+        let targets = parse_synctex_edit(stdout);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.file.as_str(), target.line))
+                .collect::<Vec<_>>(),
+            vec![("preamble.tex", 9), ("paper.tex", 3)]
+        );
+        for incomplete in [
+            "Output: paper.pdf\nLine: 3\n",
+            "Output: paper.pdf\nInput: paper.tex\n",
+            "Input: paper.tex\nLine: 0\n",
+            "",
+        ] {
+            assert!(parse_synctex_edit(incomplete).is_empty());
+        }
     }
 
     #[test]
-    fn parse_synctex_edit_rejects_missing_input() {
-        assert!(parse_synctex_edit("Output: paper.pdf\nLine: 3\n").is_none());
-        assert!(parse_synctex_edit("Output: paper.pdf\nInput: paper.tex\n").is_none());
-        assert!(parse_synctex_edit("").is_none());
+    fn inverse_unique_supported_position_beats_unrelated_coarse_hits_in_any_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("paper.tex");
+        let caption = "\\caption{Mechanical measurements remain stable.}";
+        fs::write(&source, format!("{caption}\nUnrelated coarse heading.\n")).unwrap();
+        let supported = "Input: paper.tex\nLine: 1\nColumn: -1\n";
+        let alias = "Input: ./paper.tex\nLine: 1\nColumn: -1\n";
+        let coarse = "Input: paper.tex\nLine: 2\nColumn: -1\n";
+        for stdout in [
+            format!("{supported}{coarse}{alias}"),
+            format!("{alias}{coarse}{supported}"),
+            format!("{coarse}{supported}{alias}"),
+        ] {
+            let result = inverse_output(
+                &directory.path().join("paper.pdf"),
+                &stdout,
+                Some(("Mechanical measurements remain stable", 0)),
+            )
+            .unwrap();
+            assert_eq!(
+                result.location.file,
+                source.canonicalize().unwrap().to_str().unwrap()
+            );
+            assert_eq!(result.location.line, 1);
+            assert_eq!(
+                result.location.byte_column,
+                caption.find("Mechanical").unwrap()
+            );
+            assert!(result.location.precise);
+        }
+    }
+
+    #[test]
+    fn inverse_closing_layout_anchor_does_not_guess_a_neighboring_prose_row() {
+        let source = "\\begin{tabularx}{\\linewidth}{X}\n\
+                      Group alpha \\(n\\); primary sample columns. \\\\\n\
+                      \\\\\n\\\\\n\\\\\n\\\\\n\
+                      Group beta \\(n\\); direct step. \\\\\n\
+                      Group alpha \\(n\\); secondary columns for sample tables. \\\\\n\
+                      \\end{tabularx}\n";
+        let first_context = "Group alpha 𝑛; primary sample columns.";
+        assert_eq!(source_word_location(source, 9, first_context, 0, 4), None);
+        assert_eq!(
+            source_word_location(source, 2, first_context, 0, 4),
+            Some((2, 0))
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let complete = format!("{source}{}Unrelated coarse heading.\n", "\n".repeat(8));
+        let coarse_line = complete.lines().count();
+        fs::write(directory.path().join("paper.tex"), complete).unwrap();
+        let error = resolve_inverse_output(
+            &directory.path().join("paper.pdf"),
+            InversePoint {
+                page: 1,
+                x: 10.0,
+                y_from_top: 10.0,
+                page_height_pt: 600.0,
+            },
+            Some((first_context, 0)),
+            4,
+            &Operation::default(),
+            &format!("Input: paper.tex\nLine: 9\nInput: paper.tex\nLine: {coarse_line}\n"),
+            QuerySources::default(),
+        )
+        .err()
+        .expect("unqualified layout rows must remain competing coarse anchors");
+        assert!(error.to_string().contains("ambiguous inverse search"));
+    }
+
+    #[test]
+    fn inverse_closing_layout_does_not_guess_neighboring_mathematical_atoms() {
+        let source = "\\begin{tabular}{l}\n\\(s+1\\) \\\\\n\n\n\n\n\
+                      \\(s+1\\) \\\\\n\\end{tabular}\n";
+        assert_eq!(source_word_location(source, 8, "𝑠+1", 0, 4), None);
+        assert_eq!(source_word_location(source, 2, "𝑠+1", 0, 4), Some((2, 2)));
+        let equation = "\\begin{equation}\ns+1\n\\end{equation}\n";
+        assert_eq!(source_word_location(equation, 3, "𝑠+1", 0, 4), Some((2, 0)));
+    }
+
+    #[test]
+    fn inverse_competing_precise_or_coarse_positions_are_ambiguous_in_any_order() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("paper.tex"),
+            "Silver signal remains stable.\nSilver signal remains stable.\n",
+        )
+        .unwrap();
+        let first = "Input: paper.tex\nLine: 1\n";
+        let second = "Input: paper.tex\nLine: 2\n";
+        for stdout in [format!("{first}{second}"), format!("{second}{first}")] {
+            for (word, expected) in [
+                (Some(("Silver signal remains stable", 0)), "precise"),
+                (None, "coarse"),
+            ] {
+                let error = inverse_output(&directory.path().join("paper.pdf"), &stdout, word)
+                    .err()
+                    .expect("competing source locations must be ambiguous")
+                    .to_string();
+                assert!(error.contains("ambiguous inverse search"), "{error}");
+                assert!(error.contains(expected), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_duplicate_hits_deduplicate_final_canonical_coarse_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("paper.tex");
+        fs::write(&source, "First visible line.\nSecond visible line.\n").unwrap();
+        let stdout = "Input: paper.tex\nLine: 2\nColumn: -1\n\
+                      Input: ./paper.tex\nLine: 2\nColumn: -1\n\
+                      Input: paper.tex\nLine: 2\nColumn: -1\n";
+        let result = inverse_output(&directory.path().join("paper.pdf"), stdout, None).unwrap();
+        assert_eq!(
+            result.location.file,
+            source.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!((result.location.line, result.location.byte_column), (2, 0));
+        assert!(!result.location.precise);
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn inverse_readable_bounds_are_required_even_without_word_refinement() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("main.tex"),
+            "Visible line.\n".repeat(272),
+        )
+        .unwrap();
+        let error = inverse_output(
+            &directory.path().join("main.pdf"),
+            "Input: main.tex\nLine: 490\n",
+            None,
+        )
+        .err()
+        .expect("a readable out-of-range source anchor must be rejected")
+        .to_string();
+        assert!(error.contains("source line 490 is out of range"), "{error}");
+    }
+
+    #[test]
+    fn inverse_unreadable_source_remains_explicitly_warned_coarse_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("main.tex");
+        fs::write(&source, [0xff]).unwrap();
+        for unavailable in ["invalid UTF-8", "missing"] {
+            if unavailable == "missing" {
+                fs::remove_file(&source).unwrap();
+            }
+            for word in [None, Some(("Visible line", 0))] {
+                let result = inverse_output(
+                    &directory.path().join("main.pdf"),
+                    "Input: main.tex\nLine: 490\nInput: ./main.tex\nLine: 490\n",
+                    word,
+                )
+                .unwrap();
+                assert_eq!(result.location.line, 490);
+                assert!(!result.location.precise);
+                assert!(
+                    result
+                        .warning
+                        .unwrap()
+                        .contains("source refinement unavailable"),
+                    "{unavailable}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_generated_hit_remaps_before_bounds_without_reading_reused_verbatim() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.tex");
+        fs::write(
+            &original,
+            "\\begin{frame}[fragile]\nLiteral body text.\n\\end{frame}\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("deck.vrb"), [0xff]).unwrap();
+        fs::write(
+            directory.path().join("deck.synctex"),
+            "Input:1:original.tex\nInput:2:deck.vrb\nContent:\n\
+             {1\n[1,3:0,0:1,1,0\nx2,490:0,0\n]\n}1\n",
+        )
+        .unwrap();
+        let result = inverse_output(
+            &directory.path().join("deck.pdf"),
+            "Input: deck.vrb\nLine: 490\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.location.file,
+            original.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(result.location.line, 3);
+        assert!(!result.location.precise);
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn forward_source_bounds_apply_when_the_original_position_has_no_word() {
+        let source = "école \\hidden{} % not printed\n\n";
+        for (line, column) in [(1, 6), (2, 1)] {
+            let text = validate_forward_source_position(source, line, column).unwrap();
+            assert!(ForwardWord::at(text, column).is_none());
+        }
+        assert!(validate_forward_source_position(source, 2, 2).is_err());
+        assert!(validate_forward_source_position(source, 3, 1).is_err());
+        assert!(validate_forward_source_position(source, 1, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn forward_duplicate_regions_do_not_hide_invalid_or_incomplete_records() {
+        let first = "Page:1\nh:72\nv:120\nW:200\nH:10\n";
+        let second = "Page:1\nh:72\nv:160\nW:100\nH:10\n";
+        let candidates = parse_synctex_view(&format!("{first}{first}{second}")).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].rect.bottom, 120.0);
+        assert_eq!(candidates[1].rect.bottom, 160.0);
+        for invalid in [
+            "Page:2\nh:72\nv:120\nW:NaN\nH:10\n",
+            "Page:2\nh:72\nv:120\nW:200\n",
+            "Page:0\nh:72\nv:120\nW:200\nH:10\n",
+        ] {
+            assert!(parse_synctex_view(&format!("{first}{invalid}")).is_err());
+        }
     }
 
     #[test]
@@ -2414,6 +3677,22 @@ mod tests {
             payload.replace("\"h\":72", "\"h\":1e100"),
             payload.replace("\"h\":72", "\"h\":72,\"h\":73"),
             payload.replace("\"h\":72", "\"h\":72,\"unexpected\":0"),
+            payload.replace("\"h\":72", r#""h":72,"best_guess":"false""#),
+            payload.replace("\"h\":72", r#""h":72,"best_guess":null"#),
+            payload.replace("\"h\":72", r#""h":72,"source_snapshot":"relative.json""#),
+            payload.replace(
+                "\"h\":72",
+                r#""h":72,"source_snapshot":"/cache/\u0000.json""#,
+            ),
+            payload.replace("\"h\":72", r#""h":72,"warning":"" "#),
+            payload.replace("\"h\":72", r#""h":72,"warning":"\u001b[31munsafe""#),
+            payload.replace(
+                "\"h\":72",
+                &format!(
+                    "\"h\":72,\"warning\":\"{}\"",
+                    "x".repeat(crate::source_snapshot::MAX_WARNING_BYTES + 1)
+                ),
+            ),
             payload.replace("\"h\":72", r#""h":72,"word":{"words":[],"selected":0}"#),
             payload.replace(
                 "\"h\":72",

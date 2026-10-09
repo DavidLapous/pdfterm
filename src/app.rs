@@ -30,7 +30,7 @@ use crate::config::{Config, LinkPickerLayout, ViewerSettings};
 use crate::kitty::{self, Placement};
 use crate::navigation::{
     Coordinator, ForwardStage, InverseStage, InverseTask, PendingFlash, PendingForward,
-    PendingInverse,
+    PendingInverse, SourceState,
 };
 use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
@@ -138,6 +138,8 @@ pub fn run(
     start_page: u32,
     config: &Config,
     focus_token: Option<String>,
+    source_snapshot: Option<PathBuf>,
+    synctex_best_guess: bool,
 ) -> Result<(), AppError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::NotInteractive);
@@ -172,6 +174,27 @@ pub fn run(
         (outline, revision),
         defaults,
     );
+    if let Some(snapshot) = source_snapshot {
+        let source = crate::source_snapshot::SourceSnapshot::load(&snapshot, &app.tab().path)?;
+        app.navigation.source_snapshots.insert(
+            app.tab().path.clone(),
+            SourceState {
+                revision: source.revision,
+                snapshot: Some(source.path),
+                best_guess: synctex_best_guess,
+            },
+        );
+    } else if synctex_best_guess {
+        let revision = app.tab().watcher.accepted;
+        app.navigation.source_snapshots.insert(
+            app.tab().path.clone(),
+            SourceState {
+                revision,
+                snapshot: None,
+                best_guess: true,
+            },
+        );
+    }
     app.request_current(&mut output)?;
 
     loop {
@@ -2023,6 +2046,8 @@ impl App {
                     self.navigation.inverse.take();
                     self.navigation.forward = Some(PendingForward {
                         request,
+                        document_revision: None,
+                        source_state: None,
                         reply,
                         deadline: Instant::now() + crate::ipc::FORWARD_TIMEOUT,
                         stage: ForwardStage::AwaitingDocument,
@@ -2221,6 +2246,21 @@ impl App {
 
     fn finish_forward(&mut self, error: Option<String>) {
         if let Some(mut pending) = self.navigation.forward.take() {
+            if error.is_none() {
+                let path = &self.session.tabs[self.session.active_tab].path;
+                if let Some(endpoint) = pending.request.inverse_search {
+                    self.navigation.source_maps.insert(path.clone(), endpoint);
+                } else {
+                    self.navigation.source_maps.remove(path);
+                }
+                if let Some(source) = pending.source_state {
+                    self.navigation
+                        .source_snapshots
+                        .insert(path.clone(), source);
+                } else {
+                    self.navigation.source_snapshots.remove(path);
+                }
+            }
             pending
                 .reply
                 .finish_with_token(error, self.focus_token.as_deref());
@@ -2253,7 +2293,7 @@ impl App {
                 )
                 .into());
             }
-            pending.request.revision.check(&pending.request.pdf)?;
+            pending.check_revision()?;
             if pending.stage == ForwardStage::AwaitingFrame || self.session.pending_open.is_some() {
                 return Ok(());
             }
@@ -2279,7 +2319,12 @@ impl App {
             // cannot acknowledge an older cached frame.
             let mut pending = self.navigation.forward.take().unwrap();
             match self.apply_forward_request(&pending.request, index, output) {
-                Ok(()) => {
+                Ok(source_state) => {
+                    pending.document_revision = source_state
+                        .as_ref()
+                        .filter(|source| source.snapshot.is_some())
+                        .map(|source| source.revision);
+                    pending.source_state = source_state;
                     pending.stage = ForwardStage::AwaitingFrame;
                     self.navigation.forward = Some(pending);
                 }
@@ -2308,13 +2353,31 @@ impl App {
         request: &ForwardRequest,
         index: usize,
         output: &mut impl Write,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<SourceState>, AppError> {
         if self.session.pending_open.is_some() {
             return Err(io::Error::other("viewer is still opening a document").into());
         }
         if request.page > self.session.tabs[index].page_count {
             return Err(io::Error::other("forward page is outside the document").into());
         }
+        let source = request
+            .source_snapshot
+            .as_deref()
+            .map(|path| crate::source_snapshot::SourceSnapshot::load(path, &request.pdf))
+            .transpose()?;
+        let source_state = source
+            .map(|source| SourceState {
+                revision: source.revision,
+                snapshot: Some(source.path),
+                best_guess: request.best_guess,
+            })
+            .or_else(|| {
+                request.best_guess.then_some(SourceState {
+                    revision: self.session.tabs[index].watcher.accepted,
+                    snapshot: None,
+                    best_guess: true,
+                })
+            });
         let rect = request.rect();
         self.pending_scale = None;
         self.select_tab(index, output)?;
@@ -2334,15 +2397,6 @@ impl App {
         if page != tab.page {
             tab.page = page;
             tab.scroll_y = 0;
-        }
-        if let Some(endpoint) = &request.inverse_search {
-            self.navigation
-                .source_maps
-                .insert(self.session.tabs[index].path.clone(), endpoint.clone());
-        } else {
-            self.navigation
-                .source_maps
-                .remove(&self.session.tabs[index].path);
         }
         self.navigation.flash = Some(PendingFlash {
             document_id,
@@ -2369,7 +2423,7 @@ impl App {
                 generation: self.generation,
             })
             .map_err(AppError::Renderer)?;
-        Ok(())
+        Ok(source_state)
     }
 
     fn clear_document_flash(&mut self, document_id: DocumentId) {
@@ -3958,7 +4012,7 @@ impl App {
                 .navigation
                 .forward
                 .as_ref()
-                .and_then(|pending| pending.request.revision.check(&pending.request.pdf).err())
+                .and_then(|pending| pending.check_revision().err())
                 .map(|error| error.to_string())
                 .or_else(|| {
                     highlight
@@ -3972,12 +4026,21 @@ impl App {
                 .as_ref()
                 .is_some_and(|pending| pending.stage == ForwardStage::AwaitingFrame)
             {
-                if error.is_none() && !highlight.word_precise {
-                    self.draw_status(
-                        output,
-                        viewport,
-                        "forward search: SyncTeX region; no unique source word",
-                    )?;
+                if error.is_none() {
+                    if let Some(warning) = self
+                        .navigation
+                        .forward
+                        .as_mut()
+                        .and_then(|pending| pending.request.warning.take())
+                    {
+                        self.draw_status(output, viewport, &format!("warning: {warning}"))?;
+                    } else if !highlight.word_precise {
+                        self.draw_status(
+                            output,
+                            viewport,
+                            "forward search: SyncTeX region; no unique source word",
+                        )?;
+                    }
                 }
                 self.finish_forward(error);
             }
@@ -4633,6 +4696,17 @@ impl App {
                     .source_maps
                     .get(&self.session.tabs[index].path)
                     .cloned(),
+                source_snapshot: self
+                    .navigation
+                    .source_snapshots
+                    .get(&self.session.tabs[index].path)
+                    .and_then(|source| source.snapshot_for_revision(pending.revision))
+                    .map(Path::to_path_buf),
+                best_guess: self
+                    .navigation
+                    .source_snapshots
+                    .get(&self.session.tabs[index].path)
+                    .is_some_and(|source| source.best_guess),
                 operation: pending.operation.clone(),
             })
         })();
@@ -4668,16 +4742,22 @@ impl App {
                 }
                 Ok(result) => {
                     let target = result.location;
-                    write_clipboard_osc52(
-                        output,
-                        &format!("{}:{}:{}", target.file, target.line, target.byte_column),
-                    )?;
+                    let clipboard_only = matches!(self.editor, crate::editor::Editor::None);
+                    if clipboard_only {
+                        write_clipboard_osc52(
+                            output,
+                            &format!("{}:{}:{}", target.file, target.line, target.byte_column),
+                        )?;
+                    }
                     let shown = target.file.rsplit('/').next().unwrap_or(&target.file);
-                    let detail = result.warning.as_deref().unwrap_or(if target.precise {
-                        "word, copied"
-                    } else {
-                        "line only, copied"
-                    });
+                    let detail = result.warning.as_deref().unwrap_or(
+                        match (target.precise, clipboard_only) {
+                            (true, true) => "word, copied",
+                            (false, true) => "line only, copied",
+                            (true, false) => "word",
+                            (false, false) => "line only",
+                        },
+                    );
                     self.draw_status(
                         output,
                         viewport,
@@ -8043,6 +8123,17 @@ mod tests {
         other_tab.document_id += 1;
         app.session.tabs.push(other_tab);
         app.session.active_tab = 1;
+        let path = app.session.tabs[0].path.clone();
+        let source_revision = app.session.tabs[0].watcher.accepted;
+        let snapshot = path.with_extension("manifest.json");
+        app.navigation.source_snapshots.insert(
+            path.clone(),
+            super::SourceState {
+                revision: source_revision,
+                snapshot: Some(snapshot.clone()),
+                best_guess: true,
+            },
+        );
         for pages in [2, 1] {
             let tab = &mut app.session.tabs[0];
             tab.page = 1;
@@ -8069,6 +8160,12 @@ mod tests {
             assert_eq!((tab.scroll_x, tab.scroll_y, tab.zoom), (37, 123, 150));
             assert!(tab.cache.is_empty());
             assert!(app.navigation.flash.is_none());
+            let source = &app.navigation.source_snapshots[&path];
+            assert!(source.best_guess);
+            assert_eq!(
+                source.snapshot_for_revision(source_revision),
+                Some(snapshot.as_path())
+            );
         }
     }
 

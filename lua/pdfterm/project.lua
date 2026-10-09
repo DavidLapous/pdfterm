@@ -90,15 +90,27 @@ function M.run(argv, cwd, timeout, callback, on_output)
   end
 end
 
+local function unsaved_identity(path)
+  local parent = vim.uv.fs_realpath(vim.fs.dirname(path))
+  return parent and parent .. '/' .. vim.fs.basename(path) or nil
+end
+
 -- TeXShop root directives name the owning document, not the source cursor.
-local function root_source(source)
+local function root_source(source, current_source)
   local visited, explicit = {}, false
-  while vim.fn.filereadable(source) == 1 do
-    local identity = vim.uv.fs_realpath(source) or source
+  while current_source ~= nil or vim.fn.filereadable(source) == 1 do
+    local identity = vim.uv.fs_realpath(source) or unsaved_identity(source) or source
+    local live = current_source ~= nil
     assert(not visited[identity], 'pdfterm: cyclic TeX root directive at ' .. source)
     visited[identity] = true
-    local target
-    for _, line in ipairs(vim.fn.readfile(source, '', 20)) do
+    local text, reason = current_source
+    if text == nil then text, reason = require('pdfterm.source').read_input(source) end
+    current_source = nil
+    assert(text, 'pdfterm: cannot read TeX root source: ' .. tostring(reason))
+    local target, examined = nil, 0
+    for line in vim.gsplit(text, '\n', { plain = true }) do
+      examined = examined + 1
+      if examined > 20 then break end
       target = line:match('^%s*%%%s*!%s*[Tt][Ee][Xx]%s+[Rr][Oo][Oo][Tt]%s*=%s*(.-)%s*$')
       if target then
         break
@@ -113,7 +125,11 @@ local function root_source(source)
     if not vim.startswith(target, '/') then
       target = vim.fs.dirname(source) .. '/' .. target
     end
-    target = assert(vim.uv.fs_realpath(target), 'pdfterm: TeX root file does not exist: ' .. target)
+    local resolved = vim.uv.fs_realpath(target)
+    if not resolved and live and unsaved_identity(target) == identity then
+      return identity, true
+    end
+    target = assert(resolved, 'pdfterm: TeX root file does not exist: ' .. target)
     assert(vim.fn.filereadable(target) == 1, 'pdfterm: TeX root file is not readable: ' .. target)
     if target == identity then
       return target, true
@@ -126,11 +142,11 @@ end
 -- This is a literal source graph, not a TeX interpreter. In particular, macro
 -- filenames, conditionals, search paths and catcode changes are not evaluated.
 local function tex_includes(path)
-  local ok, lines = pcall(vim.fn.readfile, path)
-  if not ok then
+  local text = require('pdfterm.source').read_input(path)
+  if not text then
     return { inputs = {} }
   end
-  local text, inputs, document = table.concat(lines, '\n'), {}, false
+  local inputs, document = {}, false
   local function after_comment(pos)
     local newline = text:find('\n', pos, true)
     return newline and newline + 1 or #text + 1
@@ -236,8 +252,16 @@ local function tex_includes(path)
   return { inputs = inputs, document = document }
 end
 
-local function automatic_root(source, configured_cwd)
-  local target = vim.uv.fs_realpath(source) or source
+local function automatic_root(source, configured_cwd, current_source)
+  local target = vim.uv.fs_realpath(source)
+  local unsaved = target == nil and current_source ~= nil
+  target = target or unsaved_identity(source) or source
+  local function included(path)
+    local identity = vim.uv.fs_realpath(path)
+    if identity or not unsaved then return identity end
+    -- A new child can already have a literal owner before its first write.
+    return unsaved_identity(path) == target and target or nil
+  end
   local home = vim.uv.os_homedir()
   home = home and (vim.uv.fs_realpath(home) or home)
   local parsed, directories = {}, {}
@@ -272,9 +296,9 @@ local function automatic_root(source, configured_cwd)
           end
           local child
           if not name:match('%.tex$') then
-            child = vim.uv.fs_realpath(name .. '.tex')
+            child = included(name .. '.tex')
           end
-          child = child or vim.uv.fs_realpath(name)
+          child = child or included(name)
           if child and not visited[child] then
             pending[#pending + 1] = child
           end
@@ -331,7 +355,48 @@ local function automatic_root(source, configured_cwd)
   return source
 end
 
-function M.describe(config, main)
+function M.sources(main, cwd)
+  cwd = cwd or vim.fs.dirname(main)
+  local pending, visited, sources = { main }, {}, {}
+  while #pending > 0 do
+    local path = table.remove(pending)
+    path = vim.uv.fs_realpath(path) or vim.fs.normalize(vim.fn.fnamemodify(path, ':p'))
+    if not visited[path] then
+      visited[path] = true
+      sources[#sources + 1] = path
+      for _, name in ipairs(tex_includes(path).inputs) do
+        if not vim.startswith(name, '/') then name = cwd .. '/' .. name end
+        local child = not name:match('%.tex$') and vim.uv.fs_realpath(name .. '.tex') or nil
+        child = child or vim.uv.fs_realpath(name)
+        if child and not visited[child] then pending[#pending + 1] = child end
+      end
+    end
+  end
+  return sources
+end
+
+function M.source_info(project, callback)
+  return M.run(
+    { project.executable, project.pdf, '--synctex-source-info' },
+    project.cwd,
+    10000,
+    function(result)
+      if result.code ~= 0 then
+        callback(nil, vim.trim(result.stderr))
+        return
+      end
+      local ok, info = pcall(vim.json.decode, result.stdout)
+      if not ok or type(info) ~= 'table' or type(info.pdf) ~= 'string'
+        or type(info.revision) ~= 'table' or type(info.inputs) ~= 'table' then
+        callback(nil, 'invalid compiled source metadata')
+        return
+      end
+      callback(info)
+    end
+  )
+end
+
+function M.describe(config, main, current_source)
   local p = config or {}
   local source = p.main or main
   assert(
@@ -345,10 +410,10 @@ function M.describe(config, main)
   local typst = source:match('%.typ$') ~= nil
   if not typst and not p.main then
     local explicit
-    source, explicit = root_source(source)
+    source, explicit = root_source(source, current_source)
     if not explicit then
       local cwd = p.cwd and vim.fs.normalize(vim.fn.fnamemodify(p.cwd, ':p'))
-      source = automatic_root(source, cwd)
+      source = automatic_root(source, cwd, current_source)
     end
   end
   local cwd = vim.fn.fnamemodify(p.cwd or vim.fs.dirname(source), ':p')
@@ -379,6 +444,7 @@ function M.describe(config, main)
 end
 
 function M.build(project, id, callback)
+  if not M.current(id) then return end
   local job = { project = project, id = id, callback = callback }
   local active = builds[project.cwd] or builds[project.pdf]
   if active then
@@ -387,6 +453,8 @@ function M.build(project, id, callback)
   end
   builds[project.cwd], builds[project.pdf] = job, job
   local tail, scheduled, completed = '', false, false
+  local tracked = project.executable and project.main and project.main:match('%.tex$')
+  local source = tracked and require('pdfterm.source') or nil
   local notification = { id = 'pdfterm.build.' .. id, title = 'pdfterm: ' .. vim.fs.basename(project.pdf) }
   local function append(data)
     tail = (tail .. data:sub(-2000)):sub(-2000)
@@ -402,41 +470,95 @@ function M.build(project, id, callback)
       })
     )
   end
-  show('Compiling…', vim.log.levels.INFO)
-  M.run(project.build, project.cwd, 120000, function(result)
+  local function finish(result, status, quiet)
+    if job.closed then return end
     local pending = job.pending
     builds[project.cwd], builds[project.pdf] = nil, nil
     completed = true
-    show(
-      result.code == 0 and 'Compilation OK' or 'Compilation failed',
-      result.code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
+    if not quiet then
+      show(
+        status or (result.code == 0 and 'Compilation OK' or 'Compilation failed'),
+        result.code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
+      )
+    end
+    if callback and M.current(id) then callback(result) end
+    if pending then M.build(pending.project, pending.id, pending.callback) end
+  end
+  local function obsolete()
+    if job.closed then return true end
+    if M.current(id) then return false end
+    if job.capture then source.publish(job.capture, nil); job.capture = nil end
+    finish({ code = 1, stdout = '', stderr = 'navigation cancelled' }, nil, true)
+    return true
+  end
+  local function tracking_failure(error, result)
+    if job.closed then return end
+    if job.capture then source.publish(job.capture, nil) end
+    append('\nsource tracking: ' .. tostring(error))
+    finish(
+      { code = 1, stdout = result and result.stdout or '', stderr = 'source tracking: ' .. tostring(error) },
+      'Source tracking failed'
     )
-    -- Never navigate from a superseded intent, even if the old build succeeds.
-    if callback and M.current(id) then
-      callback(result)
+  end
+  local function begin(info)
+    if obsolete() then return end
+    if source then
+      local ok, capture = pcall(function()
+        if info then source.ensure(project, info) end
+        local inputs = M.sources(project.main, project.cwd)
+        vim.list_extend(inputs, info and info.inputs or {})
+        return source.capture(project, inputs)
+      end)
+      if not ok then tracking_failure(capture); return end
+      job.capture = capture
     end
-    if pending then
-      M.build(pending.project, pending.id, pending.callback)
-    end
-  end, function(data)
-    append(data)
-    if scheduled then
-      return
-    end
-    scheduled = true
-    vim.defer_fn(function()
-      scheduled = false
-      if not completed then
-        show('Compiling…', vim.log.levels.INFO)
+    show('Compiling…', vim.log.levels.INFO)
+    if obsolete() then return end
+    M.run(project.build, project.cwd, 120000, function(result)
+      if job.closed then return end
+      if not source or result.code ~= 0 then
+        if source and job.capture then source.publish(job.capture, nil) end
+        finish(result)
+        return
       end
-    end, 100)
-  end)
+      M.source_info(project, function(published, error)
+        if job.closed then return end
+        if not published then tracking_failure(error, result); return end
+        local ok, document = pcall(source.publish, job.capture, published)
+        if not ok then tracking_failure(document, result); return end
+        result.source_document = document
+        finish(result)
+      end)
+    end, function(data)
+      append(data)
+      if scheduled then return end
+      scheduled = true
+      vim.defer_fn(function()
+        scheduled = false
+        if not completed then show('Compiling…', vim.log.levels.INFO) end
+      end, 100)
+    end)
+  end
+  if source and vim.uv.fs_stat(project.pdf) then
+    M.source_info(project, function(info, error)
+      if obsolete() then return end
+      if not info then tracking_failure(error); return end
+      begin(info)
+    end)
+  else
+    begin()
+  end
 end
 
 function M.close()
   M.next()
   for _, job in pairs(builds) do
     job.pending = nil
+    job.closed = true
+    if job.capture then
+      require('pdfterm.source').publish(job.capture, nil)
+      job.capture = nil
+    end
   end
   for process in pairs(processes) do
     vim.uv.kill(-process.pid, 9)

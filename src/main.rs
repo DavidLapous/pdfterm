@@ -34,6 +34,22 @@ struct Cli {
     #[arg(long)]
     synctex_view: Option<PathBuf>,
 
+    /// Read the complete compiler input list without invoking external SyncTeX.
+    #[arg(long, hide = true, conflicts_with_all = ["forward_search", "synctex_view", "synctex_edit_batch", "screenshot", "print_config", "third_party_licenses"])]
+    synctex_source_info: bool,
+
+    /// Immutable compiled source manifest supplied by the editor adapter.
+    #[arg(long, hide = true, requires = "path")]
+    source_snapshot: Option<PathBuf>,
+
+    /// Permit explicitly warned compiler-anchor navigation.
+    #[arg(long, hide = true)]
+    synctex_best_guess: bool,
+
+    /// Resolve only a compiler line anchor, without a literal word hint.
+    #[arg(long, hide = true)]
+    synctex_anchor: bool,
+
     /// One-based source line for --forward-search or --synctex-view.
     #[arg(long, default_value_t = 1)]
     line: u32,
@@ -72,6 +88,24 @@ fn main() -> ExitCode {
             }
         };
     }
+    if cli.synctex_source_info {
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let pdf = cli
+                .path
+                .as_deref()
+                .ok_or("a PDF path is required for --synctex-source-info")?;
+            let info = pdfterm::source_snapshot::SourceInfo::read(pdf)?;
+            println!("{}", serde_json::to_string(&info)?);
+            Ok(())
+        })();
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("pdfterm: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if cli.synctex_edit_batch {
         let result = (|| -> Result<(), String> {
             let pdf = cli
@@ -85,6 +119,8 @@ fn main() -> ExitCode {
                 &config.viewer,
                 io::stdin().lock(),
                 io::stdout().lock(),
+                cli.source_snapshot.as_deref(),
+                cli.synctex_best_guess,
             )
         })();
         return match result {
@@ -149,6 +185,11 @@ fn main() -> ExitCode {
                 cli.line,
                 cli.column,
                 cli.pdfium_library.as_deref(),
+                pdfterm::synctex::ForwardSource {
+                    snapshot: cli.source_snapshot.as_deref(),
+                    best_guess: cli.synctex_best_guess,
+                    anchor_only: cli.synctex_anchor,
+                },
             )?;
             if cli.synctex_view.is_some() {
                 println!("{}", serde_json::to_string(&request)?);
@@ -166,7 +207,15 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("pdfterm: {error}");
-                ExitCode::FAILURE
+                if (cli.synctex_best_guess || cli.synctex_anchor)
+                    && error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(pdfterm::synctex::is_forward_unavailable)
+                {
+                    ExitCode::from(3)
+                } else {
+                    ExitCode::FAILURE
+                }
             }
         };
     }
@@ -176,6 +225,8 @@ fn main() -> ExitCode {
         cli.page - 1,
         &config,
         cli.focus_token,
+        cli.source_snapshot,
+        cli.synctex_best_guess,
     ) {
         Ok(()) | Err(pdfterm::app::AppError::Quit) => ExitCode::SUCCESS,
         Err(error) => {

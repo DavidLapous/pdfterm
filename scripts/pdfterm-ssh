@@ -322,7 +322,7 @@ class Bridge:
         action = request.get('action')
         if action == 'launch':
             argv = request.get('argv')
-            if (not isinstance(argv, list) or not 2 <= len(argv) <= 8
+            if (not isinstance(argv, list) or not 2 <= len(argv) <= 9
                     or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in argv)):
                 raise ValueError('invalid viewer argv')
             live = self.windows.existing(self.owned, deadline=deadline)

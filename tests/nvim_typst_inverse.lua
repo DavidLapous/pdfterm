@@ -5,7 +5,7 @@ local project = require('pdfterm.project')
 local typst = require('pdfterm.typst')
 local directories, endpoints = {}, {}
 local function directory()
-  local path = assert(vim.uv.fs_mkdtemp('/tmp/pdfterm-inverse-test-XXXXXX'))
+  local path = assert(vim.uv.fs_mkdtemp(vim.fn.getcwd() .. '/target/ti-XXXXXX'))
   path = assert(vim.uv.fs_realpath(path))
   directories[#directories + 1] = path
   return path

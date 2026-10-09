@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::{
     collections::HashMap,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread::{self, JoinHandle},
 };
 
@@ -22,6 +22,7 @@ pub(crate) struct Coordinator {
     pub next_request_id: u64,
     // The retained resolver validates each displayed revision, including reloads.
     pub source_maps: HashMap<PathBuf, String>,
+    pub source_snapshots: HashMap<PathBuf, SourceState>,
 }
 impl Coordinator {
     pub fn new() -> Self {
@@ -32,7 +33,21 @@ impl Coordinator {
             flash: None,
             next_request_id: 1,
             source_maps: HashMap::new(),
+            source_snapshots: HashMap::new(),
         }
+    }
+}
+
+pub(crate) struct SourceState {
+    pub revision: DocumentRevision,
+    pub snapshot: Option<PathBuf>,
+    pub best_guess: bool,
+}
+impl SourceState {
+    pub fn snapshot_for_revision(&self, revision: DocumentRevision) -> Option<&Path> {
+        (self.revision == revision)
+            .then_some(self.snapshot.as_deref())
+            .flatten()
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,9 +57,19 @@ pub(crate) enum ForwardStage {
 }
 pub(crate) struct PendingForward {
     pub request: synctex::ForwardRequest,
+    pub document_revision: Option<DocumentRevision>,
+    pub source_state: Option<SourceState>,
     pub reply: crate::ipc::ForwardReply,
     pub deadline: std::time::Instant,
     pub stage: ForwardStage,
+}
+impl PendingForward {
+    pub fn check_revision(&self) -> io::Result<()> {
+        match self.document_revision {
+            Some(revision) => revision.check(&self.request.pdf),
+            None => self.request.revision.check(&self.request.pdf),
+        }
+    }
 }
 pub(crate) struct PendingFlash {
     pub document_id: DocumentId,
@@ -81,6 +106,8 @@ pub(crate) struct InverseTask {
     pub radius: u32,
     pub editor: Editor,
     pub inverse_search: Option<String>,
+    pub source_snapshot: Option<PathBuf>,
+    pub best_guess: bool,
     pub operation: Operation,
 }
 pub(crate) struct InverseReply {
@@ -112,19 +139,48 @@ impl InverseTask {
         let mut result = if let Some(endpoint) = &self.inverse_search {
             crate::typst::resolve_inverse(endpoint, self.revision.pdf, point, &self.operation)?
         } else {
-            synctex::resolve_inverse(&self.path, point, word, self.radius, &self.operation)?
+            synctex::resolve_inverse(
+                &self.path,
+                point,
+                word,
+                self.radius,
+                &self.operation,
+                self.source_snapshot.as_deref(),
+                self.best_guess,
+            )?
         };
         if self.inverse_search.is_none()
             && self.word_precision
             && let Err(error) = &self.click.text
         {
-            result.warning = Some(format!(
-                "line-only navigation: PDF text refinement unavailable: {error}"
-            ));
+            let warning = format!("line-only navigation: PDF text refinement unavailable: {error}");
+            result.warning = Some(match result.warning.take() {
+                Some(previous) => format!("{previous}; {warning}"),
+                None => warning,
+            });
+        }
+        if let Some(warning) = &mut result.warning
+            && warning.len() > 4096
+        {
+            let mut end = 4096;
+            while !warning.is_char_boundary(end) {
+                end -= 1;
+            }
+            warning.truncate(end);
         }
         self.operation.check()?;
         self.revision.check(&self.path)?;
-        self.editor.deliver(&result.location, &self.operation)?;
+        self.editor.deliver(
+            &result.location,
+            &self.operation,
+            Some(crate::editor::SourceDocument {
+                pdf: &self.path,
+                revision: self.revision.pdf,
+                document_revision: self.revision,
+                source_snapshot: self.source_snapshot.as_deref(),
+                warning: result.warning.as_deref(),
+            }),
+        )?;
         Ok(result)
     }
 }
@@ -273,6 +329,8 @@ mod tests {
                         .unwrap()
                         .into(),
                 ),
+                source_snapshot: None,
+                best_guess: false,
                 operation: Operation::new(Duration::from_secs(5)),
             }
         }
@@ -416,19 +474,46 @@ mod tests {
     }
 
     #[test]
-    fn failed_pdf_text_preserves_real_synctex_navigation_and_stale_pairs_fail() {
+    fn snapshot_authority_requires_the_full_revision_independently_of_mode() {
         let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("navigation.tex");
-        fs::write(&source, include_str!("../tests/fixtures/navigation.tex")).unwrap();
+        let pdf = directory.path().join("document.pdf");
+        fs::write(&pdf, b"stable document revision").unwrap();
+        let revision = DocumentRevision::read(&pdf).unwrap();
+        let snapshot = directory.path().join("manifest.json");
+        fs::write(pdf.with_extension("synctex"), b"new companion revision").unwrap();
+        let reloaded = DocumentRevision::read(&pdf).unwrap();
+        assert_eq!(revision.pdf, reloaded.pdf);
+        assert_ne!(revision, reloaded);
+        for best_guess in [false, true] {
+            let state = SourceState {
+                revision,
+                snapshot: Some(snapshot.clone()),
+                best_guess,
+            };
+            assert_eq!(
+                state.snapshot_for_revision(revision),
+                Some(snapshot.as_path())
+            );
+            assert!(state.snapshot_for_revision(reloaded).is_none());
+        }
+    }
+
+    #[test]
+    fn failed_pdf_text_preserves_real_synctex_navigation_and_stale_pairs_fail() {
+        use sha2::Digest;
+        let _native = crate::pdf::pdfium_test_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let source = root.join("navigation.tex");
+        let contents = include_str!("../tests/fixtures/navigation.tex");
+        fs::write(&source, contents).unwrap();
         let output = crate::process::output(
-            Command::new("pdflatex")
-                .current_dir(directory.path())
-                .args([
-                    "-interaction=nonstopmode",
-                    "-halt-on-error",
-                    "-synctex=1",
-                    "navigation.tex",
-                ]),
+            Command::new("pdflatex").current_dir(&root).args([
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-synctex=1",
+                "navigation.tex",
+            ]),
             &Operation::new(Duration::from_secs(30)),
         )
         .expect("pdflatex is required for the navigation fixture");
@@ -437,9 +522,9 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stdout)
         );
-        let path = directory.path().join("navigation.pdf");
+        let path = root.join("navigation.pdf");
         let forward = synctex::resolve_forward(&path, &source, 6, 1).unwrap();
-        let task = InverseTask {
+        let mut task = InverseTask {
             request_id: 1,
             revision: DocumentRevision::read(&path).unwrap(),
             path,
@@ -463,6 +548,8 @@ mod tests {
             radius: 4,
             editor: Editor::None,
             inverse_search: None,
+            source_snapshot: None,
+            best_guess: false,
             operation: Operation::default(),
         };
         let resolution = task.resolve().unwrap();
@@ -473,6 +560,54 @@ mod tests {
                 .warning
                 .unwrap()
                 .contains("PDF text refinement unavailable")
+        );
+        fs::write(&source, "\\relax\n").unwrap();
+        assert!(matches!(task.resolve(), Err(error) if error.to_string().contains("out of range")));
+        task.best_guess = true;
+        let approximate = task.resolve().unwrap();
+        assert_eq!(approximate.location.line, 6);
+        assert!(!approximate.location.precise);
+        assert!(
+            approximate
+                .warning
+                .unwrap()
+                .contains("best-guess navigation")
+        );
+
+        let cache = root.join("compiled-source");
+        fs::create_dir(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(cache.join("1.txt"), contents).unwrap();
+        let manifest = cache.join("manifest.json");
+        use std::fmt::Write as _;
+        let mut digest = String::with_capacity(64);
+        for byte in sha2::Sha256::digest(contents.as_bytes()) {
+            write!(&mut digest, "{byte:02x}").unwrap();
+        }
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "pdf": task.path,
+                "revision": task.revision,
+                "cwd": root,
+                "main": source,
+                "files": std::collections::BTreeMap::from([(source.clone(), "1.txt")]),
+                "digests": std::collections::BTreeMap::from([(source.clone(), digest)]),
+                "warnings": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        task.source_snapshot = Some(manifest);
+        task.best_guess = false;
+        let captured = task.resolve().unwrap();
+        assert_eq!(captured.location.line, 6);
+        assert!(!captured.warning.unwrap().contains("best-guess navigation"));
+        // Explicit opt-in must not downgrade required captured-text failures.
+        task.best_guess = true;
+        fs::write(cache.join("1.txt"), "changed cached source\n").unwrap();
+        assert!(
+            matches!(task.resolve(), Err(error) if error.to_string().contains("cached source changed"))
         );
         // A changed companion must reject before any source refinement/delivery.
         fs::remove_file(task.path.with_extension("synctex.gz")).unwrap();

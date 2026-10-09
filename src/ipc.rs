@@ -745,6 +745,9 @@ mod tests {
                 height: 5.0,
                 word: None,
                 inverse_search: None,
+                source_snapshot: None,
+                best_guess: false,
+                warning: None,
             };
             let output = root.path().join("capture.png");
             let expected = if kind == "forward" {

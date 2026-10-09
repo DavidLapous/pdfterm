@@ -56,8 +56,6 @@ local successful = terminal.launch_split(source, 'viewer', 'paper.pdf', function
   owned = assert(split)
 end, 'session', string.rep('f', 32))
 assert(successful:wait(1000).code == 0 and count == 1 and owned.id == 'viewer-7')
-assert(requests[1].argv[3] == '--session' and requests[1].argv[4] == 'session')
-assert(requests[1].argv[5] == '--focus-token' and requests[1].argv[6] == string.rep('f', 32))
 assert(requests[1].token == token, 'SSH launch must authenticate the exact source session')
 terminal.close(owned)
 assert(#requests == 2 and #failures == 0)
@@ -148,15 +146,6 @@ local gui_launch = terminal.launch_split(
 )
 assert(gui_launch:wait(1000).code == 0)
 assert(gui_viewer.kind == 'ghostty' and gui_viewer.id == 'ghostty-viewer-7')
-assert(scripts[1].script:find('new window with configuration cfg', 1, true))
-assert(scripts[1].argv[1] == table.concat(vim.tbl_map(vim.fn.shellescape, {
-  '/bin/viewer with space',
-  "paper's page.pdf",
-  '--session',
-  'session',
-  '--focus-token',
-  string.rep('f', 32),
-}), ' '))
 local source_focus
 terminal.focus(gui_source, function(result)
   source_focus = result

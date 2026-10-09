@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded};
 use pdfium_render::prelude::{
     PdfAction, PdfBookmark, PdfDestination, PdfDestinationViewSettings, PdfDocument, PdfLink,
-    PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon, PdfPageObjectsCommon,
+    PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon, PdfPageObjectsCommon, PdfPageText,
     PdfPageTextRenderMode, PdfPoints, PdfRect, PdfRenderConfig, Pdfium, PdfiumError,
 };
 
-use crate::synctex::{DocumentRevision, ForwardWord, PdfRevision, words};
+use crate::synctex::{DocumentRevision, ForwardCandidate, ForwardWord, PdfRevision, words};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
@@ -222,6 +222,10 @@ struct SourcePageCoordinates {
 
 impl SourcePageCoordinates {
     fn for_page(page: &PdfPage) -> Result<Self, String> {
+        Self::for_page_with_bounds(page).map(|(coordinates, _)| coordinates)
+    }
+
+    fn for_page_with_bounds(page: &PdfPage) -> Result<(Self, PdfRect), String> {
         let media = page
             .boundaries()
             .media()
@@ -242,9 +246,12 @@ impl SourcePageCoordinates {
         {
             return Err("PDFium returned invalid original paper bounds".into());
         }
-        Ok(Self {
-            height: media.height().value,
-        })
+        Ok((
+            Self {
+                height: media.height().value,
+            },
+            media,
+        ))
     }
 
     // This involution is shared by forward boxes, inverse clicks, and batch input.
@@ -1993,6 +2000,8 @@ pub fn synctex_edit_batch(
     settings: &crate::config::ViewerSettings,
     input: impl std::io::BufRead,
     mut output: impl std::io::Write,
+    source_snapshot: Option<&Path>,
+    best_guess: bool,
 ) -> Result<(), String> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -2043,6 +2052,8 @@ pub fn synctex_edit_batch(
                 settings.word_precision.then_some((&context, offset)),
                 settings.source_context_lines as u32,
                 &crate::process::Operation::new(std::time::Duration::from_secs(30)),
+                source_snapshot,
+                best_guess,
             )
             .map_err(|error| error.to_string())?;
             let pdf_word = words(&context).into_iter().find_map(|(start, word)| {
@@ -2643,8 +2654,9 @@ fn same_forward_word(a: &str, b: &str) -> bool {
 }
 
 fn forward_neighbor_score(tokens: &[(usize, &str)], hint: &ForwardWord, index: usize) -> u32 {
+    let radius = 3;
     let mut score = 0;
-    for distance in 1..=3isize {
+    for distance in 1..=radius {
         for direction in [-1, 1] {
             let delta = distance * direction;
             if let (Some(a), Some(b)) = (
@@ -2654,7 +2666,7 @@ fn forward_neighbor_score(tokens: &[(usize, &str)], hint: &ForwardWord, index: u
                     .and_then(|i| hint.words.get(i)),
             ) && same_forward_word(a.1, b)
             {
-                score += 4 - distance as u32;
+                score += (radius + 1 - distance) as u32;
             }
         }
     }
@@ -2675,54 +2687,145 @@ fn forward_context_score(text: &str, hint: &ForwardWord) -> Option<u32> {
 /// Beamer can keep future overlay text in the PDF at coordinates well outside
 /// the page. PDFium extracts those glyphs, so raw page text is not evidence
 /// that the words are visible on the current overlay.
-fn visible_forward_text(page: &PdfPage) -> Option<String> {
-    let text = page.text().ok()?;
-    let crop = page
-        .boundaries()
-        .crop()
-        .map(|boundary| boundary.bounds)
-        .unwrap_or_else(|_| page.page_size());
-    let (normalized, _) =
-        normalize_search_characters(text.chars().iter().filter_map(|character| {
-            let value = character.unicode_char()?;
-            if value.is_whitespace() {
-                let visible = character.render_mode().map_or(true, |mode| {
-                    text_mode_has_visible_paint(
-                        mode,
-                        || character.fill_color().ok().map(|color| color.alpha()),
-                        || character.stroke_color().ok().map(|color| color.alpha()),
-                    )
-                });
-                return visible.then_some((character.index(), value));
+fn visible_forward_text(page: &PdfPage) -> Result<(String, Vec<usize>), String> {
+    let bounds =
+        effective_page_bounds(page).ok_or("could not determine visible PDF page bounds")?;
+    painted_forward_text(page, bounds)
+}
+
+fn painted_forward_text(
+    page: &PdfPage,
+    (clip_left, clip_bottom, clip_right, clip_top): (f32, f32, f32, f32),
+) -> Result<(String, Vec<usize>), String> {
+    let text = page
+        .text()
+        .map_err(|error| format!("could not extract visible PDF text: {error}"))?;
+    let chars = text.chars();
+    let mut next_index = 0;
+    let mut unicode_error = None;
+    let normalized = normalize_search_characters(chars.iter().filter_map(|character| {
+        let index = character.index();
+        if index < next_index {
+            return None;
+        }
+        let first = character.unicode_value();
+        let end = index
+            + if (0xd800..=0xdbff).contains(&first) {
+                2
+            } else {
+                1
+            };
+        let Some(value) = source_range_char(index, end, |unit| {
+            if unit == index {
+                Some(first)
+            } else {
+                chars
+                    .get(unit)
+                    .ok()
+                    .map(|character| character.unicode_value())
             }
-            let bounds = character.tight_bounds().ok()?;
-            let within_crop = bounds.right().value > crop.left().value
-                && bounds.left().value < crop.right().value
-                && bounds.top().value > crop.bottom().value
-                && bounds.bottom().value < crop.top().value;
-            let painted = character.render_mode().ok().is_some_and(|mode| {
+        }) else {
+            unicode_error.get_or_insert_with(|| {
+                format!("invalid PDF Unicode value {first:#x} at character {index}")
+            });
+            return None;
+        };
+        next_index = end;
+        if value.is_whitespace() {
+            let visible = character.render_mode().map_or(true, |mode| {
                 text_mode_has_visible_paint(
                     mode,
                     || character.fill_color().ok().map(|color| color.alpha()),
                     || character.stroke_color().ok().map(|color| color.alpha()),
                 )
             });
-            (within_crop && painted).then_some((character.index(), value))
-        }));
-    Some(normalized)
+            return visible.then_some((character.index(), value));
+        }
+        let bounds = character.tight_bounds().ok()?;
+        let within_crop = bounds.right().value > clip_left
+            && bounds.left().value < clip_right
+            && bounds.top().value > clip_bottom
+            && bounds.bottom().value < clip_top;
+        let painted = character.render_mode().ok().is_some_and(|mode| {
+            text_mode_has_visible_paint(
+                mode,
+                || character.fill_color().ok().map(|color| color.alpha()),
+                || character.stroke_color().ok().map(|color| color.alpha()),
+            )
+        });
+        (within_crop && painted).then_some((character.index(), value))
+    }));
+    match unicode_error {
+        Some(error) => Err(error),
+        None => Ok(normalized),
+    }
 }
 
-/// Prefer a later SyncTeX candidate only when visible PDF text matches the
-/// selected source word together with nearby source words. A single word or
-/// an unreadable page never overrides the first complete SyncTeX result.
-pub(crate) fn first_visible_forward_page(
+fn forward_overlay_page(
+    document: &PdfDocument,
+    pages: u32,
+    first: u32,
+    candidates: &[ForwardCandidate],
+    page_hint: &ForwardWord,
+) -> (u32, Option<(String, Vec<usize>)>) {
+    let mut selected_page = first;
+    let mut selected_text = None;
+    let mut later_pages: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.rect.right > candidate.rect.left || candidate.rect.bottom > candidate.rect.top
+        })
+        .map(|candidate| candidate.page)
+        .filter(|page| *page != first)
+        .collect();
+    later_pages.sort_unstable();
+    later_pages.dedup();
+    if !later_pages.is_empty() && page_hint.words.len() >= 2 {
+        // A single word or an unreadable page never overrides the initial
+        // result. Preserve the original first-plus-63-later-page scan bound.
+        let visible = |page: u32| {
+            let index = page.checked_sub(1)?;
+            if index >= pages {
+                return None;
+            }
+            let page = document.pages().get(i32::try_from(index).ok()?).ok()?;
+            visible_forward_text(&page).ok()
+        };
+        selected_text = visible(first);
+        let first_score = selected_text
+            .as_ref()
+            .and_then(|(text, _)| forward_context_score(text, page_hint));
+        if !first_score.is_some_and(|score| score > 0) {
+            for page in later_pages.into_iter().take(63) {
+                let Some(text) = visible(page) else {
+                    continue;
+                };
+                if forward_context_score(&text.0, page_hint).is_some_and(|score| score > 0) {
+                    selected_page = page;
+                    selected_text = Some(text);
+                    break;
+                }
+            }
+        }
+    }
+    (selected_page, selected_text)
+}
+
+/// Overlay selection is independent of WORD qualification. Retain only a
+/// compiler line region when the source's literal context is unsupported.
+pub(crate) fn select_forward_line_candidate(
     pdf: &Path,
-    candidates: &[u32],
-    hint: &ForwardWord,
+    candidates: &[ForwardCandidate],
+    page_hint: &ForwardWord,
+    anchor: ForwardCandidate,
     library: Option<&Path>,
-) -> Result<Option<u32>, String> {
-    if candidates.len() < 2 || hint.words.len() < 2 {
-        return Ok(None);
+) -> Result<ForwardCandidate, String> {
+    if page_hint.words.len() < 2
+        || candidates
+            .iter()
+            .all(|candidate| candidate.page == anchor.page)
+    {
+        return Ok(anchor);
     }
     let pdfium = load_pdfium(library)?;
     let document = pdfium
@@ -2730,27 +2833,91 @@ pub(crate) fn first_visible_forward_page(
         .map_err(|error| format!("could not open {}: {error}", pdf.display()))?;
     let pages = u32::try_from(document.pages().len())
         .map_err(|_| "PDFium returned a negative page count".to_string())?;
-    let score = |page: u32| -> Option<u32> {
-        let index = page.checked_sub(1)?;
-        if index >= pages {
+    let (page, _) = forward_overlay_page(&document, pages, anchor.page, candidates, page_hint);
+    if page == 0 || page > pages {
+        return Err("selected SyncTeX page is outside the PDF".into());
+    }
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.page == page
+                && (candidate.rect.right > candidate.rect.left
+                    || candidate.rect.bottom > candidate.rect.top)
+        })
+        .copied()
+        .ok_or_else(|| "selected SyncTeX page has no usable compiler line geometry".into())
+}
+
+#[derive(Clone, Copy)]
+struct ForwardWordOccurrence {
+    first: usize,
+    rect: SearchRect,
+}
+
+fn forward_word_occurrence(
+    text: &PdfPageText,
+    source_index_by_byte: &[usize],
+    start: usize,
+    word: &str,
+) -> Option<ForwardWordOccurrence> {
+    let end = start + word.len();
+    let first = *source_index_by_byte.get(start)?;
+    let last = *source_index_by_byte.get(end.checked_sub(1)?)?;
+    // Reject partial case-expanded glyphs and require a contiguous unit span.
+    if start > 0 && source_index_by_byte[start - 1] == first
+        || source_index_by_byte.get(end) == Some(&last)
+    {
+        return None;
+    }
+    let chars = text.chars();
+    let mut next = first;
+    for (byte, value) in word.char_indices() {
+        if source_index_by_byte.get(start + byte) != Some(&next) {
             return None;
         }
-        let index = i32::try_from(index).ok()?;
-        let page = document.pages().get(index).ok()?;
-        let text = visible_forward_text(&page)?;
-        forward_context_score(&text, hint)
-    };
-    let first_score = score(candidates[0]);
-    if first_score.is_some_and(|value| value > 0) {
-        return Ok(None);
-    }
-    for &page in candidates.iter().take(64).skip(1) {
-        let candidate_score = score(page);
-        if candidate_score.is_some_and(|value| value > 0) {
-            return Ok(Some(page));
+        if value as u32 > 0xffff
+            && (0xd800..=0xdbff).contains(&chars.get(next).ok()?.unicode_value())
+        {
+            let stop = next + 2;
+            let decoded = source_range_char(next, stop, |index| {
+                chars
+                    .get(index)
+                    .ok()
+                    .map(|character| character.unicode_value())
+            })?;
+            if !decoded.to_lowercase().eq(std::iter::once(value)) {
+                return None;
+            }
+            next = stop;
+        } else {
+            next += 1;
         }
     }
-    Ok(None)
+    let segments = text.segments_subset(first, next - first);
+    let mut rectangles = segments.iter();
+    let segment = rectangles.next()?;
+    if rectangles.next().is_some() {
+        return None;
+    }
+    let bounds = segment.bounds();
+    Some(ForwardWordOccurrence {
+        first,
+        rect: SearchRect {
+            left: bounds.left().value,
+            right: bounds.right().value,
+            top: bounds.top().value,
+            bottom: bounds.bottom().value,
+        },
+    })
+}
+
+fn forward_region_contains(region: SearchRect, word: SearchRect) -> bool {
+    let x = (word.left + word.right) * 0.5;
+    let y = (word.bottom + word.top) * 0.5;
+    x >= region.left - 2.0
+        && x <= region.right + 2.0
+        && y >= region.top.min(region.bottom) - 2.0
+        && y <= region.top.max(region.bottom) + 2.0
 }
 
 /// Match complete PDF words inside the SyncTeX region. Point-only anchors also
@@ -2781,27 +2948,12 @@ fn forward_word_rect(
         if !same_forward_word(word, &hint.words[hint.selected]) {
             continue;
         }
-        let end = start + word.len();
-        let first = cached.source_index_by_byte[start];
-        let last = cached.source_index_by_byte[end - 1];
-        // Reject omitted Unicode units and partial case-expanded glyphs.
-        if last - first + 1 != word.chars().count()
-            || start > 0 && cached.source_index_by_byte[start - 1] == first
-            || cached.source_index_by_byte.get(end) == Some(&last)
-        {
-            continue;
-        }
-        let segments = text.segments_subset(first, last - first + 1);
-        let mut rectangles = segments.iter();
-        let Some(segment) = rectangles.next() else {
+        let Some(occurrence) =
+            forward_word_occurrence(&text, &cached.source_index_by_byte, start, word)
+        else {
             continue;
         };
-        if rectangles.next().is_some() {
-            continue;
-        }
-        let bounds = segment.bounds();
-        let x = (bounds.left().value + bounds.right().value) * 0.5;
-        let y = (bounds.bottom().value + bounds.top().value) * 0.5;
+        let rect = occurrence.rect;
         let score = forward_neighbor_score(&tokens, hint, index);
         if point_only {
             // Typst anchors a source span's first glyph, even if the selected
@@ -2809,32 +2961,25 @@ fn forward_word_rect(
             // evidence across those boundaries; without it, require the
             // actual PDF text run and baseline rather than an arbitrary radius.
             if complete_context_score != Some(score) {
-                let character = text.chars().get(first).map_err(|e| e.to_string())?;
+                let character = text
+                    .chars()
+                    .get(occurrence.first)
+                    .map_err(|e| e.to_string())?;
                 let object = character.text_object().map_err(|e| e.to_string())?;
                 let run = object.bounds().map_err(|e| e.to_string())?.to_rect();
                 let origin = object.matrix().map_err(|e| e.to_string())?;
                 let baseline = character.origin_y().map_err(|e| e.to_string())?.value;
                 if region.left < run.left().value.min(origin.e()) - 2.0
                     || region.left > run.right().value.max(origin.e()) + 2.0
-                    || region.top < bounds.bottom().value.min(baseline) - 2.0
-                    || region.top > bounds.top().value.max(baseline) + 2.0
+                    || region.top < rect.bottom.min(baseline) - 2.0
+                    || region.top > rect.top.max(baseline) + 2.0
                 {
                     continue;
                 }
             }
-        } else if x < region.left - 2.0
-            || x > region.right + 2.0
-            || y < region.top.min(region.bottom) - 2.0
-            || y > region.top.max(region.bottom) + 2.0
-        {
+        } else if !forward_region_contains(region, rect) {
             continue;
         }
-        let rect = SearchRect {
-            left: bounds.left().value,
-            right: bounds.right().value,
-            top: bounds.top().value,
-            bottom: bounds.bottom().value,
-        };
         match best {
             Some((old, _)) if score < old => {}
             Some((old, _)) if score == old => tied = true,
@@ -3836,25 +3981,37 @@ mod tests {
         let pdf = directory.path().join("coordinates.pdf");
         let mut tex = String::from(
             "\\documentclass{article}\n\
-             \\pdfcompresslevel=0\\pdfobjcompresslevel=0\n\
+             \\pdfcompresslevel=0\\relax\\pdfobjcompresslevel=0\\relax\n\
              \\usepackage[paperwidth=400bp,paperheight=600bp,margin=72bp]{geometry}\n\
              \\pagestyle{empty}\n\
+             \\newbox\\coordinateform\n\
+             \\setbox\\coordinateform=\\hbox{\\vrule width10bp height5bp depth0bp}\n\
+             \\immediate\\pdfxform\\coordinateform\n\
+             \\edef\\coordinateformid{\\the\\pdflastxform}\n\
              \\begin{document}\n",
         );
-        let mut lines = Vec::new();
+        let body = "\\noindent ZenithAlpha confirms the original page origin.\\par\n\
+                    \\vspace{110bp}\n\
+                    \\noindent MeridianBeta identifies a different source line.\\par\n\
+                    \\vspace{110bp}\n\
+                    \\noindent NadirGamma identifies the bottom region.\\par\n";
+        // The fixture owns its literal body and render hints; the public TeX
+        // resolver claims only compiler LINE geometry without execution tracing.
+        let mut sources = Vec::with_capacity(cases.len());
         for (index, (rotation, crop, media)) in cases.iter().enumerate() {
             if index != 0 {
                 tex.push_str("\\newpage\n");
             }
             writeln!(tex, "\\pdfpageattr{{/Rotate {rotation} {crop} {media}}}").unwrap();
-            lines.push(tex.lines().count() as u32 + 1);
-            tex.push_str(
-                "\\noindent ZenithAlpha confirms the original page origin.\\par\n\
-                 \\vspace{110bp}\n\
-                 \\noindent MeridianBeta identifies a different source line.\\par\n\
-                 \\vspace{110bp}\n\
-                 \\noindent NadirGamma identifies the bottom region.\\par\n",
-            );
+            let source_name = format!("coordinates-{index}.tex");
+            let input = directory.path().join(&source_name);
+            std::fs::write(&input, body).unwrap();
+            sources.push(input.canonicalize().unwrap());
+            writeln!(tex, "\\input{{{source_name}}}").unwrap();
+            tex.push_str("\\pdfrefxform\\coordinateformid\\par\n");
+            if index == 1 {
+                tex.push_str("\\noindent OverlayTwoNeedle distinctive\\par\n");
+            }
         }
         tex.push_str("\\end{document}\n");
         std::fs::write(&source, &tex).unwrap();
@@ -3884,7 +4041,8 @@ mod tests {
         let revision = synctex::DocumentRevision::read(&pdf).unwrap();
         worker.begin_generation(1);
         let mut batch_input = String::new();
-        for (index, line) in lines.iter().copied().enumerate() {
+        for (index, source) in sources.iter().enumerate() {
+            let line = 1;
             let page = document.pages().get(index as i32).unwrap();
             let text = page.text().unwrap();
             let first = text
@@ -3914,15 +4072,45 @@ mod tests {
                 top: word.top().value,
                 bottom: word.bottom().value,
             };
-            let column = tex
+            let column = body
                 .lines()
                 .nth(line as usize - 1)
                 .unwrap()
                 .find("ZenithAlpha")
                 .unwrap() as u32
                 + 1;
-            let request = synctex::resolve_forward(&pdf, &source, line, column).unwrap();
+            let request = synctex::resolve_forward(&pdf, source, line, column).unwrap();
             assert_eq!(request.page, index as u32 + 1);
+            assert!(request.word.is_none());
+            assert!(request.warning.is_some());
+            if index == 0 {
+                let anchor = synctex::ForwardCandidate {
+                    page: request.page,
+                    rect: request.rect(),
+                };
+                let empty_later = synctex::ForwardCandidate {
+                    page: 2,
+                    rect: super::SearchRect {
+                        left: 72.0,
+                        right: 72.0,
+                        top: 100.0,
+                        bottom: 100.0,
+                    },
+                };
+                let selected = super::select_forward_line_candidate(
+                    &pdf,
+                    &[anchor, empty_later],
+                    &synctex::ForwardWord {
+                        words: ["OverlayTwoNeedle", "distinctive"].map(String::from).into(),
+                        selected: 0,
+                    },
+                    anchor,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(selected.page, anchor.page);
+                assert_eq!(selected.rect, anchor.rect);
+            }
             for (fit, zoom) in [(super::FitMode::Page, 100), (super::FitMode::Width, 125)] {
                 let key = super::RenderKey {
                     document_id: 1,
@@ -3989,6 +4177,8 @@ mod tests {
                         radius: 4,
                         editor: Editor::None,
                         inverse_search: None,
+                        source_snapshot: None,
+                        best_guess: false,
                         operation: Operation::default(),
                     })
                     .unwrap();
@@ -3999,12 +4189,24 @@ mod tests {
                     .result
                     .unwrap();
                 assert_eq!(inverse.location.line, line);
+                assert_eq!(inverse.location.file.as_str(), source.to_str().unwrap());
                 assert!(inverse.location.precise, "{:?}", inverse.location);
                 assert_eq!(inverse.location.byte_column, (column - 1) as usize);
+                assert!(inverse.warning.is_none(), "{:?}", inverse.warning);
 
                 // Compare actual flashed pixels with PDFium's painted text bounds,
                 // not merely the forward/inverse conversion's own round trip.
-                worker.flash(1, index as u32, request.rect(), request.word.clone());
+                worker.flash(
+                    1,
+                    index as u32,
+                    request.rect(),
+                    Some(synctex::ForwardWord {
+                        words: ["ZenithAlpha", "confirms", "the", "original"]
+                            .map(String::from)
+                            .into(),
+                        selected: 0,
+                    }),
+                );
                 worker
                     .render(super::RenderRequest { key, generation: 1 })
                     .unwrap();
@@ -4091,16 +4293,20 @@ mod tests {
             &crate::config::ViewerSettings::default(),
             std::io::Cursor::new(batch_input),
             &mut batch_output,
+            None,
+            false,
         )
         .unwrap();
         let records = String::from_utf8(batch_output).unwrap();
         assert_eq!(records.lines().count(), cases.len());
-        for (record, expected_line) in records.lines().zip(lines) {
+        for (record, source) in records.lines().zip(sources) {
             let record: serde_json::Value = serde_json::from_str(record).unwrap();
             assert_eq!(record["ok"], true, "{record}");
             assert_eq!(record["pdf_word"], "ZenithAlpha");
-            assert_eq!(record["location"]["line"], expected_line);
+            assert_eq!(record["location"]["file"], source.to_str().unwrap());
+            assert_eq!(record["location"]["line"], 1);
             assert_eq!(record["location"]["precise"], true);
+            assert!(record["warning"].is_null(), "{record}");
         }
     }
 
@@ -4259,9 +4465,266 @@ mod tests {
     }
     #[test]
     fn forward_words_match_tex_accents_in_pdf_text() {
-        assert!(super::same_forward_word("Čech", "Cech"));
+        assert!(super::same_forward_word("Žora", "Zora"));
         assert!(super::same_forward_word("Cafe\u{301}", "café"));
-        assert!(!super::same_forward_word("Cech", "Delaunay"));
+        assert!(!super::same_forward_word("Zora", "Alpha"));
+    }
+
+    fn synthetic_forward_pdf(geometry: &str, contents: &str) -> tempfile::NamedTempFile {
+        // Exercise PDFium's two-unit supplementary Unicode representation in
+        // real text runs, including mathematical letters inside context words.
+        let cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+            /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+            /CMapName /SupplementaryS def\n/CMapType 2 def\n\
+            1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+            1 beginbfchar\n<73> <D835DC60>\nendbfchar\n\
+            endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R {geometry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            ),
+            format!(
+                "<< /Length {} >>\nstream\n{contents}\nendstream",
+                contents.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Courier /ToUnicode 6 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{cmap}\nendstream", cmap.len()),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        let pdf = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(pdf.path(), bytes).unwrap();
+        pdf
+    }
+
+    const FORWARD_ROWS: &str = "BT /F1 12 Tf 20 300 Td (alpha needle beta) Tj ET\n\
+        BT /F1 12 Tf 20 200 Td (gamma needle delta) Tj ET";
+
+    fn forward_row(baseline: f32) -> crate::synctex::ForwardCandidate {
+        crate::synctex::ForwardCandidate {
+            page: 1,
+            rect: super::SearchRect {
+                left: 0.0,
+                right: 390.0,
+                top: 600.0 - (baseline + 15.0),
+                bottom: 600.0 - (baseline - 5.0),
+            },
+        }
+    }
+
+    fn assert_forward_candidate_paints(
+        pdf: &std::path::Path,
+        selected: crate::synctex::ForwardCandidate,
+        first_value: u32,
+        unit_count: usize,
+        baseline: f32,
+        hint: crate::synctex::ForwardWord,
+    ) {
+        let key = super::RenderKey {
+            document_id: 1,
+            page: selected.page - 1,
+            width: 400,
+            height: 600,
+            zoom: 100,
+            fit: super::FitMode::Page,
+            invert: false,
+            dark_mode_style: super::DarkModeStyle::new([0; 3], [255; 3]),
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [255, 255, 0],
+            selected_link_ordinal: None,
+        };
+        // Locate the expected painted glyph span independently of the raw
+        // request and its conversion; every fixture has 600bp original paper.
+        let expected = {
+            let pdfium = super::load_pdfium(None).unwrap();
+            let document = pdfium.load_pdf_from_file(pdf, None).unwrap();
+            let page = document.pages().get(key.page as i32).unwrap();
+            let text = page.text().unwrap();
+            let first = text
+                .chars()
+                .iter()
+                .position(|character| {
+                    character.unicode_value() == first_value
+                        && character
+                            .origin_y()
+                            .is_ok_and(|y| (y.value - baseline).abs() < 0.1)
+                })
+                .unwrap();
+            let segments = text.segments_subset(first, unit_count);
+            assert_eq!(segments.len(), 1);
+            let bounds = segments.iter().next().unwrap().bounds();
+            let config = super::build_fit_config(
+                pdfium_render::prelude::PdfRenderConfig::new(),
+                key.fit,
+                i32::from(key.width),
+                i32::from(key.height),
+            );
+            super::page_rect_pixel_bounds(
+                &page,
+                &config,
+                super::SearchRect {
+                    left: bounds.left().value,
+                    right: bounds.right().value,
+                    top: bounds.top().value,
+                    bottom: bounds.bottom().value,
+                },
+            )
+            .unwrap()
+        };
+        let worker = super::RenderWorker::spawn(1, pdf.to_path_buf(), None);
+        worker.wait_until_ready().unwrap();
+        let revision = super::DocumentRevision::read(pdf).unwrap();
+        worker.begin_generation(1);
+        worker
+            .render(super::RenderRequest { key, generation: 1 })
+            .unwrap();
+        let plain = coordinate_frame(&worker);
+        worker.flash(1, key.page, selected.rect, Some(hint));
+        worker
+            .render(super::RenderRequest { key, generation: 1 })
+            .unwrap();
+        let painted = coordinate_frame(&worker);
+        let flash = painted.flash.as_ref().unwrap();
+        assert!(flash.error.is_none(), "{:?}", flash.error);
+        assert!(flash.word_precise);
+        assert_eq!(flash.pixel_bounds, Some(expected));
+        let before = coordinate_rgba(&plain);
+        let after = coordinate_rgba(&painted);
+        let mut changed = (u32::MAX, 0, u32::MAX, 0);
+        for (pixel, (before, after)) in before
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(after.as_chunks::<4>().0)
+            .enumerate()
+        {
+            if before != after {
+                let x = pixel as u32 % painted.width;
+                let y = pixel as u32 / painted.width;
+                changed.0 = changed.0.min(x);
+                changed.1 = changed.1.max(x + 1);
+                changed.2 = changed.2.min(y);
+                changed.3 = changed.3.max(y + 1);
+            }
+        }
+        assert_eq!(
+            changed,
+            (
+                expected.0.saturating_sub(1).clamp(0, painted.width as i32) as u32,
+                expected.1.saturating_add(2).clamp(0, painted.width as i32) as u32,
+                expected.2.saturating_sub(1).clamp(0, painted.height as i32) as u32,
+                expected.3.saturating_add(2).clamp(0, painted.height as i32) as u32,
+            )
+        );
+        close_test_worker(&worker, revision);
+    }
+
+    #[test]
+    fn forward_context_keeps_supplementary_letters_between_repeated_words() {
+        let _native = super::pdfium_test_lock();
+        let pdf = synthetic_forward_pdf(
+            "/MediaBox [0 0 400 600]",
+            "BT /F1 12 Tf 20 500 Td (Rate exactly s primary baseline intervals) Tj ET\n\
+             BT /F1 12 Tf 20 400 Td (Rate at most s intervals computed with d) Tj ET\n\
+             BT /F1 12 Tf 20 300 Td (Rate exactly s direct step of the primary model) Tj ET\n\
+             BT /F1 12 Tf 20 200 Td (Rate at most s direct step of d) Tj ET\n\
+             BT /F1 12 Tf 20 100 Td (Rate exactly s secondary intervals for the bounded models) Tj ET",
+        );
+        for (baseline, context) in [
+            (500.0, "Rate exactly s primary baseline intervals"),
+            (400.0, "Rate at most s intervals computed with"),
+            (300.0, "Rate exactly s direct step of the"),
+            (200.0, "Rate at most s direct step of"),
+            (100.0, "Rate exactly s secondary intervals for the"),
+        ] {
+            let selection = crate::synctex::ForwardWord {
+                words: context.split_whitespace().map(str::to_owned).collect(),
+                selected: 0,
+            };
+            assert_forward_candidate_paints(
+                pdf.path(),
+                forward_row(baseline),
+                u32::from('R'),
+                4,
+                baseline,
+                selection,
+            );
+        }
+    }
+
+    #[test]
+    fn forward_decoded_words_include_complete_supplementary_glyphs() {
+        let _native = super::pdfium_test_lock();
+        for (line, unit_count) in [("alpha squared beta", 8), ("alpha betas gamma", 6)] {
+            let pdf = synthetic_forward_pdf(
+                "/MediaBox [0 0 400 600]",
+                &format!("BT /F1 12 Tf 20 200 Td ({line}) Tj ET"),
+            );
+            let pdfium = super::load_pdfium(None).unwrap();
+            let document = pdfium.load_pdf_from_file(pdf.path(), None).unwrap();
+            let page = document.pages().get(0).unwrap();
+            let text = page.text().unwrap();
+            let (normalized, indexes) = super::visible_forward_text(&page).unwrap();
+            let (start, word) = super::words(&normalized)[1];
+            let selected = super::forward_word_occurrence(&text, &indexes, start, word).unwrap();
+            let segments = text.segments_subset(6, unit_count);
+            let expected = segments.iter().next().unwrap().bounds();
+            assert_eq!(selected.first, 6);
+            assert_eq!(
+                selected.rect,
+                super::SearchRect {
+                    left: expected.left().value,
+                    right: expected.right().value,
+                    top: expected.top().value,
+                    bottom: expected.bottom().value,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn forward_worker_preserves_original_paper_coordinates_and_transformed_paint() {
+        let _native = super::pdfium_test_lock();
+        let hint = crate::synctex::ForwardWord {
+            words: ["gamma", "needle", "delta"].map(String::from).into(),
+            selected: 1,
+        };
+        for rotation in [0, 90, 180, 270] {
+            let pdf = synthetic_forward_pdf(
+                &format!("/MediaBox [20 30 420 630] /CropBox [40 60 390 590] /Rotate {rotation}"),
+                FORWARD_ROWS,
+            );
+            let selected = forward_row(200.0);
+            assert_forward_candidate_paints(
+                pdf.path(),
+                selected,
+                u32::from('n'),
+                6,
+                200.0,
+                hint.clone(),
+            );
+        }
     }
 
     #[test]

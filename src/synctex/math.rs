@@ -25,7 +25,7 @@ fn append(atoms: &mut Vec<Atom>, value: char, span: Range<usize>) {
     );
 }
 
-fn command(source: &str, start: usize) -> (&str, usize) {
+pub(super) fn command(source: &str, start: usize) -> (&str, usize) {
     let after = start + 1;
     let end = if source
         .as_bytes()
@@ -74,7 +74,7 @@ pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)>
     None
 }
 
-fn math_environment(name: &str) -> bool {
+pub(super) fn math_environment(name: &str) -> bool {
     matches!(
         name.trim_end_matches('*'),
         "math"

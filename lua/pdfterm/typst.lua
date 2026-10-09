@@ -526,6 +526,7 @@ function M.resolve(project, file, line, byte_column, callback)
           close_listener = inverse_listener(endpoint, inverse)
           retained[project.pdf] = stop
           complete(nil, vim.json.encode({ pdf = project.pdf, revision = published,
+            best_guess = true,
             inverse_search = endpoint, page = g.position.page, h = g.position.x, v = g.position.y,
             width = 0, height = 0, word = literal_word(source, byte_column) }))
         end
