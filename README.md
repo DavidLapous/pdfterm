@@ -92,4 +92,6 @@ The Neovim adapter tracks compiled source with immutable snapshots and native li
 
 SyncTeX forward search uses warned compiler LINE geometry, not exact WORD ownership: saved-source hashes and matching text cannot prove which tokens arbitrary TeX hooks or macros printed. A captured build verifies source history, not TeX execution. The existing overlay/page selection is retained, but does not prove ownership of a particular printed word or table row. Without a usable line target, Neovim warns and leaves the current PDF position unchanged; it never substitutes the document beginning. Inverse search remains enabled; strict inverse search rejects competing targets and invalid source bounds. Invalid required source-cache data, missing PDFs, failed compilation, required-tool failures, and viewer/socket failures remain errors. A coarse forward warning does not enable best-guess inverse navigation in a standalone viewer.
 
+Inverse queries preserve click-coordinate precision at source-region boundaries. Diagnostics distinguish missing mappings, ambiguous targets, and invalid readable source anchors; invalid anchors report the source path, requested line, and available line count.
+
 Socket/command navigation leaves the clipboard untouched. `editor.transport = "none"` copies source locations via OSC 52; explicit `y` still copies page text.

@@ -31,6 +31,50 @@ fn message(worker: &RenderWorker) -> WorkerMessage {
 }
 
 #[test]
+fn inverse_native_near_boundary_preserves_the_clicked_source_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let child = root.join("child.tex");
+    fs::write(
+        &child,
+        format!("{}ChildZephyr paragraph.\\par\n", "\n".repeat(40)),
+    )
+    .unwrap();
+    let (pdf, _) = compile_out_of_tree_fixture(
+        &root,
+        "\\documentclass{article}\n\
+         \\begin{document}\n\
+         MainCopper paragraph.\\par\n\
+         \\input{child}\n\
+         \\end{document}\n",
+    );
+    // This point lies on the child's side of the native nearest-anchor boundary.
+    // Rounding y to 137.28 selects MainCopper in the other input instead.
+    let result = synctex::resolve_inverse(
+        &pdf,
+        synctex::InversePoint {
+            page: 1,
+            x: 140.0,
+            y_from_top: 137.28305,
+            page_height_pt: 792.0,
+        },
+        None,
+        0,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        Path::new(&result.location.file),
+        child.canonicalize().unwrap()
+    );
+    assert_eq!(result.location.line, 41);
+    assert!(!result.location.precise);
+    assert!(result.warning.is_none());
+}
+
+#[test]
 fn beamer_overlay_forward_uses_visible_source_context() {
     let _native = pdfium_test_lock();
     let directory = tempfile::tempdir().unwrap();

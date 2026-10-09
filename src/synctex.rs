@@ -696,7 +696,7 @@ pub fn resolve_inverse(
     };
     operation.check()?;
     let spec = format!(
-        "{}:{:.2}:{:.2}:{}",
+        "{}:{}:{}:{}",
         point.page,
         point.x,
         point.y_from_top,
@@ -734,7 +734,10 @@ fn resolve_inverse_output(
 ) -> io::Result<InverseResolution> {
     let targets = parse_synctex_edit(stdout);
     if targets.is_empty() {
-        return Err(io::Error::other("synctex edit returned no match"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            InverseFailure::NoMatch,
+        ));
     }
     let best_guess = sources.best_guess;
     let mut query = InverseQuery {
@@ -778,7 +781,10 @@ fn resolve_inverse_output(
     if let Some(reason) = ambiguous
         && !best_guess
     {
-        return Err(io::Error::other(reason));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            InverseFailure::Ambiguous(reason),
+        ));
     }
     // The executable's first result is its nearest compiler anchor. Explicit
     // best-guess mode cannot turn an ambiguous word refinement into precision.
@@ -865,6 +871,27 @@ impl QuerySources<'_> {
 
 type MetadataLocation = (String, Rc<String>, u32, usize, isize);
 
+#[derive(Debug, thiserror::Error)]
+enum InverseFailure {
+    #[error("synctex edit returned no match")]
+    NoMatch,
+    #[error("{0}")]
+    Ambiguous(&'static str),
+    #[error("invalid source anchor: {file}:{line} is out of range (available lines: {available})")]
+    InvalidSourceAnchor {
+        file: PathBuf,
+        line: u32,
+        available: usize,
+    },
+}
+
+struct InverseAnchor {
+    target: SourceLocation,
+    generated: bool,
+    warning: Option<String>,
+    source_map: Option<io::Result<Rc<SourceMap>>>,
+}
+
 struct InverseQuery<'a> {
     pdf: &'a Path,
     point: InversePoint,
@@ -913,8 +940,22 @@ impl InverseQuery<'_> {
 
     fn resolve_target(
         &mut self,
-        mut target: SourceLocation,
+        target: SourceLocation,
     ) -> io::Result<(InverseResolution, Option<SourceLocation>)> {
+        let mut anchor = self.normalize_anchor(target)?;
+        let Some(source) = self.qualify_source(&mut anchor)? else {
+            return Ok((
+                InverseResolution {
+                    location: anchor.target,
+                    warning: anchor.warning,
+                },
+                None,
+            ));
+        };
+        self.refine_target(anchor, source)
+    }
+
+    fn normalize_anchor(&mut self, mut target: SourceLocation) -> io::Result<InverseAnchor> {
         let path = Path::new(&target.file);
         let absolute = if let Some(snapshot) = self.sources.snapshot {
             snapshot.normalize(path)?
@@ -949,13 +990,28 @@ impl InverseQuery<'_> {
             && Path::new(&target.file).file_stem() == self.pdf.file_stem();
         // Known generated hits use structural sheet provenance before any
         // source bounds, and never read the final reused .vrb file.
-        let mut source_map = generated.then(|| self.source_map(true));
+        let source_map = generated.then(|| self.source_map(true));
         if self.sources.best_guess
             && let Some(Err(error)) = &source_map
         {
             self.operation.check()?;
             return Err(io::Error::other(error.to_string()));
         }
+        Ok(InverseAnchor {
+            target,
+            generated,
+            warning,
+            source_map,
+        })
+    }
+
+    // Authority and bounds are settled before word ownership. A coarse result
+    // carries its compiler anchor unchanged; only a qualified source is refined.
+    fn qualify_source(&mut self, anchor: &mut InverseAnchor) -> io::Result<Option<Rc<String>>> {
+        let target = &mut anchor.target;
+        let generated = anchor.generated;
+        let source_map = &anchor.source_map;
+        let warning = &mut anchor.warning;
         if self.sources.best_guess && self.sources.snapshot.is_none() {
             if let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok()) {
                 let (original, line) = map
@@ -978,10 +1034,8 @@ impl InverseQuery<'_> {
             // Preserve compiled coordinates for Lua's historical extmarks.
             // Reading or clamping against current disk text would erase them.
             self.operation.check()?;
-            return Ok((InverseResolution {
-                location: target,
-                warning: Some("best-guess navigation: compiled source snapshot unavailable; using the original compiler line anchor without disk text qualification".into()),
-            }, None));
+            *warning = Some("best-guess navigation: compiled source snapshot unavailable; using the original compiler line anchor without disk text qualification".into());
+            return Ok(None);
         }
         if !generated
             && let Some(reason) = self
@@ -997,80 +1051,14 @@ impl InverseQuery<'_> {
                 return Err(error);
             }
             self.operation.check()?;
-            return Ok((
-                InverseResolution {
-                    location: target,
-                    warning: Some(reason),
-                },
-                None,
-            ));
+            *warning = Some(reason);
+            return Ok(None);
         }
-        let mut source = if generated {
-            let remapped = source_map
-                .as_ref()
-                .and_then(|map| map.as_ref().ok())
-                .ok_or_else(|| {
-                    io::Error::other(
-                        source_map
-                            .as_ref()
-                            .and_then(|map| map.as_ref().err())
-                            .map_or(
-                                "original source map is unavailable".to_owned(),
-                                ToString::to_string,
-                            ),
-                    )
-                })
-                .and_then(|map| {
-                    original_source_from_verbatim(map, &mut self.sources, self.operation)
-                });
-            match remapped {
-                Ok((file, original, anchor)) => {
-                    target.file = file;
-                    target.line = anchor;
-                    original
-                }
-                Err(error) => {
-                    self.operation.check()?;
-                    if crate::source_snapshot::required_cache_error(&error) {
-                        return Err(error);
-                    }
-                    if self.sources.best_guess
-                        && let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok())
-                    {
-                        let (original, line) = map
-                            .page_source
-                            .as_ref()
-                            .map(|(path, line)| (path.as_path(), *line))
-                            .unwrap_or((&map.main, 1));
-                        if line == 0 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "SyncTeX original compiler anchor line must be positive",
-                            ));
-                        }
-                        let original = if let Some(snapshot) = self.sources.snapshot {
-                            snapshot.normalize(original)?
-                        } else {
-                            fs::canonicalize(original).unwrap_or(original.to_owned())
-                        };
-                        target.file = original
-                            .into_os_string()
-                            .into_string()
-                            .map_err(|_| io::Error::other("source path is not UTF-8"))?;
-                        target.line = line;
-                        self.operation.check()?;
-                    }
-                    return Ok((
-                        InverseResolution {
-                            location: target,
-                            warning: Some(format!(
-                                "line-only navigation: original fragile frame unavailable: {error}"
-                            )),
-                        },
-                        None,
-                    ));
-                }
-            }
+        let source = if generated {
+            let Some(source) = self.remap_generated_source(target, source_map, warning)? else {
+                return Ok(None);
+            };
+            source
         } else {
             match self.sources.read(Path::new(&target.file), self.operation) {
                 Ok(source) => source,
@@ -1079,41 +1067,110 @@ impl InverseQuery<'_> {
                     if crate::source_snapshot::required_cache_error(&error) {
                         return Err(error);
                     }
-                    return Ok((
-                        InverseResolution {
-                            location: target,
-                            warning: Some(format!(
-                                "line-only navigation: source refinement unavailable: {error}"
-                            )),
-                        },
-                        None,
+                    *warning = Some(format!(
+                        "line-only navigation: source refinement unavailable: {error}"
                     ));
+                    return Ok(None);
                 }
             }
         };
-        if let Err(error) = validate_source_line(&source, target.line) {
+        if let Err(error) =
+            validate_inverse_source_line(&source, target.line, Path::new(&target.file))
+        {
             if !self.sources.best_guess {
                 return Err(error);
             }
-            return Ok((
-                InverseResolution {
-                    location: target,
-                    warning: Some(format!(
-                        "best-guess navigation: {error}; preserving the original compiler anchor for editor mapping"
-                    )),
-                },
-                None,
+            *warning = Some(format!(
+                "best-guess navigation: {error}; preserving the original compiler anchor for editor mapping"
             ));
+            return Ok(None);
         }
         if let Some(reason) = self.sources.warning(Path::new(&target.file)) {
-            return Ok((
-                InverseResolution {
-                    location: target,
-                    warning: Some(reason.to_owned()),
-                },
-                None,
-            ));
+            *warning = Some(reason.to_owned());
+            return Ok(None);
         }
+        Ok(Some(source))
+    }
+
+    // The structural sheet anchor must identify a verified original fragile
+    // frame. Its saved source is necessary for that proof, never the reused vrb.
+    fn remap_generated_source(
+        &mut self,
+        target: &mut SourceLocation,
+        source_map: &Option<io::Result<Rc<SourceMap>>>,
+        warning: &mut Option<String>,
+    ) -> io::Result<Option<Rc<String>>> {
+        let remapped = source_map
+            .as_ref()
+            .and_then(|map| map.as_ref().ok())
+            .ok_or_else(|| {
+                io::Error::other(
+                    source_map
+                        .as_ref()
+                        .and_then(|map| map.as_ref().err())
+                        .map_or_else(
+                            || "original source map is unavailable".to_owned(),
+                            ToString::to_string,
+                        ),
+                )
+            })
+            .and_then(|map| original_source_from_verbatim(map, &mut self.sources, self.operation));
+        match remapped {
+            Ok((file, original, anchor)) => {
+                target.file = file;
+                target.line = anchor;
+                Ok(Some(original))
+            }
+            Err(error) => {
+                self.operation.check()?;
+                if crate::source_snapshot::required_cache_error(&error) {
+                    return Err(error);
+                }
+                if self.sources.best_guess
+                    && let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok())
+                {
+                    let (original, line) = map
+                        .page_source
+                        .as_ref()
+                        .map(|(path, line)| (path.as_path(), *line))
+                        .unwrap_or((&map.main, 1));
+                    if line == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SyncTeX original compiler anchor line must be positive",
+                        ));
+                    }
+                    let original = if let Some(snapshot) = self.sources.snapshot {
+                        snapshot.normalize(original)?
+                    } else {
+                        fs::canonicalize(original).unwrap_or_else(|_| original.to_owned())
+                    };
+                    target.file = original
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| io::Error::other("source path is not UTF-8"))?;
+                    target.line = line;
+                    self.operation.check()?;
+                }
+                *warning = Some(format!(
+                    "line-only navigation: original fragile frame unavailable: {error}"
+                ));
+                Ok(None)
+            }
+        }
+    }
+
+    fn refine_target(
+        &mut self,
+        anchor: InverseAnchor,
+        mut source: Rc<String>,
+    ) -> io::Result<(InverseResolution, Option<SourceLocation>)> {
+        let InverseAnchor {
+            mut target,
+            generated,
+            mut warning,
+            mut source_map,
+        } = anchor;
         let anchor = (self.sources.best_guess && self.word.is_some()).then(|| target.clone());
         if let Some((context, offset)) = self.word {
             let fragile_frame = fragile_frame_range(&source, target.line);
@@ -1236,7 +1293,7 @@ impl InverseQuery<'_> {
                 }
             }
             if let Some((line, byte)) = location {
-                let text = validate_source_line(&source, line)?;
+                let text = validate_inverse_source_line(&source, line, Path::new(&target.file))?;
                 let prefix = text
                     .get(..byte)
                     .ok_or_else(|| io::Error::other("source column is not a UTF-8 boundary"))?;
@@ -1262,6 +1319,25 @@ fn validate_source_line(source: &str, line: u32) -> io::Result<&str> {
     line.checked_sub(1)
         .and_then(|index| source.lines().nth(index as usize))
         .ok_or_else(|| io::Error::other(format!("source line {line} is out of range")))
+}
+
+fn validate_inverse_source_line<'a>(
+    source: &'a str,
+    line: u32,
+    file: &Path,
+) -> io::Result<&'a str> {
+    line.checked_sub(1)
+        .and_then(|index| source.lines().nth(index as usize))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                InverseFailure::InvalidSourceAnchor {
+                    file: file.to_owned(),
+                    line,
+                    available: source.lines().count(),
+                },
+            )
+        })
 }
 
 fn validate_forward_source_position(source: &str, line: u32, column: u32) -> io::Result<&str> {
@@ -1827,7 +1903,7 @@ fn original_source_from_verbatim(
     })?;
     let original = sources.normalize(original)?;
     let source = sources.read(&original, operation)?;
-    validate_source_line(&source, *line)?;
+    validate_inverse_source_line(&source, *line, &original)?;
     fragile_frame_range(&source, *line)
         .filter(|frame| *line == frame.end as u32)
         .ok_or_else(|| {
@@ -3340,6 +3416,37 @@ mod tests {
     }
 
     #[test]
+    fn inverse_no_match_and_competing_anchors_have_distinct_typed_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("paper.pdf");
+        fs::write(directory.path().join("paper.tex"), "Copper.\nZephyr.\n").unwrap();
+        let no_match = inverse_output(&pdf, "SyncTeX result begin\nSyncTeX result end\n", None)
+            .err()
+            .expect("empty native results are not source ambiguity");
+        assert_eq!(no_match.kind(), io::ErrorKind::NotFound);
+        assert!(matches!(
+            no_match
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<InverseFailure>()),
+            Some(InverseFailure::NoMatch)
+        ));
+        let ambiguous = inverse_output(
+            &pdf,
+            "Input: paper.tex\nLine: 1\nInput: paper.tex\nLine: 2\n",
+            None,
+        )
+        .err()
+        .expect("competing valid anchors are not no-match");
+        assert_eq!(ambiguous.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            ambiguous
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<InverseFailure>()),
+            Some(InverseFailure::Ambiguous(_))
+        ));
+    }
+
+    #[test]
     fn inverse_raw_hits_preserve_distinct_records_without_trailing_duplicates() {
         let stdout = "Output: paper.pdf\nInput: preamble.tex\nLine: 9\nColumn: -1\n\
                       Offset: 0\nContext: ignored\nInput: paper.tex\nLine: 3\n\
@@ -3499,9 +3606,26 @@ mod tests {
             None,
         )
         .err()
-        .expect("a readable out-of-range source anchor must be rejected")
-        .to_string();
-        assert!(error.contains("source line 490 is out of range"), "{error}");
+        .expect("a readable out-of-range source anchor must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let failure = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<InverseFailure>())
+            .expect("source bounds retain a typed failure");
+        match failure {
+            InverseFailure::InvalidSourceAnchor {
+                file,
+                line,
+                available,
+            } => {
+                assert_eq!(
+                    file,
+                    &directory.path().join("main.tex").canonicalize().unwrap()
+                );
+                assert_eq!((*line, *available), (490, 272));
+            }
+            other => panic!("unexpected inverse failure: {other}"),
+        }
     }
 
     #[test]

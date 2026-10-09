@@ -49,7 +49,7 @@ def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
 
 def raw_inverse(pdf: Path, x: float, y: float, page: int) -> tuple[int, str] | None:
     result = subprocess.run(
-        ["synctex", "edit", "-o", f"{page}:{x:.2f}:{y:.2f}:{pdf}"],
+        ["synctex", "edit", "-o", f"{page}:{x}:{y}:{pdf}"],
         capture_output=True,
         text=True,
         timeout=30,
