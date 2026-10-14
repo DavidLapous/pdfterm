@@ -1,5 +1,7 @@
 use crate::screenshot::{Badge as ScreenshotBadge, Page as ScreenshotPage, Rect as ScreenshotRect};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -4796,30 +4798,35 @@ impl App {
         let page = tab.page + 1;
         let page_count = tab.page_count;
         self.status_buffer.clear();
+        // Leave the last cell unused even if a terminal has re-enabled wrapping.
+        let columns = Cell::new(usize::from(viewport.columns.saturating_sub(1)));
         execute!(
             self.status_buffer,
             MoveTo(0, viewport.status_row),
             SetBackgroundColor(theme.bg_dark),
             SetForegroundColor(theme.fg),
             Clear(ClearType::CurrentLine),
-            Print(" "),
+            Print(StatusText(" ", &columns)),
             SetForegroundColor(theme.blue),
-            Print(page),
+            Print(StatusText(page, &columns)),
             SetForegroundColor(theme.fg_dark),
-            Print("/"),
+            Print(StatusText("/", &columns)),
             SetForegroundColor(theme.magenta),
-            Print(page_count),
-            Print("  "),
+            Print(StatusText(page_count, &columns)),
+            Print(StatusText("  ", &columns)),
             SetForegroundColor(theme.yellow),
-            Print(&mode),
+            Print(StatusText(&mode, &columns)),
             SetForegroundColor(theme.green),
-            Print(state),
+            Print(StatusText(state, &columns)),
             SetForegroundColor(theme.magenta),
-            Print(search_status.as_deref().unwrap_or_default()),
+            Print(StatusText(
+                search_status.as_deref().unwrap_or_default(),
+                &columns
+            )),
             SetForegroundColor(theme.cyan),
-            Print(link_status.unwrap_or_default()),
+            Print(StatusText(link_status.unwrap_or_default(), &columns)),
             SetForegroundColor(theme.comment),
-            Print("  ?: help"),
+            Print(StatusText("  ?: help", &columns)),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;
@@ -5336,6 +5343,50 @@ fn visible_match_points(
         anchor = Some(point);
     }
     hit.zip(anchor)
+}
+
+/// Clip all styled status fragments to one row without emitting text controls.
+struct StatusText<'a, T>(T, &'a Cell<usize>);
+
+impl<T: fmt::Display> fmt::Display for StatusText<'_, T> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use fmt::Write as _;
+        write!(
+            StatusWriter {
+                output,
+                columns: self.1
+            },
+            "{}",
+            self.0
+        )
+    }
+}
+
+struct StatusWriter<'a, 'b> {
+    output: &'a mut fmt::Formatter<'b>,
+    columns: &'a Cell<usize>,
+}
+
+impl fmt::Write for StatusWriter<'_, '_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        for part in value.split_inclusive(char::is_control) {
+            let span = Span::raw(part);
+            for grapheme in span.styled_graphemes(Style::default()) {
+                let width = Span::raw(grapheme.symbol).width();
+                if self.columns.get() == 0 || width > self.columns.get() {
+                    self.columns.set(0);
+                    return Ok(());
+                }
+                self.output.write_str(grapheme.symbol)?;
+                self.columns.set(self.columns.get() - width);
+            }
+            if part.ends_with(char::is_control) && self.columns.get() > 0 {
+                self.output.write_str(" ")?;
+                self.columns.set(self.columns.get() - 1);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn stale_status_row(previous: Option<u16>, current: u16) -> Option<u16> {
@@ -8183,6 +8234,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use std::cell::Cell;
     use std::fs;
     use std::io::{self, Write};
     use std::time::Instant;
@@ -8965,6 +9017,45 @@ mod tests {
         assert!(rendered.contains("visual representation learning"));
         assert!(rendered.contains("Section  Methods"));
         assert!(rendered.contains("Page 3 · 1 hit"));
+    }
+
+    #[test]
+    fn status_text_flattens_errors_without_terminal_controls() {
+        let columns = Cell::new(80);
+        assert_eq!(
+            format!(
+                "{}",
+                super::StatusText("reload failed: bad\r\nfile\t\u{1b}[2J", &columns)
+            ),
+            "reload failed: bad  file  [2J"
+        );
+    }
+
+    #[test]
+    fn status_text_shares_the_row_budget_across_fragments() {
+        let columns = Cell::new(6);
+        let text = format!(
+            "{}{}{}{}",
+            super::StatusText(1, &columns),
+            super::StatusText("/1 ", &columns),
+            super::StatusText("漢字", &columns),
+            super::StatusText(" help", &columns),
+        );
+        assert_eq!(text, "1/1 漢");
+        let columns = Cell::new(0);
+        assert_eq!(
+            format!("{}", super::StatusText("reload failed", &columns)),
+            ""
+        );
+    }
+
+    #[test]
+    fn status_text_preserves_combining_and_emoji_graphemes() {
+        let columns = Cell::new(4);
+        assert_eq!(
+            format!("{}", super::StatusText("e\u{301}👩‍🔬xy", &columns)),
+            "e\u{301}👩‍🔬x"
+        );
     }
 
     #[test]
