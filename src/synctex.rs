@@ -117,9 +117,13 @@ impl ForwardWord {
     fn at(text: &str, column: u32) -> Option<Self> {
         let text = source_line_text(text);
         let byte = text.char_indices().nth(column.checked_sub(1)? as usize)?.0;
+        let hidden = nonprinting_source_ranges(text);
         let words: Vec<_> = words(text)
             .into_iter()
-            .filter(|(start, _)| *start == 0 || !text[..*start].ends_with('\\'))
+            .filter(|(start, _)| {
+                (*start == 0 || !text[..*start].ends_with('\\'))
+                    && !hidden.iter().any(|range| range.contains(start))
+            })
             .collect();
         Self::from_tokens(&words, byte)
     }
@@ -460,11 +464,14 @@ pub fn resolve_forward_with_library(
     } else {
         original_line.and_then(|text| ForwardWord::at(text, column))
     };
-    // Beamer records frame bodies at the closing line; retain the original
-    // compiled source's frame ownership even when the live source was edited.
+    // Collected frame/caption bodies use their closing compiler line. Keep the
+    // original source position for the page hint, and give Beamer priority.
     let view_line = source
         .as_deref()
-        .and_then(|source| frame_closing_line(source, line))
+        .and_then(|source| {
+            frame_closing_line(source, line)
+                .or_else(|| original_line.and_then(|_| caption_closing_line(source, line, column)))
+        })
         .unwrap_or(line);
     let spec = format!(
         "{view_line}:{column}:{}",
@@ -688,6 +695,42 @@ pub fn resolve_inverse(
     let snapshot = source_snapshot
         .map(|path| SourceSnapshot::load(path, &pdf))
         .transpose()?;
+    resolve_inverse_with_snapshot(
+        &pdf,
+        point,
+        word,
+        radius,
+        operation,
+        snapshot.as_ref(),
+        best_guess,
+    )
+}
+
+pub(crate) fn resolve_inverse_with_snapshot(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    operation: &Operation,
+    snapshot: Option<&SourceSnapshot>,
+    best_guess: bool,
+) -> io::Result<InverseResolution> {
+    operation.check()?;
+    if point.page == 0
+        || point.page_height_pt <= 0.0
+        || ![point.x, point.y_from_top, point.page_height_pt]
+            .into_iter()
+            .all(f32::is_finite)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inverse search requires a positive page and finite compiler coordinates",
+        ));
+    }
+    let pdf = std::path::absolute(pdf)?;
+    if let Some(snapshot) = snapshot {
+        snapshot.revision.check(&pdf)?;
+    }
     let raw_revision = if best_guess && snapshot.is_none() {
         drop(crate::source_snapshot::open_regular(&pdf, false)?);
         Some(DocumentRevision::read(&pdf)?)
@@ -704,7 +747,7 @@ pub fn resolve_inverse(
     );
     let stdout = run(operation, &["edit", "-o", &spec])?;
     let sources = QuerySources {
-        snapshot: snapshot.as_ref(),
+        snapshot,
         best_guess,
         ..QuerySources::default()
     };
@@ -740,6 +783,7 @@ fn resolve_inverse_output(
         ));
     }
     let best_guess = sources.best_guess;
+    let assume_unchanged = best_guess && sources.snapshot.is_none();
     let mut query = InverseQuery {
         pdf,
         point,
@@ -790,6 +834,12 @@ fn resolve_inverse_output(
     // best-guess mode cannot turn an ambiguous word refinement into precision.
     let (mut chosen, raw) = resolutions.swap_remove(if ambiguous.is_some() { 0 } else { selected });
     let mut warnings = std::collections::BTreeSet::new();
+    if assume_unchanged {
+        warnings.insert(
+            "best-guess navigation: compiled source history unavailable; assuming saved source is unchanged since compilation"
+                .into(),
+        );
+    }
     if let Some(reason) = ambiguous {
         if let Some(raw) = raw {
             chosen.location = raw;
@@ -892,6 +942,10 @@ struct InverseAnchor {
     source_map: Option<io::Result<Rc<SourceMap>>>,
 }
 
+fn is_generated_sidecar(path: &Path, pdf: &Path) -> bool {
+    path.file_stem() == pdf.file_stem() && crate::source_snapshot::is_compiler_sidecar_input(path)
+}
+
 struct InverseQuery<'a> {
     pdf: &'a Path,
     point: InversePoint,
@@ -899,13 +953,13 @@ struct InverseQuery<'a> {
     radius: u32,
     operation: &'a Operation,
     sources: QuerySources<'a>,
-    structural_map: Option<Result<Rc<SourceMap>, String>>,
+    structural_map: Option<(PathBuf, Result<Rc<SourceMap>, String>)>,
     geometry_map: Option<Result<Rc<SourceMap>, String>>,
     metadata: Option<Option<MetadataLocation>>,
 }
 
 impl InverseQuery<'_> {
-    fn source_map(&mut self, generated: bool) -> io::Result<Rc<SourceMap>> {
+    fn source_map(&mut self, generated: Option<&Path>) -> io::Result<Rc<SourceMap>> {
         self.operation.check()?;
         let current_dir = if self.sources.best_guess && self.sources.snapshot.is_none() {
             Some(std::env::current_dir()?)
@@ -917,23 +971,54 @@ impl InverseQuery<'_> {
             .snapshot
             .map(|snapshot| snapshot.cwd.as_path())
             .or(current_dir.as_deref());
-        let cache = if generated {
-            &mut self.structural_map
+        let default_vrb = self.pdf.with_extension("vrb");
+        let generated_path = generated.unwrap_or(&default_vrb);
+        let result = if let Some(generated) = generated {
+            if generated == default_vrb
+                && let Some(geometry) = &self.geometry_map
+            {
+                geometry
+            } else {
+                if self
+                    .structural_map
+                    .as_ref()
+                    .is_none_or(|(cached, _)| cached != generated)
+                {
+                    let loaded = read_source_map(
+                        self.pdf,
+                        self.point,
+                        generated_path,
+                        false,
+                        self.operation,
+                        input_cwd,
+                    )
+                    .map(Rc::new)
+                    .map_err(|error| error.to_string());
+                    self.structural_map = Some((generated.to_owned(), loaded));
+                }
+                &self.structural_map.as_ref().unwrap().1
+            }
         } else {
-            &mut self.geometry_map
+            if self.geometry_map.is_none()
+                && let Some((cached, Ok(map))) = &self.structural_map
+                && cached == &default_vrb
+                && map.page_source.is_none()
+            {
+                self.geometry_map = Some(Ok(Rc::clone(map)));
+            }
+            self.geometry_map.get_or_insert_with(|| {
+                read_source_map(
+                    self.pdf,
+                    self.point,
+                    generated_path,
+                    true,
+                    self.operation,
+                    input_cwd,
+                )
+                .map(Rc::new)
+                .map_err(|error| error.to_string())
+            })
         };
-        let result = cache.get_or_insert_with(|| {
-            read_source_map(
-                self.pdf,
-                self.point,
-                &self.pdf.with_extension("vrb"),
-                !generated,
-                self.operation,
-                input_cwd,
-            )
-            .map(Rc::new)
-            .map_err(|error| error.to_string())
-        });
         self.operation.check()?;
         result.clone().map_err(io::Error::other)
     }
@@ -984,13 +1069,10 @@ impl InverseQuery<'_> {
             .into_os_string()
             .into_string()
             .map_err(|_| io::Error::other("source path is not UTF-8"))?;
-        let generated = Path::new(&target.file)
-            .extension()
-            .is_some_and(|ext| ext == "vrb")
-            && Path::new(&target.file).file_stem() == self.pdf.file_stem();
+        let generated = is_generated_sidecar(Path::new(&target.file), self.pdf);
         // Known generated hits use structural sheet provenance before any
-        // source bounds, and never read the final reused .vrb file.
-        let source_map = generated.then(|| self.source_map(true));
+        // source bounds, and never read the final reused .vrb / sidecar file.
+        let source_map = generated.then(|| self.source_map(Some(Path::new(&target.file))));
         if self.sources.best_guess
             && let Some(Err(error)) = &source_map
         {
@@ -1012,31 +1094,6 @@ impl InverseQuery<'_> {
         let generated = anchor.generated;
         let source_map = &anchor.source_map;
         let warning = &mut anchor.warning;
-        if self.sources.best_guess && self.sources.snapshot.is_none() {
-            if let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok()) {
-                let (original, line) = map
-                    .page_source
-                    .as_ref()
-                    .map(|(path, line)| (path.as_path(), *line))
-                    .unwrap_or((&map.main, 1));
-                if line == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "SyncTeX original compiler anchor line must be positive",
-                    ));
-                }
-                target.file = original
-                    .to_str()
-                    .ok_or_else(|| io::Error::other("source path is not UTF-8"))?
-                    .to_owned();
-                target.line = line;
-            }
-            // Preserve compiled coordinates for Lua's historical extmarks.
-            // Reading or clamping against current disk text would erase them.
-            self.operation.check()?;
-            *warning = Some("best-guess navigation: compiled source snapshot unavailable; using the original compiler line anchor without disk text qualification".into());
-            return Ok(None);
-        }
         if !generated
             && let Some(reason) = self
                 .sources
@@ -1092,14 +1149,17 @@ impl InverseQuery<'_> {
         Ok(Some(source))
     }
 
-    // The structural sheet anchor must identify a verified original fragile
-    // frame. Its saved source is necessary for that proof, never the reused vrb.
+    // The structural sheet anchor must identify the enclosing source frame for
+    // generated sidecars (.vrb, .toc, .nav, .out, .aux, .snm).
     fn remap_generated_source(
         &mut self,
         target: &mut SourceLocation,
         source_map: &Option<io::Result<Rc<SourceMap>>>,
         warning: &mut Option<String>,
     ) -> io::Result<Option<Rc<String>>> {
+        let verbatim_only = Path::new(&target.file)
+            .extension()
+            .is_some_and(|ext| ext == "vrb");
         let remapped = source_map
             .as_ref()
             .and_then(|map| map.as_ref().ok())
@@ -1114,9 +1174,16 @@ impl InverseQuery<'_> {
                         ),
                 )
             })
-            .and_then(|map| original_source_from_verbatim(map, &mut self.sources, self.operation));
+            .and_then(|map| {
+                if verbatim_only {
+                    original_source_from_verbatim(map, &mut self.sources, self.operation)
+                } else {
+                    original_source_from_generated(map, &mut self.sources, self.operation)
+                }
+            });
         match remapped {
             Ok((file, original, anchor)) => {
+                *warning = None;
                 target.file = file;
                 target.line = anchor;
                 Ok(Some(original))
@@ -1177,15 +1244,8 @@ impl InverseQuery<'_> {
             if !generated {
                 // Ordinary source refinement and document metadata need only
                 // structural provenance, not fragile-body geometry.
-                source_map = Some(self.source_map(fragile_frame.is_none()));
-                if fragile_frame.is_none()
-                    && source_map
-                        .as_ref()
-                        .and_then(|result| result.as_ref().ok())
-                        .is_some_and(|map| map.page_source.is_some())
-                {
-                    source_map = Some(self.source_map(false));
-                }
+                let default_vrb = self.pdf.with_extension("vrb");
+                source_map = Some(self.source_map(fragile_frame.is_none().then_some(&default_vrb)));
             }
             if self.sources.best_guess
                 && let Some(Err(error)) = &source_map
@@ -1196,7 +1256,7 @@ impl InverseQuery<'_> {
             self.operation.check()?;
             // A fragile sheet also contains nongenerated headings and footers.
             // Sheet-wide .vrb participation does not prove this point is body text.
-            let scope_proven = fragile_frame.is_none_or(|frame| {
+            let scope_proven = fragile_frame.as_ref().is_none_or(|frame| {
                 generated
                     || source_map
                         .as_ref()
@@ -1224,38 +1284,52 @@ impl InverseQuery<'_> {
                     false,
                 )
             };
-            if location.is_none()
-                && !generated
-                && let Some(map) = source_map
+            if location.is_none() && !generated {
+                if fragile_frame.is_none()
+                    && source_map
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                        .is_some_and(|map| map.page_source.is_some())
+                {
+                    source_map = Some(self.source_map(None));
+                    if self.sources.best_guess
+                        && let Some(Err(error)) = &source_map
+                    {
+                        self.operation.check()?;
+                        return Err(io::Error::other(error.to_string()));
+                    }
+                }
+                if let Some(map) = source_map
                     .as_ref()
                     .and_then(|result| result.as_ref().ok())
                     .filter(|map| map.generated_at_point && map.page_source.is_some())
-            {
-                match original_source_from_verbatim(map, &mut self.sources, self.operation) {
-                    Ok((file, original, anchor)) => {
-                        if self.sources.warning(Path::new(&file)).is_none()
-                            && let Some(candidate) = source_word_location(
-                                &original,
-                                anchor,
-                                context,
-                                offset,
-                                self.radius,
-                            )
-                        {
-                            target.file = file;
-                            target.line = anchor;
-                            source = original;
-                            location = Some(candidate);
+                {
+                    match original_source_from_verbatim(map, &mut self.sources, self.operation) {
+                        Ok((file, original, anchor)) => {
+                            if self.sources.warning(Path::new(&file)).is_none()
+                                && let Some(candidate) = source_word_location(
+                                    &original,
+                                    anchor,
+                                    context,
+                                    offset,
+                                    self.radius,
+                                )
+                            {
+                                target.file = file;
+                                target.line = anchor;
+                                source = original;
+                                location = Some(candidate);
+                            }
                         }
-                    }
-                    Err(error) => {
-                        self.operation.check()?;
-                        if crate::source_snapshot::required_cache_error(&error) {
-                            return Err(error);
+                        Err(error) => {
+                            self.operation.check()?;
+                            if crate::source_snapshot::required_cache_error(&error) {
+                                return Err(error);
+                            }
+                            warning = Some(format!(
+                                "line-only navigation: original fragile frame unavailable: {error}"
+                            ));
                         }
-                        warning = Some(format!(
-                            "line-only navigation: original fragile frame unavailable: {error}"
-                        ));
                     }
                 }
             }
@@ -1263,7 +1337,9 @@ impl InverseQuery<'_> {
                 self.operation.check()?;
                 warning = Some(format!("source-map refinement unavailable: {error}"));
             }
-            if let Some(map) = source_map.as_ref().and_then(|result| result.as_ref().ok()) {
+            if !generated
+                && let Some(map) = source_map.as_ref().and_then(|result| result.as_ref().ok())
+            {
                 if self.metadata.is_none() {
                     self.metadata = Some(document_metadata_word_location(
                         &map.main,
@@ -1513,7 +1589,11 @@ fn read_source_map(
     let compressed = pdf.with_extension("synctex.gz");
     match fs::File::open(&compressed) {
         Ok(file) => source_map_from_reader(
-            BufReader::new(flate2::read::GzDecoder::new(file).take(128 * 1024 * 1024)),
+            BufReader::with_capacity(
+                64 * 1024,
+                flate2::read::GzDecoder::new(BufReader::with_capacity(64 * 1024, file))
+                    .take(128 * 1024 * 1024),
+            ),
             pdf,
             point,
             generated,
@@ -1522,7 +1602,10 @@ fn read_source_map(
             input_cwd,
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => source_map_from_reader(
-            BufReader::new(fs::File::open(pdf.with_extension("synctex"))?.take(128 * 1024 * 1024)),
+            BufReader::with_capacity(
+                64 * 1024,
+                fs::File::open(pdf.with_extension("synctex"))?.take(128 * 1024 * 1024),
+            ),
             pdf,
             point,
             generated,
@@ -1566,9 +1649,13 @@ fn source_map_from_reader(
     let mut postamble = false;
     let mut postamble_count = false;
     let mut bytes_read = 0;
+    let mut lines = 0usize;
     let mut last_v = -1.0;
     loop {
-        operation.check()?;
+        if lines & 1023 == 0 {
+            operation.check()?;
+        }
+        lines = lines.wrapping_add(1);
         row.clear();
         let count = reader.read_line(&mut row)?;
         bytes_read += count;
@@ -1708,6 +1795,7 @@ fn source_map_from_reader(
             page_complete = true;
             in_page = false;
             if !geometry_required && input_cwd.is_none() {
+                operation.check()?;
                 let main = inputs
                     .get(&1)
                     .cloned()
@@ -1805,6 +1893,7 @@ fn source_map_from_reader(
             }
         }
     }
+    operation.check()?;
     if !page_complete || !postamble_count {
         return Err(io::Error::other("SyncTeX source map is incomplete"));
     }
@@ -1898,17 +1987,26 @@ fn original_source_from_verbatim(
     sources: &mut QuerySources<'_>,
     operation: &Operation,
 ) -> io::Result<(String, Rc<String>, u32)> {
+    let (file, source, line) = original_source_from_generated(map, sources, operation)?;
+    fragile_frame_range(&source, line)
+        .filter(|frame| line == frame.end as u32)
+        .ok_or_else(|| {
+            io::Error::other("clicked sheet does not identify a fragile frame's closing line")
+        })?;
+    Ok((file, source, line))
+}
+
+fn original_source_from_generated(
+    map: &SourceMap,
+    sources: &mut QuerySources<'_>,
+    operation: &Operation,
+) -> io::Result<(String, Rc<String>, u32)> {
     let (original, line) = map.page_source.as_ref().ok_or_else(|| {
         io::Error::other("clicked sheet has no original generated-file provenance")
     })?;
     let original = sources.normalize(original)?;
     let source = sources.read(&original, operation)?;
     validate_inverse_source_line(&source, *line, &original)?;
-    fragile_frame_range(&source, *line)
-        .filter(|frame| *line == frame.end as u32)
-        .ok_or_else(|| {
-            io::Error::other("clicked sheet does not identify a fragile frame's closing line")
-        })?;
     let file = original
         .to_str()
         .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
@@ -2029,39 +2127,64 @@ fn document_metadata_word_location(
             let row = row.strip_suffix('\r').unwrap_or(row);
             let visible = source_line_text(row);
             for command in ["\\title", "\\subtitle", "\\author", "\\date", "\\institute"] {
-                let Some(at) = visible.find(command) else {
-                    continue;
-                };
-                let Some((body, end)) = math::group(source, start + at + command.len()) else {
-                    continue;
-                };
-                let first = source[..body.start]
-                    .bytes()
-                    .filter(|ch| *ch == b'\n')
-                    .count();
-                let last = source[..end].bytes().filter(|ch| *ch == b'\n').count();
-                let Some((line, byte, score)) = source_prose_scored_location(
-                    source,
-                    1,
-                    context,
-                    offset,
-                    first..last + 1,
-                    true,
-                    &hidden,
-                ) else {
-                    continue;
-                };
-                if score < 3 {
-                    continue;
-                }
-                match best {
-                    Some((old, _, _, _)) if score < old => {}
-                    Some((old, index, old_line, old_byte)) if score == old => {
-                        tied |= (file_index, line, byte) != (index, old_line, old_byte);
+                for (at, _) in visible.match_indices(command) {
+                    let after_cmd = start + at + command.len();
+                    if source
+                        .as_bytes()
+                        .get(after_cmd)
+                        .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                    {
+                        continue;
                     }
-                    _ => {
-                        best = Some((score, file_index, line, byte));
-                        tied = false;
+                    let mut arg_at =
+                        after_cmd + usize::from(source.as_bytes().get(after_cmd) == Some(&b'*'));
+                    let mut spans = Vec::with_capacity(2);
+                    while let Some(opt_end) = optional_argument_end(source, arg_at) {
+                        let opt_start = skip_source_space(source, arg_at) + 1;
+                        spans.push(opt_start..opt_end - 1);
+                        arg_at = opt_end;
+                    }
+                    if let Some((body, end)) =
+                        math::group(source, skip_source_space(source, arg_at))
+                    {
+                        spans.push(body.start..end);
+                    }
+                    let mut cmd_best: Option<(isize, u32, usize)> = None;
+                    for span in spans {
+                        let first = source[..span.start]
+                            .bytes()
+                            .filter(|ch| *ch == b'\n')
+                            .count();
+                        let last = source[..span.end].bytes().filter(|ch| *ch == b'\n').count();
+                        let mut span_hidden = hidden.clone();
+                        span_hidden.push(0..span.start);
+                        span_hidden.push(span.end..source.len());
+                        let Some((line, byte, score)) = source_prose_scored_location(
+                            source,
+                            1,
+                            context,
+                            offset,
+                            first..last + 1,
+                            true,
+                            &span_hidden,
+                        ) else {
+                            continue;
+                        };
+                        if score >= 3 && cmd_best.is_none_or(|(old, _, _)| score >= old) {
+                            cmd_best = Some((score, line, byte));
+                        }
+                    }
+                    if let Some((score, line, byte)) = cmd_best {
+                        match best {
+                            Some((old, _, _, _)) if score < old => {}
+                            Some((old, index, old_line, old_byte)) if score == old => {
+                                tied |= (file_index, line, byte) != (index, old_line, old_byte);
+                            }
+                            _ => {
+                                best = Some((score, file_index, line, byte));
+                                tied = false;
+                            }
+                        }
                     }
                 }
             }
@@ -2123,20 +2246,57 @@ fn source_line_text(text: &str) -> &str {
 /// Beamer attributes frame bodies to the frame's last source line: forward
 /// search refines against the closing line, inverse search against the range.
 fn frame_bounds(source: &str, anchor: usize) -> Option<(usize, usize)> {
+    let mut ignored = Vec::new();
+    let mut scan = 0;
+    while scan < source.len() {
+        match source.as_bytes()[scan] {
+            b'%' => {
+                scan += source[scan..].find('\n').unwrap_or(source.len() - scan);
+            }
+            b'\\' => {
+                let start = scan;
+                let (command, end) = math::command(source, scan);
+                if end == start + 1 {
+                    scan = end;
+                    continue;
+                }
+                if let Some((opaque_end, _)) = math::opaque_command_end(source, command, end) {
+                    ignored.push(start..opaque_end);
+                    scan = opaque_end;
+                    continue;
+                }
+                scan = end;
+            }
+            _ => {
+                scan += source[scan..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    ignored.extend(nonprinting_source_ranges(source));
     let mut start = None;
-    for (index, text) in source.lines().enumerate() {
-        let mut text = source_line_text(text);
-        while let Some((_, rest)) = text.split_once('\\') {
-            text = rest;
-            if let Some(rest) = text.strip_prefix('\\') {
-                text = rest;
+    let mut line_offset = 0;
+    for (index, raw_row) in source.split_inclusive('\n').enumerate() {
+        let row = raw_row.strip_suffix('\n').unwrap_or(raw_row);
+        let row = row.strip_suffix('\r').unwrap_or(row);
+        let visible = source_line_text(row);
+        let mut cursor = 0;
+        while let Some(rel) = visible[cursor..].find('\\') {
+            let slash = cursor + rel;
+            let abs = line_offset + slash;
+            cursor = slash + 1;
+            if visible[cursor..].starts_with('\\') {
+                cursor += 1;
                 continue;
             }
+            if ignored.iter().any(|range| range.contains(&abs)) {
+                continue;
+            }
+            let text = &visible[cursor..];
             if let Some(rest) = text
                 .strip_prefix("begin")
                 .and_then(|rest| rest.trim_start().strip_prefix("{frame}"))
             {
-                text = rest;
+                cursor = visible.len() - rest.len();
                 // Nested frames are not a reliable source boundary.
                 if start.replace(index).is_some() {
                     return None;
@@ -2145,7 +2305,7 @@ fn frame_bounds(source: &str, anchor: usize) -> Option<(usize, usize)> {
                 .strip_prefix("end")
                 .and_then(|rest| rest.trim_start().strip_prefix("{frame}"))
             {
-                text = rest;
+                cursor = visible.len() - rest.len();
                 if let Some(begin) = start.take() {
                     if begin <= anchor && anchor <= index {
                         return Some((begin, index));
@@ -2155,6 +2315,7 @@ fn frame_bounds(source: &str, anchor: usize) -> Option<(usize, usize)> {
                 }
             }
         }
+        line_offset += raw_row.len();
         if index >= anchor && start.is_none() {
             return None;
         }
@@ -2166,6 +2327,21 @@ fn frame_bounds(source: &str, anchor: usize) -> Option<(usize, usize)> {
 /// SyncTeX line. Beamer forwards map interior lines to the closing line.
 pub(crate) fn frame_closing_line(source: &str, line: u32) -> Option<u32> {
     frame_bounds(source, line.checked_sub(1)? as usize).map(|(_, end)| end as u32 + 1)
+}
+
+fn caption_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    let row = validate_forward_source_position(source, line, column).ok()?;
+    // End-of-line is a cursor boundary, not a character in the argument.
+    let byte = row.char_indices().nth(column.checked_sub(1)? as usize)?.0;
+    let start = source
+        .split_inclusive('\n')
+        .take(line.checked_sub(1)? as usize)
+        .map(str::len)
+        .sum::<usize>();
+    let body = math::caption_argument_at(source, start + byte)?;
+    u32::try_from(source[..body.end].bytes().filter(|ch| *ch == b'\n').count())
+        .ok()?
+        .checked_add(1)
 }
 
 /// Find a literal frame environment enclosing the one-based SyncTeX line.
@@ -2190,15 +2366,13 @@ pub(crate) fn words(text: &str) -> Vec<(usize, &str)> {
 }
 
 fn normalized_word(word: &str) -> String {
+    if word.is_ascii() {
+        return word.to_ascii_lowercase();
+    }
     word.nfkd()
         .filter(|ch| !is_combining_mark(*ch))
-        .collect::<String>()
-        .to_lowercase()
-        .replace('ﬁ', "fi")
-        .replace('ﬂ', "fl")
-        .replace('ﬀ', "ff")
-        .replace('ﬃ', "ffi")
-        .replace('ﬄ', "ffl")
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn ordinary_word_source_start(
@@ -2310,12 +2484,12 @@ fn skip_source_space(source: &str, mut at: usize) -> usize {
     }
 }
 
+/// TeX optional arguments end at the first unbraced, unescaped closing bracket.
 fn optional_argument_end(source: &str, start: usize) -> Option<usize> {
     let start = skip_source_space(source, start);
     if source.as_bytes().get(start) != Some(&b'[') {
         return None;
     }
-    let mut depth = 1;
     let mut at = start + 1;
     while at < source.len() {
         match source.as_bytes()[at] {
@@ -2332,13 +2506,7 @@ fn optional_argument_end(source: &str, start: usize) -> Option<usize> {
                 at = math::group(source, at)?.1;
                 continue;
             }
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(at + 1);
-                }
-            }
+            b']' => return Some(at + 1),
             _ => {}
         }
         at += source[at..].chars().next()?.len_utf8();
@@ -2346,131 +2514,214 @@ fn optional_argument_end(source: &str, start: usize) -> Option<usize> {
     None
 }
 
+fn overlay_argument_end(source: &str, start: usize) -> Option<usize> {
+    if source.as_bytes().get(start) != Some(&b'<') {
+        return None;
+    }
+    let rest = &source[start + 1..];
+    let end = rest.find(['>', '\n'])?;
+    if rest.as_bytes()[end] != b'>' {
+        return None;
+    }
+    let body = &rest[..end];
+    if body.is_empty() {
+        return None;
+    }
+    let has_action = body.contains([':', '@']);
+    body.bytes()
+        .all(|ch| {
+            ch.is_ascii_digit()
+                || matches!(
+                    ch,
+                    b'+' | b'-' | b',' | b'.' | b'(' | b')' | b'|' | b'*' | b' '
+                )
+                || has_action && (ch.is_ascii_alphabetic() || matches!(ch, b':' | b'@'))
+        })
+        .then_some(start + 1 + end + 1)
+}
+
 /// Only known nonprinting arguments are masked. This is not macro expansion;
 /// ordinary formatting/caption arguments and href display text remain literal.
 fn nonprinting_source_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
+    nonprinting_source_spans(source)
+        .map(|(_, body)| body)
+        .collect()
+}
+
+fn nonprinting_source_spans(
+    source: &str,
+) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> + '_ {
     let mut at = 0;
-    while at < source.len() {
-        if source.as_bytes()[at] == b'%' {
-            at += source[at..].find('\n').unwrap_or(source.len() - at);
-        } else if source.as_bytes()[at] == b'\\' {
-            let start = at;
-            at += 1;
-            let end = at
-                + source[at..]
-                    .bytes()
-                    .take_while(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
-                    .count();
-            if end == at {
-                at += source[at..].chars().next().map_or(0, char::len_utf8);
-                continue;
+    std::iter::from_fn(move || {
+        loop {
+            if at >= source.len() {
+                return None;
             }
-            let command = &source[at..end];
-            at = end + usize::from(source.as_bytes().get(end) == Some(&b'*'));
-            let definition = matches!(
-                command,
-                "newcommand"
-                    | "renewcommand"
-                    | "providecommand"
-                    | "DeclareRobustCommand"
-                    | "NewDocumentCommand"
-                    | "RenewDocumentCommand"
-                    | "ProvideDocumentCommand"
-                    | "DeclareDocumentCommand"
-                    | "newenvironment"
-                    | "renewenvironment"
-                    | "def"
-                    | "gdef"
-                    | "edef"
-                    | "xdef"
-            );
-            if definition {
-                if matches!(command, "def" | "gdef" | "edef" | "xdef") {
-                    while at < source.len() && source.as_bytes()[at] != b'{' {
-                        if source.as_bytes()[at] == b'\\' {
-                            at += 1;
-                            at += source[at..].chars().next().map_or(0, char::len_utf8);
-                        } else if source.as_bytes()[at] == b'%' {
-                            at = skip_source_space(source, at);
-                        } else {
-                            at += source[at..].chars().next().unwrap().len_utf8();
+            if source.as_bytes()[at] == b'%' {
+                at += source[at..].find('\n').unwrap_or(source.len() - at);
+            } else if source.as_bytes()[at] == b'<'
+                && at > 0
+                && matches!(source.as_bytes()[at - 1], b'}' | b']')
+            {
+                let start = at;
+                if let Some(end) = overlay_argument_end(source, at) {
+                    at = end;
+                    return Some((start, start..end));
+                }
+                at += 1;
+            } else if source.as_bytes()[at] == b'\\' {
+                let start = at;
+                at += 1;
+                let end = at
+                    + source[at..]
+                        .bytes()
+                        .take_while(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                        .count();
+                if end == at {
+                    at += source[at..].chars().next().map_or(0, char::len_utf8);
+                    continue;
+                }
+                let command = &source[at..end];
+                if let Some((end, nonprinting)) = math::opaque_command_end(source, command, end) {
+                    at = end;
+                    if nonprinting {
+                        return Some((start, start..end));
+                    }
+                    continue;
+                }
+                if matches!(command, "let" | "futurelet") {
+                    at = skip_source_space(source, end);
+                    if source.as_bytes().get(at) == Some(&b'\\') {
+                        at = math::command(source, at).1;
+                    } else if at < source.len() {
+                        at += source[at..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    at = skip_source_space(source, at);
+                    if command == "let" && source.as_bytes().get(at) == Some(&b'=') {
+                        at = skip_source_space(source, at + 1);
+                    }
+                    if source.as_bytes().get(at) == Some(&b'\\') {
+                        at = math::command(source, at).1;
+                    } else if at < source.len() {
+                        at += source[at..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    return Some((start, start..at));
+                }
+                at = end + usize::from(matches!(source.as_bytes().get(end), Some(b'*' | b'+')));
+                let definition = matches!(
+                    command,
+                    "newcommand"
+                        | "renewcommand"
+                        | "providecommand"
+                        | "DeclareRobustCommand"
+                        | "NewDocumentCommand"
+                        | "RenewDocumentCommand"
+                        | "ProvideDocumentCommand"
+                        | "DeclareDocumentCommand"
+                        | "newenvironment"
+                        | "renewenvironment"
+                        | "def"
+                        | "gdef"
+                        | "edef"
+                        | "xdef"
+                );
+                if definition {
+                    if matches!(command, "def" | "gdef" | "edef" | "xdef") {
+                        while at < source.len() && source.as_bytes()[at] != b'{' {
+                            if source.as_bytes()[at] == b'\\' {
+                                at += 1;
+                                at += source[at..].chars().next().map_or(0, char::len_utf8);
+                            } else if source.as_bytes()[at] == b'%' {
+                                at = skip_source_space(source, at);
+                            } else {
+                                at += source[at..].chars().next().unwrap().len_utf8();
+                            }
+                        }
+                    } else {
+                        at = skip_source_space(source, at);
+                        if let Some((_, end)) = math::group(source, at) {
+                            at = end;
+                        } else if source.as_bytes().get(at) == Some(&b'\\') {
+                            at = math::command(source, at).1;
+                        }
+                        while let Some(end) = optional_argument_end(source, at) {
+                            at = end;
+                        }
+                        if command.contains("Document") {
+                            let Some((_, end)) = math::group(source, skip_source_space(source, at))
+                            else {
+                                continue;
+                            };
+                            at = end;
                         }
                     }
-                } else {
-                    at = skip_source_space(source, at);
-                    if let Some((_, end)) = math::group(source, at) {
-                        at = end;
-                    } else if source.as_bytes().get(at) == Some(&b'\\') {
-                        at += 1;
-                        at += source[at..]
-                            .bytes()
-                            .take_while(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
-                            .count();
-                    }
-                    while let Some(end) = optional_argument_end(source, at) {
-                        at = end;
-                    }
-                    if command.contains("Document") {
-                        let Some((_, end)) = math::group(source, skip_source_space(source, at))
-                        else {
-                            continue;
-                        };
+                    let body_start = skip_source_space(source, at);
+                    let Some((_, end)) = math::group(source, body_start) else {
+                        if source.as_bytes().get(body_start) == Some(&b'{') {
+                            let end = source.len();
+                            at = end;
+                            return Some((start, start..end));
+                        }
+                        at = body_start;
+                        continue;
+                    };
+                    at = end;
+                    if command.ends_with("environment")
+                        && let Some((_, end)) = math::group(source, skip_source_space(source, at))
+                    {
                         at = end;
                     }
+                    return Some((start, start..at));
+                } else if matches!(
+                    command,
+                    "label"
+                        | "ref"
+                        | "eqref"
+                        | "pageref"
+                        | "autoref"
+                        | "cref"
+                        | "Cref"
+                        | "cite"
+                        | "citep"
+                        | "citet"
+                        | "parencite"
+                        | "textcite"
+                        | "autocite"
+                        | "footcite"
+                        | "nocite"
+                        | "href"
+                        | "includegraphics"
+                        | "includesvg"
+                        | "input"
+                        | "include"
+                        | "bibliography"
+                        | "addbibresource"
+                ) {
+                    while let Some(end) = optional_argument_end(source, at)
+                        .or_else(|| overlay_argument_end(source, at))
+                    {
+                        at = end;
+                    }
+                    if let Some((body, end)) = math::group(source, skip_source_space(source, at)) {
+                        at = end;
+                        return Some((
+                            start,
+                            if matches!(command, "includegraphics" | "includesvg") {
+                                start..end
+                            } else {
+                                body
+                            },
+                        ));
+                    }
+                } else if let Some(overlay_end) = overlay_argument_end(source, at) {
+                    at = overlay_end;
+                    return Some((start, end..overlay_end));
                 }
-                let Some((_, end)) = math::group(source, skip_source_space(source, at)) else {
-                    ranges.push(start..source.len());
-                    break;
-                };
-                at = end;
-                if command.ends_with("environment")
-                    && let Some((_, end)) = math::group(source, skip_source_space(source, at))
-                {
-                    at = end;
-                }
-                ranges.push(start..at);
-            } else if matches!(
-                command,
-                "label"
-                    | "ref"
-                    | "eqref"
-                    | "pageref"
-                    | "autoref"
-                    | "cref"
-                    | "Cref"
-                    | "cite"
-                    | "citep"
-                    | "citet"
-                    | "parencite"
-                    | "textcite"
-                    | "autocite"
-                    | "footcite"
-                    | "nocite"
-                    | "href"
-                    | "includegraphics"
-                    | "input"
-                    | "include"
-                    | "bibliography"
-                    | "addbibresource"
-            ) {
-                while let Some(end) = optional_argument_end(source, at) {
-                    at = end;
-                }
-                if let Some((body, end)) = math::group(source, skip_source_space(source, at)) {
-                    ranges.push(if command == "includegraphics" {
-                        start..end
-                    } else {
-                        body
-                    });
-                    at = end;
-                }
+            } else {
+                at += source[at..].chars().next().unwrap().len_utf8();
             }
-        } else {
-            at += source[at..].chars().next().unwrap().len_utf8();
         }
-    }
-    ranges
+    })
 }
 
 fn source_prose_scored_location(
@@ -2578,6 +2829,152 @@ fn source_prose_scored_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_review_embedded_comment_end_does_not_expose_hidden_caption() {
+        let source = "\\begin{comment}\nignored \\end{comment}\n\
+                      \\caption{hidden\ncaption}\n\\end{comment}";
+        assert_eq!(caption_closing_line(source, 3, 10), None);
+    }
+
+    #[test]
+    fn caption_review_comment_keys_cannot_become_inverse_word_targets() {
+        let source = "\\newcommand{\\Printed}{Zephyr}\n\
+                      \\begin{comment}\n\
+                      \\label{Zephyr}\n\
+                      \\end{comment}\n\
+                      \\Printed";
+        assert_eq!(source_word_location(source, 5, "Zephyr", 0, 4), None);
+    }
+
+    #[test]
+    fn caption_review_unbraced_short_brackets_do_not_own_adjacent_prose() {
+        let source = "\\caption[short[inner]]{first\nsecond}";
+        let column = source.find("first").unwrap() as u32 + 1;
+        assert_eq!(caption_closing_line(source, 1, column), None);
+        assert_eq!(math::caption_lines(source, 2), None);
+        let source = "\\caption[{short[inner]}]{first\nsecond}";
+        let column = source.find("first").unwrap() as u32 + 1;
+        assert_eq!(caption_closing_line(source, 1, column), Some(2));
+        assert_eq!(math::caption_lines(source, 2), Some(0..2));
+    }
+
+    #[test]
+    fn optional_arguments_shield_braces_comments_and_control_symbols() {
+        let source = "[short[inner]] trailing";
+        assert_eq!(
+            optional_argument_end(source, 0),
+            Some(source.find(']').unwrap() + 1)
+        );
+        for source in [
+            "[{short[inner]}]",
+            "[% ignored ]\n{brace]} \\] tail]",
+            "[escaped \\{ brace]",
+        ] {
+            assert_eq!(optional_argument_end(source, 0), Some(source.len()));
+        }
+        assert_eq!(optional_argument_end("[{unclosed]", 0), None);
+        assert!(
+            nonprinting_source_ranges("\\begin{verbatim}\n\\label{printed}\n\\end{verbatim}")
+                .is_empty()
+        );
+        let source = "\\begin{comment}\n\\label{hidden}\n\\end{comment}";
+        assert_eq!(nonprinting_source_ranges(source), vec![0..source.len()]);
+    }
+
+    #[test]
+    fn comment_closure_requires_a_complete_subsequent_input_line() {
+        for fake in [
+            "ignored \\end{comment}",
+            "\\end{comment} ignored",
+            " \\end{comment}",
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "\\begin{{comment}}{newline}{fake}{newline}\\caption{{hidden{newline}caption}}{newline}\\end{{comment}}{newline}\\caption{{visible{newline}caption}}"
+                );
+                assert_eq!(caption_closing_line(&source, 3, 10), None);
+                assert_eq!(caption_closing_line(&source, 6, 10), Some(7));
+                let unclosed = format!(
+                    "\\begin{{comment}}{newline}{fake}{newline}\\caption{{hidden{newline}caption}}"
+                );
+                assert_eq!(caption_closing_line(&unclosed, 3, 10), None);
+            }
+        }
+        for newline in ["\n", "\r\n"] {
+            let source = format!(
+                "\\begin{{comment}}\\end{{comment}}{newline}\\caption{{hidden{newline}caption}}{newline}\\end{{comment}}   {newline}\\caption{{visible{newline}caption}}"
+            );
+            assert_eq!(caption_closing_line(&source, 2, 10), None);
+            assert_eq!(caption_closing_line(&source, 5, 10), Some(6));
+        }
+    }
+
+    #[test]
+    fn forward_caption_anchor_uses_only_complete_long_argument() {
+        for caption in [
+            "\\caption",
+            "\\caption*",
+            "\\caption[short {nested}]",
+            "\\caption*[short]",
+        ] {
+            let source = format!(
+                "before\n{caption}% argument follows\n{{école first\nsecond \\emph{{literal}}\n}}\nafter"
+            );
+            assert_eq!(caption_closing_line(&source, 3, 2), Some(5));
+            assert_eq!(caption_closing_line(&source, 4, 1), Some(5));
+            for (line, column) in [(1, 1), (2, 1), (3, 13), (5, 1), (6, 1), (0, 1), (3, 0)] {
+                assert_eq!(caption_closing_line(&source, line, column), None);
+            }
+        }
+        for source in [
+            "\\caption[short]{unclosed\nbody",
+            "\\caption[unclosed{body}",
+            "\\caption{body\n} trailing",
+        ] {
+            let last = source.lines().count() as u32;
+            let column = source.lines().last().unwrap().chars().count() as u32;
+            assert_eq!(caption_closing_line(source, last, column), None);
+        }
+    }
+
+    #[test]
+    fn forward_caption_anchor_excludes_nonprinting_and_opaque_source() {
+        let source = "\\newcommand{\\Hidden}{\\caption{definition}}\n\
+                      \\def\\Other{\\caption{primitive}}\n\
+                      \\verb|\\caption{inline}|\n\
+                      \\begin{verbatim}\n\\caption{verbatim}\n\\end{verbatim}\n\
+                      \\caption[short]{visible \\label{key} % comment\n\
+                      \\verb|opaque| \\newcommand{\\Inner}{nested} final}\n\
+                      % \\caption{commented}\n\
+                      \\label{\\caption{label}}\n";
+        for word in [
+            "definition",
+            "primitive",
+            "inline",
+            "verbatim}",
+            "short",
+            "key",
+            "comment",
+            "opaque",
+            "nested",
+            "commented",
+            "label",
+        ] {
+            let at = source.find(word).unwrap();
+            let line = source[..at].bytes().filter(|ch| *ch == b'\n').count() as u32 + 1;
+            let start = source[..at].rfind('\n').map_or(0, |end| end + 1);
+            let column = source[start..at].chars().count() as u32 + 1;
+            assert_eq!(caption_closing_line(source, line, column), None, "{word}");
+        }
+        assert_eq!(caption_closing_line(source, 7, 17), Some(8));
+        let source = "\\begin{frame}\n\\caption{first\nsecond}\n\\end{frame}";
+        assert_eq!(caption_closing_line(source, 2, 10), Some(3));
+        assert_eq!(
+            frame_closing_line(source, 2).or_else(|| caption_closing_line(source, 2, 10)),
+            Some(4),
+        );
+    }
 
     #[test]
     fn explicit_inverse_guess_preserves_compiled_coordinates_and_warns_on_ambiguity() {
@@ -3154,7 +3551,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let main_path = directory.path().join("original.tex");
         let main = "\\input{preamble.tex}\n\
-                    \\title{Example Report and Results}\n\
+                    \\title[Example Report and Results]{Example Report and Results}\n\
                     \\author{Ada Example}\n\
                     \\begin{document}\n\
                     \\begin{frame}{Other title}\n\
@@ -3175,7 +3572,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!((found.2, found.3), (2, 15));
+        assert_eq!((found.2, found.3), (2, 43));
         assert!(found.4 >= 6);
         let found = document_metadata_word_location(
             &main_path,
@@ -3663,14 +4060,15 @@ mod tests {
         let original = directory.path().join("original.tex");
         fs::write(
             &original,
-            "\\begin{frame}[fragile]\nLiteral body text.\n\\end{frame}\n",
+            "\\title{Shared Section Words}\n\\begin{frame}[fragile]\nLiteral body text.\n\\end{frame}\n\\begin{frame}{Plan}\n\\tableofcontents\n\\end{frame}\n",
         )
         .unwrap();
         fs::write(directory.path().join("deck.vrb"), [0xff]).unwrap();
         fs::write(
             directory.path().join("deck.synctex"),
-            "Input:1:original.tex\nInput:2:deck.vrb\nContent:\n\
-             {1\n[1,3:0,0:1,1,0\nx2,490:0,0\n]\n}1\n",
+            "Input:1:original.tex\nInput:2:deck.vrb\nInput:3:build/deck.toc\nContent:\n\
+             {1\n[1,4:0,0:1,1,0\nx2,490:0,0\n]\n}1\n\
+             {2\n[1,7:0,0:1,1,0\nx3,12:0,0\n]\n}2\n",
         )
         .unwrap();
         let result = inverse_output(
@@ -3683,9 +4081,32 @@ mod tests {
             result.location.file,
             original.canonicalize().unwrap().to_str().unwrap()
         );
-        assert_eq!(result.location.line, 3);
+        assert_eq!(result.location.line, 4);
         assert!(!result.location.precise);
         assert!(result.warning.is_none());
+
+        let toc_result = resolve_inverse_output(
+            &directory.path().join("deck.pdf"),
+            InversePoint {
+                page: 2,
+                x: 72.0,
+                y_from_top: 120.0,
+                page_height_pt: 792.0,
+            },
+            Some(("Shared Section Words", 0)),
+            0,
+            &Operation::default(),
+            "Input: build/deck.toc\nLine: 12\n",
+            QuerySources::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            toc_result.location.file,
+            original.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(toc_result.location.line, 7);
+        assert!(!toc_result.location.precise);
+        assert!(toc_result.warning.is_none());
     }
 
     #[test]
@@ -3734,6 +4155,11 @@ mod tests {
             assert_eq!(hint.words[hint.selected], decomposed);
             assert!(hint.valid());
         }
+        let overlay = "\\only<3>{visible} \\includesvg[width=\\linewidth]{diagram}";
+        assert!(ForwardWord::at(overlay, 7).is_none());
+        assert!(ForwardWord::at(overlay, 50).is_none());
+        let visible_hint = ForwardWord::at(overlay, 10).unwrap();
+        assert_eq!(visible_hint.words, ["visible"]);
     }
 
     #[test]
@@ -3829,5 +4255,28 @@ mod tests {
         ] {
             assert!(parse_forward_request(&invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn nonprinting_spans_and_frame_bounds_handle_control_symbols_let_and_verbatim() {
+        let source = "\\let\\olddef\\def\n\\newcommand\\+{HiddenSymbol}\nVisibleProse\n";
+        let visible_at = source.find("VisibleProse").unwrap();
+        let hidden = nonprinting_source_ranges(source);
+        assert!(hidden.iter().all(|range| !range.contains(&visible_at)));
+        let hidden_at = source.find("HiddenSymbol").unwrap();
+        assert!(hidden.iter().any(|range| range.contains(&hidden_at)));
+
+        let frame_source = "\
+\\begin{frame}
+Slide text
+\\begin{verbatim}
+\\begin{frame}
+\\end{frame}
+\\end{verbatim}
+More slide text
+\\end{frame}";
+        assert_eq!(frame_bounds(frame_source, 7), Some((0, 7)));
+        assert_eq!(normalized_word("oﬃce"), "office");
+        assert_eq!(normalized_word(" Café "), " cafe ");
     }
 }

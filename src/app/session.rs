@@ -162,13 +162,25 @@ impl App {
             return Ok(());
         };
 
-        self.navigation.inverse.take();
+        self.begin_reload(document_id, path, fingerprint, output)
+    }
+
+    pub(super) fn begin_reload(
+        &mut self,
+        document_id: DocumentId,
+        path: PathBuf,
+        fingerprint: FileFingerprint,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
         self.clear_document_flash(document_id);
         if self.tab().document_id == document_id {
+            self.navigation.inverse.take();
             self.generation = self.generation.wrapping_add(1);
             self.worker.begin_generation(self.generation);
             self.reset_render_state();
             self.pending_scale = None;
+        } else {
+            self.pending.retain(|key| key.document_id != document_id);
         }
         self.worker
             .open(document_id, path)
@@ -216,7 +228,7 @@ impl App {
                 tab.pending_destination = None;
                 tab.link_index = LinkIndexState::new(pages);
                 if index == self.session.active_tab {
-                    self.search_picker = None;
+                    self.reset_active_tab_pickers();
                     self.reset_render_state();
                     self.ensure_link_index();
                     self.request_current(output)?;
@@ -264,6 +276,7 @@ impl App {
                     tab.invert = view.invert;
                 }
                 self.session.active_tab = self.session.tabs.len() - 1;
+                self.reset_active_tab_pickers();
                 self.clear_viewer(output)?;
                 self.reset_render_state();
                 self.ensure_link_index();
@@ -375,6 +388,7 @@ impl App {
         }
         self.navigation.inverse.take();
         self.session.active_tab = index;
+        self.reset_active_tab_pickers();
         self.clear_viewer(output)?;
         self.reset_render_state();
         self.ensure_link_index();
@@ -390,12 +404,15 @@ impl App {
             return Ok(true);
         }
         let removed = self.session.tabs.remove(self.session.active_tab);
+        self.clear_document_flash(removed.document_id);
         self.worker.close(removed.document_id);
         if self.session.active_tab == self.session.tabs.len() {
             self.session.active_tab -= 1;
         }
+        self.reset_active_tab_pickers();
         self.clear_viewer(output)?;
         self.reset_render_state();
+        self.ensure_link_index();
         self.request_current(output)?;
         Ok(false)
     }

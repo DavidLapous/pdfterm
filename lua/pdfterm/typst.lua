@@ -11,7 +11,7 @@ local function canonical(path, cwd)
 end
 
 local function literal_word(source, byte_column)
-  -- Bound the literal excerpt for the 4096-byte forward socket, even on long
+  -- Bound the literal excerpt for the forward socket, even on long
   -- prose lines. Cut only at whitespace so UTF-8 and edge words remain whole.
   -- Rust owns Unicode tokenization; do not duplicate it with Vim's ASCII classes.
   local first, last = math.max(1, byte_column - 255), math.min(#source, byte_column + 256)

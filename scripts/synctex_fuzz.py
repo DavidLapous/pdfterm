@@ -332,6 +332,23 @@ def tex_space_end(text: str, at: int) -> int:
     return at
 
 
+def overlay_end(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] != "<":
+        return None
+    end = text.find(">", start + 1)
+    newline = text.find("\n", start + 1)
+    if end < 0 or (0 <= newline < end):
+        return None
+    body = text[start + 1 : end]
+    if not body:
+        return None
+    has_action = ":" in body or "@" in body
+    allowed = set("0123456789+-,.()|* ")
+    if has_action:
+        allowed.update("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ:@")
+    return end + 1 if all(ch in allowed for ch in body) else None
+
+
 def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
     definitions = {
         "newcommand", "renewcommand", "providecommand", "DeclareRobustCommand",
@@ -342,18 +359,23 @@ def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
     keys = {
         "label", "ref", "eqref", "pageref", "autoref", "cref", "Cref", "cite",
         "citep", "citet", "parencite", "textcite", "autocite", "footcite",
-        "nocite", "href", "includegraphics", "input", "include", "bibliography",
-        "addbibresource",
+        "nocite", "href", "includegraphics", "includesvg", "input", "include",
+        "bibliography", "addbibresource",
     }
     hidden, at = [], 0
     while at < len(text):
         if text[at] == "%":
             at = tex_space_end(text, at)
             continue
+        if text[at] == "<" and at > 0 and text[at - 1] in "}]":
+            if (end := overlay_end(text, at)) is not None:
+                hidden.append((at, end))
+                at = end
+                continue
         if text[at] != "\\":
             at += 1
             continue
-        match = re.match(r"\\([A-Za-z@]+)\*?", text[at:])
+        match = re.match(r"\\([A-Za-z@]+)[*+]?", text[at:])
         if match is None:
             at += 2
             continue
@@ -394,13 +416,16 @@ def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
                 at = tex_group_end(text, at) or at
             hidden.append((start, at))
         elif command in keys:
-            while (end := tex_group_end(text, at, "[")) is not None:
+            while (end := tex_group_end(text, at, "[") or overlay_end(text, at)) is not None:
                 at = end
             body = tex_space_end(text, at)
             end = tex_group_end(text, body)
             if end is not None:
-                hidden.append((start if command == "includegraphics" else body, end))
+                hidden.append((start if command in {"includegraphics", "includesvg"} else body, end))
                 at = end
+        elif (end := overlay_end(text, at)) is not None:
+            hidden.append((at, end))
+            at = end
     return hidden
 
 
@@ -531,7 +556,7 @@ def inverse(
         expected_file, expected_anchor = raw_file, raw[0]
         bounds = None
         remapped = False
-        generated = raw_file.suffix == ".vrb" and raw_file.stem == pdf.stem
+        generated = raw_file.suffix in {".vrb", ".toc", ".nav", ".out", ".aux", ".snm"} and raw_file.stem == pdf.stem
         if generated:
             origin = source_map["origins"].get(page)
             generated_on_page = any(
@@ -542,7 +567,11 @@ def inverse(
                 original = source_map["inputs"][origin[0]]
                 original_lines = source_info(original)[1]
                 original_bounds = frame_bounds(original_lines, origin[1])
-                if (
+                if raw_file.suffix != ".vrb":
+                    if 1 <= origin[1] <= len(original_lines):
+                        expected_file, expected_anchor = original, origin[1]
+                        bounds, remapped = original_bounds, True
+                elif (
                     original_bounds
                     and origin[1] == original_bounds[1] + 1
                     and re.search(
@@ -632,15 +661,42 @@ def inverse(
                     literal.append(char)
                 else:
                     break
-            if normalized_words("".join(literal)) != normalized_words(pdf_word):
+            enclosing = []
+            for char in reversed(prefix):
+                if char.isalnum() or unicodedata.combining(char):
+                    enclosing.append(char)
+                else:
+                    break
+            enclosing = list(reversed(enclosing)) + literal
+            alpha_word = len(pdf_word) >= 2 and pdf_word.isascii() and pdf_word.isalpha()
+            if normalized_words("".join(literal)) != normalized_words(pdf_word) and (
+                alpha_word or normalized_words("".join(enclosing)) != normalized_words(pdf_word)
+            ):
                 entry["error"] = "precise inverse column does not select the PDF word"
             else:
                 entry.update(ok=True, match="document_metadata" if metadata else "literal_frame_word" if bounds else "literal_source")
         else:
             expected_lines = source_info(expected_file)[1]
             eligible = expected_lines[bounds[0]:bounds[1] + 1] if bounds else expected_lines
+            selected_token = re.match(
+                r"\\[A-Za-z@]+\*?(?:\s*[_^]\s*(?:\{[^{}]*\}|\\[A-Za-z@]+\*?|[A-Za-z0-9]))*|[A-Za-z0-9]+",
+                resolved_row[len(prefix):],
+            )
+            anchor_row = (
+                source_line_text(expected_lines[expected_anchor - 1])
+                if 1 <= expected_anchor <= len(expected_lines)
+                else ""
+            )
             if any(line_has_word(row, pdf_word) for row in eligible):
                 entry["error"] = "inverse refinement missed a literal printed word in its original source scope"
+            elif (
+                not bounds
+                and resolved_line != expected_anchor
+                and selected_token
+                and not re.match(r"\s*\\(?:end\b|caption\b)", anchor_row)
+                and selected_token.group(0) in anchor_row
+            ):
+                entry["error"] = "inverse refinement jumped away from raw anchor line containing the same math token"
             else:
                 entry.update(abstained=True, reason="precision_not_literal_math_or_expansion")
         yield entry

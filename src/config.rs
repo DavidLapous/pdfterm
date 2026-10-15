@@ -319,6 +319,7 @@ pub struct NvimSettings {
     pub focus_on_forward: bool,
     pub executable: String,
     pub attach_only: bool,
+    pub log_file: Option<String>,
     pub keys: NvimKeys,
 }
 
@@ -348,6 +349,7 @@ mod tests {
         assert_eq!(config.link_picker_split_percent(), 50);
         assert!(!config.nvim.focus_on_forward);
         assert!(!config.nvim.focus_on_inverse);
+        assert_eq!(config.nvim.log_file, None);
         assert_eq!(config.link_picker_layout(), LinkPickerLayout::Auto);
     }
 
@@ -358,6 +360,13 @@ mod tests {
                 .expect("config");
         assert!(config.nvim.focus_on_forward);
         assert!(config.nvim.focus_on_inverse);
+    }
+
+    #[test]
+    fn parses_nvim_log_file() {
+        let config: Config =
+            toml::from_str("[nvim]\nlog_file = \"/tmp/pdfterm.log\"\n").expect("config");
+        assert_eq!(config.nvim.log_file.as_deref(), Some("/tmp/pdfterm.log"));
     }
 
     #[test]

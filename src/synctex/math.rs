@@ -44,7 +44,7 @@ pub(super) fn command(source: &str, start: usize) -> (&str, usize) {
 }
 
 pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)> {
-    let start = start + source[start..].len() - source[start..].trim_start().len();
+    let start = super::skip_source_space(source, start);
     if source.as_bytes().get(start) != Some(&b'{') {
         return None;
     }
@@ -74,6 +74,152 @@ pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)>
     None
 }
 
+/// Return the opaque command's end and whether its entire span is nonprinting.
+pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Option<(usize, bool)> {
+    match name {
+        "verb" => {
+            at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
+            let delimiter = source[at..].chars().next()?;
+            at += delimiter.len_utf8();
+            Some((
+                at + source[at..]
+                    .find(delimiter)
+                    .map_or(source.len() - at, |n| n + delimiter.len_utf8()),
+                false,
+            ))
+        }
+        "begin" => {
+            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            let environment = &source[body];
+            if !matches!(
+                environment.trim_end_matches('*'),
+                "verbatim" | "Verbatim" | "lstlisting" | "minted" | "comment"
+            ) {
+                return None;
+            }
+            if environment.trim_end_matches('*') == "comment" {
+                // comment.sty compares entire subsequent input lines, not
+                // substrings; TeX removes trailing ASCII spaces on input.
+                let Some(newline) = source[end..].find('\n') else {
+                    return Some((source.len(), true));
+                };
+                let mut at = end + newline + 1;
+                for row in source[at..].split_inclusive('\n') {
+                    let text = row.strip_suffix('\n').unwrap_or(row);
+                    let text = text
+                        .strip_suffix('\r')
+                        .unwrap_or(text)
+                        .trim_end_matches(' ');
+                    at += row.len();
+                    if text
+                        .strip_prefix("\\end{")
+                        .and_then(|text| text.strip_suffix('}'))
+                        == Some(environment)
+                    {
+                        return Some((at, true));
+                    }
+                }
+                return Some((source.len(), true));
+            }
+            if matches!(environment.trim_end_matches('*'), "Verbatim" | "minted") {
+                // Fancyvrb checks only the first \end{ marker on each subsequent line.
+                let Some(newline) = source[end..].find('\n') else {
+                    return Some((source.len(), false));
+                };
+                let mut at = end + newline + 1;
+                for row in source[at..].split_inclusive('\n') {
+                    at += row.len();
+                    if row
+                        .find("\\end{")
+                        .and_then(|offset| row[offset + 5..].strip_prefix(environment))
+                        .is_some_and(|rest| rest.starts_with('}'))
+                    {
+                        return Some((at, false));
+                    }
+                }
+                return Some((source.len(), false));
+            }
+            Some((
+                source[end..]
+                    .match_indices("\\end{")
+                    .find_map(|(offset, _)| {
+                        source[end + offset + 5..]
+                            .strip_prefix(environment)?
+                            .strip_prefix('}')?;
+                        Some(end + offset + 5 + environment.len() + 1)
+                    })
+                    .unwrap_or(source.len()),
+                false,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn caption_argument(source: &str, mut at: usize) -> Option<(Range<usize>, usize)> {
+    at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
+    at = super::skip_source_space(source, at);
+    if source.as_bytes().get(at) == Some(&b'[') {
+        at = super::optional_argument_end(source, at)?;
+    }
+    group(source, super::skip_source_space(source, at))
+}
+
+/// Find a complete long caption argument owning this literal cursor byte.
+pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usize>> {
+    if byte >= source.len() || !source.is_char_boundary(byte) {
+        return None;
+    }
+    let mut hidden = super::nonprinting_source_spans(source).peekable();
+    let mut body = None;
+    let mut at = 0;
+    while at <= byte {
+        while hidden.peek().is_some_and(|(_, range)| range.end <= at) {
+            hidden.next();
+        }
+        if let Some((start, range)) = hidden.peek()
+            && *start <= at
+        {
+            at = range.end;
+            if byte < at {
+                return None;
+            }
+            continue;
+        }
+        match source.as_bytes()[at] {
+            b'%' => {
+                at += source[at..].find('\n').unwrap_or(source.len() - at);
+                if byte < at {
+                    return None;
+                }
+            }
+            b'\\' => {
+                let (name, end) = command(source, at);
+                at = end;
+                if let Some((end, _)) = opaque_command_end(source, name, at) {
+                    at = end;
+                    if byte < at {
+                        return None;
+                    }
+                } else if name == "caption"
+                    && let Some((argument, _)) = caption_argument(source, at)
+                {
+                    if argument.contains(&byte) {
+                        at = argument.start;
+                        body = Some(argument);
+                    } else {
+                        at = argument.end + 1;
+                    }
+                }
+            }
+            _ => {
+                at += source[at..].chars().next()?.len_utf8();
+            }
+        }
+    }
+    body
+}
+
 pub(super) fn math_environment(name: &str) -> bool {
     matches!(
         name.trim_end_matches('*'),
@@ -85,17 +231,30 @@ pub(super) fn math_environment(name: &str) -> bool {
             | "alignat"
             | "flalign"
             | "gather"
+            | "gathered"
             | "multline"
             | "eqnarray"
+            | "matrix"
+            | "pmatrix"
+            | "bmatrix"
+            | "Bmatrix"
+            | "vmatrix"
+            | "Vmatrix"
+            | "smallmatrix"
+            | "cases"
+            | "split"
     )
 }
 
 /// Only closed, literal math regions qualify; escaped dollars and comments do not.
-fn regions(source: &str) -> Vec<Range<usize>> {
+fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
     let mut result = Vec::new();
     let mut open: Option<(&str, usize)> = None;
     let mut i = 0;
     while i < source.len() {
+        if open.is_none() && i >= limit {
+            break;
+        }
         let start = i;
         let ch = source[i..].chars().next().unwrap();
         i += ch.len_utf8();
@@ -120,6 +279,12 @@ fn regions(source: &str) -> Vec<Range<usize>> {
             '\\' => {
                 let (name, end) = command(source, start);
                 i = end;
+                if open.is_none()
+                    && let Some((end, _)) = opaque_command_end(source, name, i)
+                {
+                    i = end;
+                    continue;
+                }
                 match (name, open) {
                     ("(" | "[", None) => open = Some((if name == "(" { ")" } else { "]" }, i)),
                     (")" | "]", Some((expected, begin))) if name == expected => {
@@ -132,33 +297,13 @@ fn regions(source: &str) -> Vec<Range<usize>> {
                             i = end;
                             if name == "begin" && open.is_none() && math_environment(environment) {
                                 open = Some((environment, start));
-                            } else if let Some((expected, begin)) = open {
-                                if name == "end" && expected == environment {
-                                    result.push(begin..start);
-                                    open = None;
-                                }
-                            } else if name == "begin"
-                                && matches!(
-                                    environment,
-                                    "verbatim" | "Verbatim" | "lstlisting" | "minted" | "comment"
-                                )
+                            } else if let Some((expected, begin)) = open
+                                && name == "end"
+                                && expected == environment
                             {
-                                let close = format!("\\end{{{environment}}}");
-                                i += source[i..]
-                                    .find(&close)
-                                    .map_or(source.len() - i, |n| n + close.len());
+                                result.push(begin..start);
+                                open = None;
                             }
-                        }
-                    }
-                    ("verb", None) => {
-                        if source[i..].starts_with('*') {
-                            i += 1;
-                        }
-                        if let Some(delimiter) = source[i..].chars().next() {
-                            i += delimiter.len_utf8();
-                            i += source[i..]
-                                .find(delimiter)
-                                .map_or(source.len() - i, |n| n + delimiter.len_utf8());
                         }
                     }
                     _ => {}
@@ -173,38 +318,51 @@ fn regions(source: &str) -> Vec<Range<usize>> {
 /// Captions are collected before expansion, so SyncTeX can report the closing
 /// line for every word. Restrict refinement to that complete literal argument.
 pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
+    let target = line.checked_sub(1)? as usize;
+    let mut hidden = super::nonprinting_source_spans(source).peekable();
     let mut i = 0;
     let mut counted_to = 0;
     let mut counted_lines = 0;
     while i < source.len() {
+        while hidden.peek().is_some_and(|(_, range)| range.end <= i) {
+            hidden.next();
+        }
+        if let Some((start, range)) = hidden.peek()
+            && *start <= i
+        {
+            i = range.end;
+            continue;
+        }
         let ch = source[i..].chars().next()?;
         if ch == '%' {
             i += source[i..].find('\n').unwrap_or(source.len() - i);
         } else if ch == '\\' {
             let (name, end) = command(source, i);
             i = end;
-            if name == "caption" {
-                if source[i..].starts_with('*') {
-                    i += 1;
+            if let Some((end, _)) = opaque_command_end(source, name, i) {
+                i = end;
+            } else if name == "caption"
+                && let Some((body, end)) = caption_argument(source, i)
+            {
+                let first = counted_lines
+                    + source[counted_to..body.start]
+                        .bytes()
+                        .filter(|c| *c == b'\n')
+                        .count();
+                let last = first
+                    + source[body.start..end]
+                        .bytes()
+                        .filter(|c| *c == b'\n')
+                        .count();
+                counted_to = end;
+                counted_lines = last;
+                if (first..=last).contains(&target) {
+                    return Some(first..last + 1);
                 }
-                if let Some((body, end)) = group(source, i) {
-                    let first = counted_lines
-                        + source[counted_to..body.start]
-                            .bytes()
-                            .filter(|c| *c == b'\n')
-                            .count();
-                    let last = first
-                        + source[body.start..end]
-                            .bytes()
-                            .filter(|c| *c == b'\n')
-                            .count();
-                    counted_to = end;
-                    counted_lines = last;
-                    if (first..=last).contains(&(line.checked_sub(1)? as usize)) {
-                        return Some(first..last + 1);
-                    }
-                    i = end;
+                if first > target {
+                    return None;
                 }
+                i = end;
             }
         } else {
             i += ch.len_utf8();
@@ -214,8 +372,8 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
 }
 
 /// Literal prose immediately beside inline math is evidence for which
-/// occurrence was clicked. Stop at markup and line boundaries (which may hide
-/// comments); never invent a TeX expansion.
+/// occurrence was clicked. Stop at markup, comments, and blank-line
+/// paragraph boundaries; never invent a TeX expansion.
 fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<Atom> {
     let (before, after) =
         if source[..range.start].ends_with("\\(") && source[range.end..].starts_with("\\)") {
@@ -235,25 +393,72 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
             '\\' | '$' | '{' | '}' | '%' | '^' | '_' | '&' | '~' | '\n' | '\r'
         )
     };
-    let prefix: Vec<_> = source[..before]
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| literal(*c))
-        .filter(|(_, c)| !c.is_whitespace())
-        .take(8)
-        .collect();
+    let mut prefix = Vec::with_capacity(8);
+    let mut cursor = before;
+    'backward: while prefix.len() < 8 {
+        let line_start = source[..cursor].rfind('\n').map_or(0, |p| p + 1);
+        for (i, c) in source[line_start..cursor].char_indices().rev() {
+            if c == '\r' {
+                continue;
+            }
+            if !literal(c) {
+                break 'backward;
+            }
+            if !c.is_whitespace() {
+                prefix.push((line_start + i, c));
+                if prefix.len() == 8 {
+                    break 'backward;
+                }
+            }
+        }
+        if line_start == 0 {
+            break;
+        }
+        let nl = line_start - 1;
+        let prev_start = source[..nl].rfind('\n').map_or(0, |p| p + 1);
+        let prev_line = &source[prev_start..nl];
+        if prev_line.trim().is_empty() || prev_line.contains('%') {
+            break;
+        }
+        cursor = nl;
+    }
     let mut result = Vec::with_capacity(atoms.len() + 16);
     for (i, c) in prefix.into_iter().rev() {
         append(&mut result, c, i..i + c.len_utf8());
     }
     result.extend(atoms);
-    for (i, c) in source[after..]
-        .char_indices()
-        .take_while(|(_, c)| literal(*c))
-        .filter(|(_, c)| !c.is_whitespace())
-        .take(8)
-    {
-        append(&mut result, c, after + i..after + i + c.len_utf8());
+    let mut suffix_count = 0;
+    let mut cursor = after;
+    'forward: while suffix_count < 8 && cursor < source.len() {
+        let line_end = source[cursor..]
+            .find('\n')
+            .map_or(source.len(), |p| cursor + p);
+        for (i, c) in source[cursor..line_end].char_indices() {
+            if c == '\r' {
+                continue;
+            }
+            if !literal(c) {
+                break 'forward;
+            }
+            if !c.is_whitespace() {
+                append(&mut result, c, cursor + i..cursor + i + c.len_utf8());
+                suffix_count += 1;
+                if suffix_count == 8 {
+                    break 'forward;
+                }
+            }
+        }
+        if line_end >= source.len() {
+            break;
+        }
+        let next_start = line_end + 1;
+        let next_end = source[next_start..]
+            .find('\n')
+            .map_or(source.len(), |p| next_start + p);
+        if source[next_start..next_end].trim().is_empty() {
+            break;
+        }
+        cursor = next_start;
     }
     result
 }
@@ -263,7 +468,6 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
 fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
     let mut result = Vec::new();
     let mut opaque = false;
-    let mut scripted = false;
     let mut i = range.start;
     while i < range.end {
         let start = i;
@@ -273,10 +477,22 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
             '%' => i += source[i..range.end].find('\n').unwrap_or(range.end - i),
             '{' | '}' | '&' => {}
             '_' | '^' => {
-                // A single script has a linear base/script order. Multiple
-                // scripts can be extracted in visual rather than source order.
-                opaque |= scripted;
-                scripted = true;
+                // A single script has a linear base/script order. Simultaneous
+                // scripts on the same base can extract in visual rather than source order.
+                let arg = super::skip_source_space(source, i).min(range.end);
+                let arg_end = match source.as_bytes().get(arg) {
+                    Some(b'{') => group(source, arg).map(|(_, end)| end),
+                    Some(b'\\') => Some(command(source, arg).1),
+                    Some(_) => source[arg..range.end]
+                        .chars()
+                        .next()
+                        .map(|c| arg + c.len_utf8()),
+                    None => None,
+                };
+                opaque |= arg_end.is_none_or(|end| {
+                    let after = super::skip_source_space(source, end).min(range.end);
+                    source[after..range.end].starts_with(['_', '^'])
+                });
             }
             '\\' => {
                 let (name, end) = command(source, start);
@@ -353,6 +569,8 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
                     | Token::Frac
                     | Token::Text
                     | Token::OperatorName
+                    | Token::Over(_, _)
+                    | Token::Under(_, _)
                     | Token::NewLine => {}
                     _ => {
                         opaque = true;
@@ -383,10 +601,16 @@ pub(super) fn source_location(
     offset: usize,
     prose: Option<(u32, usize, isize)>,
 ) -> Option<(u32, usize)> {
-    let regions = regions(source);
     let starts: Vec<_> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
+    let limit = if let Some((row, _, _)) = prose {
+        (*starts.get(lines.end).unwrap_or(&source.len()))
+            .max(*starts.get(row as usize).unwrap_or(&source.len()))
+    } else {
+        *starts.get(lines.end).unwrap_or(&source.len())
+    };
+    let regions = regions(source, limit);
     let prose = prose.filter(|(row, byte, _)| {
         let index = starts[*row as usize - 1] + byte;
         !regions.iter().any(|range| range.contains(&index))
@@ -475,6 +699,7 @@ pub(super) fn source_location(
             // Context from a different formula must not break an ambiguity tie.
             let mut score = 0;
             let mut lexical_score = 0;
+            let mut contradictions = 0usize;
             for direction in [-1isize, 1] {
                 let source_edge = if direction < 0 {
                     begin
@@ -498,6 +723,10 @@ pub(super) fn source_location(
                             score += 9 - distance;
                             lexical_score += usize::from(a.value.is_alphanumeric());
                         }
+                        (Some(_), Some(_)) if distance == 1 => {
+                            contradictions += 1;
+                            break;
+                        }
                         _ => break,
                     }
                 }
@@ -513,7 +742,13 @@ pub(super) fn source_location(
             } else {
                 location.0.abs_diff(line)
             };
-            let rank = (score, lexical_score, std::cmp::Reverse(proximity));
+            let rank = (
+                score,
+                lexical_score > 0,
+                std::cmp::Reverse(contradictions),
+                std::cmp::Reverse(proximity),
+                lexical_score,
+            );
             match best {
                 Some((old, _)) if rank < old => {}
                 Some((old, previous)) if rank == old => tied |= previous != location,
@@ -527,7 +762,7 @@ pub(super) fn source_location(
     let known_math = best.is_some();
     let mathematical = best.filter(|_| !tied).map(|(_, location)| location);
     let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
-        && best.is_some_and(|((_, lexical_score, _), _)| lexical_score == 0);
+        && best.is_some_and(|((_, has_lexical, _, _, _), _)| !has_lexical);
     if prose_evidence {
         return prose.map(|(row, byte, _)| (row, byte));
     }
@@ -541,16 +776,17 @@ pub(super) fn source_location(
         if prose.is_some() && known_math {
             return None;
         }
-        let prose = prose.filter(|(row, _, _)| {
+        let prose = prose.filter(|(row, _, score)| {
             !known_math
-                && (literal_word
-                    || source
-                        .lines()
-                        .nth(*row as usize - 1)
-                        .is_some_and(|line| line.contains("\\begin{frame}")))
-                && pdf[word.clone()]
-                    .iter()
-                    .all(|atom| atom.value.is_alphabetic())
+                && (*score >= 3
+                    || (literal_word
+                        || source
+                            .lines()
+                            .nth(*row as usize - 1)
+                            .is_some_and(|line| line.contains("\\begin{frame}")))
+                        && pdf[word.clone()]
+                            .iter()
+                            .all(|atom| atom.value.is_alphabetic()))
         });
         let mathematical = mathematical.filter(|_| literal_word);
         return prose.map(|(row, byte, _)| (row, byte)).or(mathematical);
@@ -572,6 +808,63 @@ mod tests {
         assert_eq!(caption_lines(source, 9), Some(7..10));
         assert_eq!(caption_lines(source, 6), None);
         assert_eq!(caption_lines(source, 0), None);
+        let source = "\\caption*[short {nested}]\n% between arguments\n{\nlong\n}";
+        assert_eq!(caption_lines(source, 4), Some(2..5));
+        assert_eq!(caption_lines(source, 1), None);
+    }
+
+    #[test]
+    fn fancyvrb_closure_uses_only_the_first_end_marker_on_each_input_line() {
+        for environment in ["Verbatim", "Verbatim*", "minted", "minted*"] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "\\begin{{{environment}}}{newline}\
+                     \\end{{other}} ignored \\end{{{environment}}}{newline}\
+                     \\caption{{LiteralCopper{newline}LiteralNickel{newline}}}{newline}\
+                     prefix \\end{{{environment}}}   {newline}\
+                     \\caption{{VisibleCopper{newline}VisibleNickel{newline}}}"
+                );
+                let visible = source.find("\\caption{VisibleCopper").unwrap();
+                assert_eq!(
+                    opaque_command_end(&source, "begin", 6),
+                    Some((visible, false))
+                );
+                for word in ["LiteralCopper", "LiteralNickel"] {
+                    assert_eq!(
+                        caption_argument_at(&source, source.find(word).unwrap()),
+                        None,
+                        "{environment}, {word}"
+                    );
+                }
+                let argument =
+                    caption_argument_at(&source, source.find("VisibleNickel").unwrap()).unwrap();
+                assert_eq!(
+                    &source[argument],
+                    format!("VisibleCopper{newline}VisibleNickel{newline}")
+                );
+                let unclosed = &source[..source.find("prefix").unwrap()];
+                assert_eq!(
+                    opaque_command_end(unclosed, "begin", 6),
+                    Some((unclosed.len(), false))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_printed_opaque_environments_keep_their_inline_closure() {
+        for environment in ["verbatim", "verbatim*", "lstlisting", "lstlisting*"] {
+            let source = format!(
+                "\\begin{{{environment}}}\\end{{other}} \\end{{{environment}}}\
+                 \\caption{{VisibleCopper}}"
+            );
+            let visible = source.find("\\caption").unwrap();
+            assert_eq!(
+                opaque_command_end(&source, "begin", 6),
+                Some((visible, false))
+            );
+            assert!(caption_argument_at(&source, source.find("VisibleCopper").unwrap()).is_some());
+        }
     }
 
     #[test]
@@ -630,6 +923,20 @@ mod tests {
                 Some((1, source.find(needle).unwrap()))
             );
         }
+        let matrix = "\\begin{align*}\\dot f(t)&=\\begin{pmatrix}\\cos\\alpha_1(t)\\\\\\sin\\alpha_2(t)\\end{pmatrix}\\end{align*}";
+        let context = "f(t)=cosα1(t) sinα2(t)";
+        assert_eq!(
+            source_location(
+                matrix,
+                1,
+                0..1,
+                false,
+                context,
+                context.find("sin").unwrap(),
+                None
+            ),
+            Some((1, matrix.find("\\sin").unwrap()))
+        );
     }
 
     #[test]
@@ -641,6 +948,23 @@ mod tests {
         assert_eq!(source_location(source, 2, 0..2, true, "x⟼h", 1, None), None);
         let source = "$\\alpha\\custom{z}$\n$\\beta$";
         assert_eq!(source_location(source, 2, 0..2, true, "β", 0, None), None);
+        let source = "$\\custom{z}$\nA. Box in 2020";
+        assert_eq!(
+            source_location(source, 2, 0..2, true, "A. Box", 0, Some((2, 0, 3))),
+            Some((2, 0))
+        );
+        assert_eq!(
+            source_location(
+                source,
+                2,
+                0..2,
+                true,
+                "in 2020",
+                "in ".len(),
+                Some((2, 10, 3))
+            ),
+            Some((2, 10))
+        );
     }
 
     #[test]
@@ -685,5 +1009,44 @@ mod tests {
             source_location("$x.y$", 1, 0..1, false, "x.y", 1, None),
             Some((1, 2))
         );
+    }
+
+    #[test]
+    fn repeated_inline_math_across_soft_wraps_preserves_occurrence_ownership() {
+        let source = "\
+  \\begin{enumerate}
+    \\item if \\(u\\in\\mathcal M_k(a_0,a_1)\\) is regular and
+      \\(q_*\\) is its initial sample value, then \\(q_*\\) scales \\(\\Omega_k\\) on
+      \\(B_n^{\\le k}\\);
+    \\item similarly, if \\(q_*\\in B_n^{\\le k}\\) scales
+      \\(\\Omega_k\\), then the
+      combination of any local sample interval
+  \\end{enumerate}";
+        let context = "similarly, if q* ∈ Bn≤k scales Ωk,";
+        let offset = context.find("Ωk").unwrap();
+        assert_eq!(
+            source_location(source, 6, 1..8, false, context, offset, None),
+            Some((
+                6,
+                source.lines().nth(5).unwrap().find("\\Omega_k").unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn caption_lines_ignore_nonprinting_and_opaque_captions() {
+        let source = "\
+\\begin{comment}
+\\caption{Hidden
+comment
+caption}
+\\end{comment}
+\\newcommand{\\mycap}{\\caption{Macro
+caption}}
+\\caption{Visible
+caption}";
+        assert_eq!(caption_lines(source, 3), None);
+        assert_eq!(caption_lines(source, 6), None);
+        assert_eq!(caption_lines(source, 9), Some(7..9));
     }
 }

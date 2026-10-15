@@ -49,7 +49,31 @@ function M.launch(source, argv, callback)
         callback(result)
         return
       end
-      remote(arguments, callback)
+      remote(
+        arguments,
+        vim.schedule_wrap(function(split)
+          local id = vim.trim(split.stdout or '')
+          if split.code == 0 and (id == '' or id == source.id) then
+            split = {
+              code = 1,
+              stdout = '',
+              stderr = 'Kitty split returned no distinct window ID; created window ownership is unknown',
+            }
+          end
+          local ok, failure = xpcall(callback, debug.traceback, split)
+          if not ok then
+            if split.code == 0 and id ~= '' then
+              local closed, close_error = pcall(M.close, { id = id })
+              if not closed then
+                split.code, split.unclosed = 1, true
+                split.stderr = failure .. '; could not close unowned Kitty split: ' .. tostring(close_error)
+                error(split.stderr)
+              end
+            end
+            error(failure)
+          end
+        end)
+      )
     end)
   )
 end
@@ -63,10 +87,14 @@ function M.close(split)
   if found.code ~= 0 then
     error('pdfterm: could not locate PDF split: ' .. (found.stderr or ''))
   end
-  for _, os_window in ipairs(vim.json.decode(found.stdout)) do
-    for _, tab in ipairs(os_window.tabs) do
-      for _, window in ipairs(tab.windows) do
-        if tostring(window.id) == split.id then
+  local ok, windows = pcall(vim.json.decode, found.stdout or '')
+  if not ok or type(windows) ~= 'table' then
+    error('pdfterm: invalid Kitty window listing')
+  end
+  for _, os_window in ipairs(windows) do
+    for _, tab in ipairs(type(os_window) == 'table' and os_window.tabs or {}) do
+      for _, window in ipairs(type(tab) == 'table' and tab.windows or {}) do
+        if type(window) == 'table' and tostring(window.id) == split.id then
           local result = remote({ 'send-text', '--match', 'id:' .. split.id, '\003' }):wait()
           if result.code ~= 0 then
             error('pdfterm: could not quit owned PDF split: ' .. (result.stderr or ''))

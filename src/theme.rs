@@ -274,6 +274,7 @@ fn home_dir() -> PathBuf {
 fn expand_home(home: &Path, configured_path: &str) -> PathBuf {
     configured_path
         .strip_prefix("~/")
+        .filter(|_| !home.as_os_str().is_empty())
         .map(|rest| home.join(rest))
         .unwrap_or_else(|| PathBuf::from(configured_path))
 }
@@ -778,6 +779,10 @@ cursor_bg = "surface0"
         assert_eq!(
             expand_home(root.path(), "~/.config/themes/synthetic.toml"),
             root.path().join(".config/themes/synthetic.toml")
+        );
+        assert_eq!(
+            expand_home(Path::new(""), "~/.config/themes/synthetic.toml"),
+            PathBuf::from("~/.config/themes/synthetic.toml")
         );
     }
 

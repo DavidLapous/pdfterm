@@ -41,7 +41,10 @@ impl SourceInfo {
         let revision = DocumentRevision::read(&pdf)?;
         let cwd = fs::canonicalize(std::env::current_dir()?)?;
         let reader: Box<dyn Read> = match open_regular(&pdf.with_extension("synctex.gz"), false) {
-            Ok(file) => Box::new(flate2::read::GzDecoder::new(file)),
+            Ok(file) => Box::new(flate2::read::GzDecoder::new(BufReader::with_capacity(
+                64 * 1024,
+                file,
+            ))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match open_regular(&pdf.with_extension("synctex"), false) {
                     Ok(file) => Box::new(file),
@@ -65,7 +68,7 @@ impl SourceInfo {
             Err(error) => return Err(error),
         };
         let (main, inputs, unavailable) = read_inputs(
-            BufReader::new(reader.take(MAX_SOURCE_MAP_BYTES + 1)),
+            BufReader::with_capacity(64 * 1024, reader.take(MAX_SOURCE_MAP_BYTES + 1)),
             &cwd,
             operation,
         )?;
@@ -91,6 +94,33 @@ impl SourceInfo {
     }
 }
 
+pub(crate) fn is_compiler_sidecar_input(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "aux"
+                    | "nav"
+                    | "out"
+                    | "toc"
+                    | "w18"
+                    | "vrb"
+                    | "snm"
+                    | "bbl"
+                    | "blg"
+                    | "log"
+                    | "fls"
+                    | "fdb_latexmk"
+                    | "synctex"
+            )
+        })
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".synctex.gz"))
+}
+
 fn read_inputs(
     mut reader: impl BufRead,
     cwd: &Path,
@@ -100,11 +130,15 @@ fn read_inputs(
     let mut first = None;
     let mut row = String::new();
     let mut bytes = 0;
+    let mut lines = 0usize;
     let mut postamble = false;
     let mut count_seen = false;
     let mut unavailable = 0;
     loop {
-        operation.check()?;
+        if lines & 1023 == 0 {
+            operation.check()?;
+        }
+        lines = lines.wrapping_add(1);
         row.clear();
         let count = reader.read_line(&mut row)?;
         bytes += count;
@@ -139,11 +173,22 @@ fn read_inputs(
                 ));
             }
             let absolute = normalize_absolute(Path::new(path), cwd)?;
-            let path = match fs::canonicalize(&absolute) {
-                Ok(path) => path,
-                Err(_) => {
-                    unavailable += 1;
-                    absolute
+            let ignored = tag != 1
+                && first.is_some()
+                && (is_compiler_sidecar_input(&absolute)
+                    || !absolute.starts_with(cwd)
+                        && absolute.components().any(|component| {
+                            component.as_os_str().as_bytes().starts_with(b"texmf")
+                        }));
+            let path = if ignored {
+                absolute
+            } else {
+                match fs::canonicalize(&absolute) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        unavailable += 1;
+                        absolute
+                    }
                 }
             };
             match inputs.entry(tag) {
@@ -183,7 +228,17 @@ fn read_inputs(
         .get(&1)
         .or_else(|| first.and_then(|tag| inputs.get(&tag)))
         .cloned();
-    let mut paths: Vec<_> = inputs.into_values().collect();
+    let mut paths: Vec<_> = inputs
+        .into_values()
+        .filter(|path| {
+            Some(path) == main.as_ref()
+                || !is_compiler_sidecar_input(path)
+                    && (path.starts_with(cwd)
+                        || !path.components().any(|component| {
+                            component.as_os_str().as_bytes().starts_with(b"texmf")
+                        }))
+        })
+        .collect();
     paths.sort_unstable();
     paths.dedup();
     Ok((main, paths, unavailable))
@@ -609,7 +664,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cwd = fs::canonicalize(directory.path()).unwrap();
         fs::write(cwd.join("main.tex"), "compiled").unwrap();
-        let text = "Input:1:./main.tex\nContent:\n{1\n(not geometry\n}1\nPostamble:\nCount:2\nInput:3:missing.tex\n";
+        fs::write(cwd.join("main.aux"), "sidecar").unwrap();
+        fs::write(cwd.join("main.toc"), "sidecar").unwrap();
+        fs::write(cwd.join("main.nav"), "sidecar").unwrap();
+        fs::write(cwd.join("main.out"), "sidecar").unwrap();
+        let text = "Input:1:./main.tex\nInput:2:/usr/local/texlive/2026/texmf-dist/tex/latex/base/article.cls\nInput:3:./main.aux\nInput:4:./main.toc\nInput:5:./main.nav\nInput:6:./main.out\nInput:7:./main.w18\nContent:\n{1\n(not geometry\n}1\nPostamble:\nCount:2\nInput:8:missing.tex\n";
         let (main, inputs, missing) =
             read_inputs(text.as_bytes(), &cwd, &Operation::default()).unwrap();
         assert_eq!(main, Some(cwd.join("main.tex")));

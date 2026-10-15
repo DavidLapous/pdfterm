@@ -172,11 +172,18 @@ impl BrowserState {
             return;
         }
         let directory = self.current_dir.clone();
+        let root_dir = self.root_dir.clone();
         let recents = self.recents.clone();
         let (sender, receiver) = mpsc::channel();
         self.recursive_rx = Some(receiver);
         thread::spawn(move || {
-            let root = find_git_root(&directory).unwrap_or_else(|| directory.clone());
+            let canonical_root =
+                std::fs::canonicalize(&root_dir).unwrap_or_else(|_| root_dir.clone());
+            let root = find_git_root(&directory)
+                .filter(|git_root| {
+                    git_root.starts_with(&root_dir) || git_root.starts_with(&canonical_root)
+                })
+                .unwrap_or_else(|| directory.clone());
             let mut entries: Vec<_> = collect_pdf_files(&root)
                 .into_iter()
                 .map(|(name, path)| BrowserEntry {
@@ -252,6 +259,8 @@ impl BrowserState {
 
         let pattern = Pattern::parse(&self.filter, CaseMatching::Ignore, Normalization::Smart);
         let query = self.filter.trim().to_lowercase();
+        let current_dir = self.current_dir.clone();
+        let canonical_dir = std::fs::canonicalize(&current_dir).ok();
         let filtered_indices = {
             let source = self.active_source();
             let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
@@ -267,11 +276,21 @@ impl BrowserState {
                         .unwrap_or_else(|| entry.name.as_str().into());
                     let basename_score =
                         pattern.score(Utf32Str::new(basename.as_ref(), &mut buffer), &mut matcher);
-                    let path = entry.path.to_string_lossy();
+                    let relative_path = entry
+                        .path
+                        .strip_prefix(&current_dir)
+                        .ok()
+                        .or_else(|| {
+                            canonical_dir
+                                .as_deref()
+                                .and_then(|dir| entry.path.strip_prefix(dir).ok())
+                        })
+                        .unwrap_or(&entry.path)
+                        .to_string_lossy();
                     let path_score = if entry.name == "../" {
                         None
                     } else {
-                        pattern.score(Utf32Str::new(&path, &mut buffer), &mut matcher)
+                        pattern.score(Utf32Str::new(&relative_path, &mut buffer), &mut matcher)
                     };
                     let score = basename_score.or(path_score)?;
                     let basename_lower = basename.to_lowercase();

@@ -1116,6 +1116,44 @@ local ok, failure = xpcall(function()
     assert(digest(pdf_a) == original_a and digest(pdf_b) ~= original_b,
       'public build compiled the old root after saving the new directive')
 
+    -- Live standalone/included transitions must select the owner before saving.
+    for _, standalone in ipairs({ false, true }) do
+      local ownership = base .. '/live ownership ' .. tostring(standalone)
+      vim.fn.mkdir(ownership .. '/nested', 'p')
+      vim.fn.mkdir(ownership .. '/.git', 'p')
+      local parent, changing = ownership .. '/parent.tex', ownership .. '/nested/child.tex'
+      local prefix = {}
+      for _ = 1, 25 do prefix[#prefix + 1] = '% Header comment.' end
+      local function body(is_standalone)
+        local lines = vim.deepcopy(prefix)
+        if is_standalone then
+          vim.list_extend(lines, { '\\documentclass{article}', '\\begin{document}' })
+        end
+        lines[#lines + 1] = 'Copper quartz identifies the selected source owner.'
+        if is_standalone then lines[#lines + 1] = '\\end{document}' end
+        return lines
+      end
+      vim.fn.writefile({
+        '\\documentclass{article}', '\\begin{document}',
+        '\\input{nested/child}', '\\end{document}',
+      }, parent)
+      vim.fn.writefile(body(standalone), changing)
+      vim.cmd.edit(vim.fn.fnameescape(changing))
+      root_notices = {}
+      vim.cmd('PdfTermBuild')
+      finish_build()
+      local old_pdf = (standalone and changing or parent):gsub('%.tex$', '.pdf')
+      local old_digest = digest(old_pdf)
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, body(not standalone))
+      root_notices = {}
+      vim.cmd('PdfTermBuild')
+      finish_build()
+      local selected_pdf = (standalone and parent or changing):gsub('%.tex$', '.pdf')
+      assert(vim.fn.filereadable(selected_pdf) == 1, 'live ownership built the old root')
+      assert(digest(old_pdf) == old_digest, 'live ownership rebuilt the independent old PDF')
+      assert(not vim.bo.modified, 'ownership build did not save the selected source')
+    end
+
     -- New unsaved children work with both a live directive and automatic ownership.
     local fresh_build = base .. '/fresh-build.tex'
     local fresh_literal = 'Silver owner silverneedle glows among quiet amber stones.'

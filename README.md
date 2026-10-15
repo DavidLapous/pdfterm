@@ -70,11 +70,13 @@ The bundled plugin works with [Lazy.nvim](https://github.com/folke/lazy.nvim); i
   "jrf/pdfterm",
   main = "pdfterm",
   lazy = false,
-  opts = { executable = "pdfterm", open_pdf = true },
+  opts = { executable = "pdfterm", open_pdf = true, log_file = "~/.local/state/nvim/pdfterm.log" },
 }
 ```
 
-`:PdfTermOpen` opens a PDF. `:PdfTermForwardSplit` opens/navigates the viewer beside Neovim; `:PdfTermForward` navigates an existing viewer.
+`:PdfTermOpen` opens a PDF. `:PdfTermForwardSplit` opens/navigates the viewer beside Neovim; `:PdfTermForward` navigates an existing viewer. `:PdfTermLog` opens the configured log file in a split. SyncTeX position checks, ambiguities, and navigation errors are recorded with timestamps and source/PDF coordinates.
+
+Configured log-directory, open, write, and close failures report an explicit Neovim error without recursively logging it or aborting navigation.
 
 Kitty splits require `allow_remote_control yes`; detached Neovim also needs a private `listen_on` socket. Ghostty control is macOS-only. WezTerm requires `wezterm` on `PATH`. For manual pairing, `:PdfTermViewerCommand` prints the Neovim-attached launch command and copies it to the clipboard.
 
@@ -88,10 +90,58 @@ latexmk -pdf -synctex=1 main.tex
 
 Forward search uses the source cursor; `Alt`/`Option` + click or `x` navigates from PDF text back to its source. Neither direction changes terminal focus by default.
 
-The Neovim adapter tracks compiled source with immutable snapshots and native line-range anchors. Unchanged text follows insertions, deletions, undo, reload, and known buffer renames. New or changed text, deleted inverse targets, and unavailable history use a warned compiled/live anchor; new text is not treated as printed text. A successful plugin build captures saved inputs when compilation starts. Existing or externally rebuilt PDFs have unverified source history and warn until a captured build establishes it. Build and forward commands use edited root directives without losing pre-save anchors.
+The Neovim adapter tracks plugin builds with immutable source snapshots and native line-range anchors. Unchanged captured text follows insertions, deletions, undo, reload, and known buffer renames; changed or deleted targets use warned live boundaries. A successful plugin build captures saved inputs when compilation starts. Inverse clicks look up that build's matching PDF/SyncTeX revision before refinement, including after viewer reloads without a forward request. When no captured build exists, inverse navigation makes the usual saved-source word guess and explicitly warns that it assumes the source has not changed since compilation. It does not manufacture source history from current files. Build and forward commands use edited root directives without losing pre-save anchors. Restart Neovim and existing viewers after updating the plugin and executable together.
+
+Automatic root discovery also uses the initiating buffer's complete live text, so adding or removing a standalone preamble selects the correct owner before saving. Explicit main selection and the first-20-line root-directive convention keep their precedence.
 
 SyncTeX forward search uses warned compiler LINE geometry, not exact WORD ownership: saved-source hashes and matching text cannot prove which tokens arbitrary TeX hooks or macros printed. A captured build verifies source history, not TeX execution. The existing overlay/page selection is retained, but does not prove ownership of a particular printed word or table row. Without a usable line target, Neovim warns and leaves the current PDF position unchanged; it never substitutes the document beginning. Inverse search remains enabled; strict inverse search rejects competing targets and invalid source bounds. Invalid required source-cache data, missing PDFs, failed compilation, required-tool failures, and viewer/socket failures remain errors. A coarse forward warning does not enable best-guess inverse navigation in a standalone viewer.
+
+A cursor inside a complete literal caption's long argument uses that argument's closing compiler line instead of its opening line. This avoids a preceding-graphic anchor when SyncTeX records the collected caption against its closing line. The same rule applies to readable captured-source anchors. Short caption options, comments, command definitions, verbatim text, and adjacent prose do not acquire caption scope. Beamer frame anchoring takes precedence. Navigation remains warned LINE geometry, not an exact word highlight.
 
 Inverse queries preserve click-coordinate precision at source-region boundaries. Diagnostics distinguish missing mappings, ambiguous targets, and invalid readable source anchors; invalid anchors report the source path, requested line, and available line count.
 
 Socket/command navigation leaves the clipboard untouched. `editor.transport = "none"` copies source locations via OSC 52; explicit `y` still copies page text.
+
+## Stateful Neovim fuzzing
+
+The edit campaign runs real headless Neovim, with a separate Python operation-history
+oracle. It probes every UTF-8 byte position and line end after each edit, in both
+directions. Histories include insert/replace/delete, duplicate text, line splits/joins,
+undo/redo, save/unload/reload, and clean/dirty buffer renames. Checks cover occurrence
+identity, precise coordinates versus required warnings, immutable snapshots, saved
+bytes, unrelated dirty buffers, and actual inverse socket/cursor delivery.
+
+```console
+python3 scripts/nvim_source_fuzz.py --seed 20261011 --cases 1000000 --steps 32 --binary "$(command -v pdfterm)"
+```
+
+The default and maximum campaign size are 1,000,000 cases. Histories are generated
+one at a time; use `--cases 16` for a short run. A full campaign starts Neovim for
+each case, so plan for substantial runtime. Passing-case artifacts are discarded
+by default; campaign totals and failure artifacts are retained. Use `--keep-passing`
+only for small diagnostic campaigns that need every trace and observation.
+
+Requires Python 3.9+, Neovim, and a built viewer. Each case has a process-group
+deadline (`--timeout`, default 30 seconds). Results, failing seeds, edit traces, and
+exact queries are retained under `target/nvim-fuzz-*`; semantic failures also produce
+`repro.json` and a bounded, best-found `minimized.json` (`--minimize`, default 16
+shrink attempts). Replay a trace with `--replay PATH`; `--output` must stay inside
+this repository's `target/`.
+Replay files are bounded to 8 MiB, captured source to 2 MiB, and worker results to
+64 MiB. Invalid results fail explicitly with retained diagnostics. Output directories
+containing previous case artifacts are rejected rather than reusing stale results.
+Summary totals count observed queries and completed states/edits, not planned trace
+coverage. Precision failures shrink only while preserving the violation class,
+query, and original source owner.
+The live `summary.json` is atomically updated after the first passing case and
+every 100 cases, then finalized on completion or a retained failure.
+
+The oracle never reads extmarks, `vim.diff`, or mapper results to establish expected
+positions. The fixture is a valid metadata-only PDF, and listener setup uses an
+explicit private plugin seam. This campaign checks source-history projection,
+not rendered PDF/TeX ownership or public forward-command save/build behavior.
+All byte positions are checked within generated states; arbitrary edit histories,
+PDFs, compiler races, external reloads, and cold editor sessions are not exhaustively
+covered. Warned coarse results must have valid bounds and identity; their exact
+best-guess choice is not certified. Increasing cases does not prove arbitrary
+macro-expanded TeX/math execution ownership in the PDF.

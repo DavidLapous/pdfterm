@@ -1037,14 +1037,16 @@ fn run_worker(
                     let Some(document) = documents.get(&document_id) else {
                         continue;
                     };
-                    let target = document
-                        .pages()
-                        .get(page as i32)
-                        .map_err(|e| e.to_string())?;
-                    let translated = SourcePageCoordinates::for_page(&target)
-                        .and_then(|coordinates| coordinates.pdf_rect(rect));
                     let result = (|| -> Result<(SearchRect, bool), String> {
-                        let coarse = translated?;
+                        let page_index = i32::try_from(page).map_err(|_| {
+                            format!("page {} exceeds PDFium's index range", page + 1)
+                        })?;
+                        let target = document
+                            .pages()
+                            .get(page_index)
+                            .map_err(|e| e.to_string())?;
+                        let coarse = SourcePageCoordinates::for_page(&target)
+                            .and_then(|coordinates| coordinates.pdf_rect(rect))?;
                         let Some(word) = word else {
                             return Ok((coarse, false));
                         };
@@ -1258,15 +1260,15 @@ fn run_worker(
                 continue;
             }
 
-            let page_index = i32::try_from(request.key.page).map_err(|_| {
-                format!("page {} exceeds PDFium's index range", request.key.page + 1)
-            })?;
+            let Ok(page_index) = i32::try_from(request.key.page) else {
+                continue;
+            };
             let Some(document) = documents.get(&request.key.document_id) else {
                 continue;
             };
-            let page = document.pages().get(page_index).map_err(|error| {
-                format!("could not load page {}: {error}", request.key.page + 1)
-            })?;
+            let Ok(page) = document.pages().get(page_index) else {
+                continue;
+            };
             let zoom = i32::from(request.key.zoom.max(1));
             let target_width = i32::from(request.key.width) * zoom / 100;
             let target_height = i32::from(request.key.height) * zoom / 100;
@@ -1796,8 +1798,9 @@ fn dark_mode_pixel([red, green, blue]: [u8; 3], transform: DarkModeTransform) ->
     let max_f = f32::from(max_channel) / 255.0;
     let min_f = f32::from(min_channel) / 255.0;
     let lightness = (max_f + min_f) * 0.5;
+    let sum = usize::from(max_channel) + usize::from(min_channel);
     let new_lightness =
-        transform.background_lightness + (1.0 - lightness.powf(1.2)) * transform.lightness_range;
+        transform.background_lightness + dark_mode_lightness_lut()[sum] * transform.lightness_range;
     let chroma = max_f - min_f;
 
     let hue = if max_channel == red {
@@ -1824,6 +1827,16 @@ fn dark_mode_pixel([red, green, blue]: [u8; 3], transform: DarkModeTransform) ->
         unit_to_u8(hue_to_rgb(p, q, hue)),
         unit_to_u8(hue_to_rgb(p, q, hue - 1.0 / 3.0)),
     ]
+}
+
+fn dark_mode_lightness_lut() -> &'static [f32; 511] {
+    static LUT: OnceLock<[f32; 511]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|sum| {
+            let lightness = sum as f32 / (255.0 * 2.0);
+            1.0 - lightness.powf(1.2)
+        })
+    })
 }
 
 fn dark_mode_curve_lut() -> &'static [u8; 766] {
@@ -2016,6 +2029,7 @@ pub fn synctex_edit_batch(
         .load_pdf_from_file(pdf, None)
         .map_err(|error| format!("could not open {}: {error}", pdf.display()))?;
     let mut cached_page: Option<(u32, PdfPage<'_>)> = None;
+    let mut cached_snapshot: Option<crate::source_snapshot::SourceSnapshot> = None;
     for (line_number, line) in input.lines().enumerate() {
         let input_line = line.as_ref().ok().cloned();
         let result = (|| -> Result<serde_json::Value, String> {
@@ -2046,13 +2060,22 @@ pub fn synctex_edit_batch(
                 Ok(None) => return Err("PDFium found no text near point".into()),
                 Err(error) => return Err(format!("PDFium text hit-test failed: {error}")),
             };
-            let resolution = crate::synctex::resolve_inverse(
+            if let Some(snapshot_path) = source_snapshot
+                && cached_snapshot.is_none()
+            {
+                let pdf = std::path::absolute(pdf).map_err(|error| error.to_string())?;
+                cached_snapshot = Some(
+                    crate::source_snapshot::SourceSnapshot::load(snapshot_path, &pdf)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let resolution = crate::synctex::resolve_inverse_with_snapshot(
                 pdf,
                 coordinates.inverse_point(point.page, pdf_x, pdf_y)?,
                 settings.word_precision.then_some((&context, offset)),
                 settings.source_context_lines as u32,
                 &crate::process::Operation::new(std::time::Duration::from_secs(30)),
-                source_snapshot,
+                cached_snapshot.as_ref(),
                 best_guess,
             )
             .map_err(|error| error.to_string())?;
@@ -2357,11 +2380,33 @@ fn cached_page_text<'a>(
         let page = document.pages().get(page_index).ok()?;
         let text = page.text().ok()?;
         let raw = text.all();
+        let chars = text.chars();
+        let mut next_index = 0;
         let (normalized, source_index_by_byte) =
-            normalize_search_characters(text.chars().iter().filter_map(|character| {
-                character
-                    .unicode_char()
-                    .map(|value| (character.index(), value))
+            normalize_search_characters(chars.iter().filter_map(|character| {
+                let index = character.index();
+                if index < next_index {
+                    return None;
+                }
+                let first = character.unicode_value();
+                let end = index
+                    + if (0xd800..=0xdbff).contains(&first) {
+                        2
+                    } else {
+                        1
+                    };
+                let value = source_range_char(index, end, |unit| {
+                    if unit == index {
+                        Some(first)
+                    } else {
+                        chars
+                            .get(unit)
+                            .ok()
+                            .map(|character| character.unicode_value())
+                    }
+                })?;
+                next_index = end;
+                Some((index, value))
             }));
         *slot = Some(CachedPageText {
             raw,
@@ -2534,6 +2579,7 @@ fn normalize_search_text(value: &str) -> String {
     normalize_search_characters(value.chars().enumerate()).0
 }
 
+#[cfg(test)]
 fn count_search_matches(haystack: &str, needle: &str) -> u32 {
     u32::try_from(haystack.match_indices(needle).count()).unwrap_or(u32::MAX)
 }
@@ -2780,9 +2826,9 @@ fn forward_overlay_page(
         .collect();
     later_pages.sort_unstable();
     later_pages.dedup();
-    if !later_pages.is_empty() && page_hint.words.len() >= 2 {
-        // A single word or an unreadable page never overrides the initial
-        // result. Preserve the original first-plus-63-later-page scan bound.
+    if !later_pages.is_empty() && !page_hint.words.is_empty() {
+        // An unreadable page never overrides the initial result. Preserve the
+        // original first-plus-63-later-page scan bound.
         let visible = |page: u32| {
             let index = page.checked_sub(1)?;
             if index >= pages {
@@ -2795,16 +2841,27 @@ fn forward_overlay_page(
         let first_score = selected_text
             .as_ref()
             .and_then(|(text, _)| forward_context_score(text, page_hint));
-        if !first_score.is_some_and(|score| score > 0) {
+        let min_score = u32::from(page_hint.words.len() >= 2);
+        if !first_score.is_some_and(|score| score >= min_score) {
+            let mut fallback = None;
             for page in later_pages.into_iter().take(63) {
                 let Some(text) = visible(page) else {
                     continue;
                 };
-                if forward_context_score(&text.0, page_hint).is_some_and(|score| score > 0) {
+                let score = forward_context_score(&text.0, page_hint);
+                if score.is_some_and(|score| score >= min_score) {
                     selected_page = page;
                     selected_text = Some(text);
+                    fallback = None;
                     break;
                 }
+                if first_score.is_none() && fallback.is_none() && score.is_some() {
+                    fallback = Some((page, text));
+                }
+            }
+            if let Some((page, text)) = fallback {
+                selected_page = page;
+                selected_text = Some(text);
             }
         }
     }
@@ -2820,7 +2877,7 @@ pub(crate) fn select_forward_line_candidate(
     anchor: ForwardCandidate,
     library: Option<&Path>,
 ) -> Result<ForwardCandidate, String> {
-    if page_hint.words.len() < 2
+    if page_hint.words.is_empty()
         || candidates
             .iter()
             .all(|candidate| candidate.page == anchor.page)
@@ -3011,7 +3068,7 @@ fn search_page(
             Some((first, last.saturating_sub(first).saturating_add(1)))
         })
         .collect();
-    let occurrences = count_search_matches(&cached.normalized, needle);
+    let occurrences = u32::try_from(source_ranges.len()).unwrap_or(u32::MAX);
     if source_ranges.is_empty() {
         return (0, Vec::new(), String::new());
     }
@@ -3044,20 +3101,23 @@ fn search_page(
 
 fn search_match_context(cached: &CachedPageText, range: (usize, usize)) -> String {
     let (start, count) = range;
-    let start_byte = cached
-        .raw
-        .char_indices()
-        .nth(start)
-        .map_or(cached.raw.len(), |(index, _)| index);
-    let end_byte = cached
-        .raw
-        .char_indices()
-        .nth(start.saturating_add(count))
-        .map_or(cached.raw.len(), |(index, _)| index);
-    context_window(&cached.raw, start_byte..end_byte, 70, 90)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let end_utf16 = start.saturating_add(count);
+    let mut utf16_pos = 0usize;
+    let mut start_byte = None;
+    let mut end_byte = None;
+    for (byte_index, ch) in cached.raw.char_indices() {
+        if start_byte.is_none() && utf16_pos >= start {
+            start_byte = Some(byte_index);
+        }
+        if utf16_pos >= end_utf16 {
+            end_byte = Some(byte_index);
+            break;
+        }
+        utf16_pos += ch.len_utf16();
+    }
+    let start_byte = start_byte.unwrap_or(cached.raw.len());
+    let end_byte = end_byte.unwrap_or(cached.raw.len()).max(start_byte);
+    normalize_context_text(&context_window(&cached.raw, start_byte..end_byte, 70, 90))
 }
 
 fn apply_search_highlights(
@@ -3100,7 +3160,7 @@ fn extract_page_links(
     width: u32,
     height: u32,
 ) -> Vec<PageLink> {
-    let page_text = page.text().ok();
+    let mut page_text = None;
     let mut links: Vec<_> = page
         .links()
         .iter()
@@ -3109,6 +3169,7 @@ fn extract_page_links(
             let bounds = link.rect().ok()?;
             let rect = page_rect_to_pixels(page, config, width, height, bounds)?;
             let label = page_text
+                .get_or_insert_with(|| page.text().ok())
                 .as_ref()
                 .map(|text| link_text_label(&text.inside_rect(bounds)))
                 .filter(|label| !label.is_empty())
@@ -3161,40 +3222,49 @@ fn extract_document_links(
     let page_width = page.width().value.max(1.0);
     let index_height =
         ((INDEX_WIDTH as f32 * page.height().value / page_width).ceil() as u32).max(1);
+    let links = extract_page_links(document, page, &config, INDEX_WIDTH, index_height);
+    if links.is_empty() {
+        return Vec::new();
+    }
     let source_text = cached_page_text(document, source_page, text_cache)
         .map(|text| normalize_context_text(&text.raw));
+    let mut target_texts = HashMap::<u32, Option<String>>::new();
     let mut label_occurrences = HashMap::<String, usize>::new();
-    coalesce_document_link_fragments(
-        extract_page_links(document, page, &config, INDEX_WIDTH, index_height),
-        source_text.as_deref(),
-    )
-    .into_iter()
-    .enumerate()
-    .map(|(ordinal, link)| {
-        let occurrence = label_occurrences.entry(link.label.clone()).or_default();
-        let source_context = source_text
-            .as_deref()
-            .and_then(|text| context_around_label(text, &link.label, *occurrence, 90, 110));
-        *occurrence += 1;
-        let reference_context = match &link.target {
-            LinkTarget::Internal { page, .. } => citation_number(&link.label).and_then(|number| {
-                cached_page_text(document, *page, text_cache)
-                    .and_then(|text| reference_context(&normalize_context_text(&text.raw), number))
-            }),
-            LinkTarget::Uri(_) => None,
-        }
-        .filter(|reference| source_context.as_ref() != Some(reference));
-        DocumentLink {
-            source_page,
-            source_top_ratio: (link.rect.top as f32 / index_height as f32).clamp(0.0, 1.0),
-            ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
-            label: link.label,
-            source_context,
-            reference_context,
-            target: link.target,
-        }
-    })
-    .collect()
+    coalesce_document_link_fragments(links, source_text.as_deref())
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, link)| {
+            let occurrence = label_occurrences.entry(link.label.clone()).or_default();
+            let source_context = source_text
+                .as_deref()
+                .and_then(|text| context_around_label(text, &link.label, *occurrence, 90, 110));
+            *occurrence += 1;
+            let reference_context = match &link.target {
+                LinkTarget::Internal { page, .. } => {
+                    citation_number(&link.label).and_then(|number| {
+                        let target_text = target_texts.entry(*page).or_insert_with(|| {
+                            cached_page_text(document, *page, text_cache)
+                                .map(|text| normalize_context_text(&text.raw))
+                        });
+                        target_text
+                            .as_deref()
+                            .and_then(|text| reference_context(text, number))
+                    })
+                }
+                LinkTarget::Uri(_) => None,
+            }
+            .filter(|reference| source_context.as_ref() != Some(reference));
+            DocumentLink {
+                source_page,
+                source_top_ratio: (link.rect.top as f32 / index_height as f32).clamp(0.0, 1.0),
+                ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                label: link.label,
+                source_context,
+                reference_context,
+                target: link.target,
+            }
+        })
+        .collect()
 }
 
 fn coalesce_document_link_fragments(
@@ -3276,7 +3346,14 @@ fn link_fragments_are_adjacent(previous: PageLinkRect, next: PageLinkRect) -> bo
 }
 
 fn normalize_context_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut normalized = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(word);
+    }
+    normalized
 }
 
 fn citation_number(label: &str) -> Option<&str> {
@@ -3344,23 +3421,54 @@ fn context_window(
     before: usize,
     after: usize,
 ) -> String {
-    let characters: Vec<_> = text.chars().collect();
-    let start_character = text[..range.start].chars().count();
-    let end_character = start_character + text[range].chars().count();
-    let mut start = start_character.saturating_sub(before);
-    while start > 0 && !characters[start - 1].is_whitespace() {
-        start -= 1;
+    let start_slice = text.get(..range.start).unwrap_or("");
+    let mut rev_chars = start_slice.char_indices().rev();
+    let mut start_byte = range.start;
+    for _ in 0..before {
+        let Some((idx, _)) = rev_chars.next() else {
+            start_byte = 0;
+            break;
+        };
+        start_byte = idx;
     }
-    let mut end = end_character.saturating_add(after).min(characters.len());
-    while end < characters.len() && !characters[end].is_whitespace() {
-        end += 1;
+    if start_byte > 0 {
+        for (idx, ch) in rev_chars {
+            if ch.is_whitespace() {
+                break;
+            }
+            start_byte = idx;
+        }
     }
-    let mut context: String = characters[start..end].iter().collect();
-    context = context.trim().to_string();
-    if start > 0 {
-        context.insert(0, '…');
+
+    let end_slice = text.get(range.end..).unwrap_or("");
+    let mut fwd_chars = end_slice.char_indices();
+    let mut end_rel = 0;
+    let mut reached_end = false;
+    for _ in 0..after {
+        let Some((idx, ch)) = fwd_chars.next() else {
+            end_rel = end_slice.len();
+            reached_end = true;
+            break;
+        };
+        end_rel = idx + ch.len_utf8();
     }
-    if end < characters.len() {
+    if !reached_end {
+        for (idx, ch) in fwd_chars {
+            if ch.is_whitespace() {
+                break;
+            }
+            end_rel = idx + ch.len_utf8();
+        }
+    }
+    let end_byte = (range.end + end_rel).min(text.len());
+
+    let trimmed = text.get(start_byte..end_byte).unwrap_or("").trim();
+    let mut context = String::with_capacity(trimmed.len() + 6);
+    if start_byte > 0 {
+        context.push('…');
+    }
+    context.push_str(trimmed);
+    if end_byte < text.len() {
         context.push('…');
     }
     context
@@ -3393,7 +3501,7 @@ fn sort_page_links_reading_order(links: &mut [PageLink]) {
 }
 
 fn link_text_label(text: &str) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalize_context_text(text);
     let mut characters = normalized.chars();
     let mut label: String = characters.by_ref().take(80).collect();
     if characters.next().is_some() {
@@ -3664,7 +3772,15 @@ fn apply_dark_mode_link_contrast(
         let Some(background) = dominant_rectangle_color(rgba, width, height, *rectangle) else {
             continue;
         };
-        let Some(ink) = darkest_blue_link_ink(rgba, width, height, *rectangle, background) else {
+        let background_luminance = relative_luminance(background);
+        let Some(ink) = darkest_blue_link_ink(
+            rgba,
+            width,
+            height,
+            *rectangle,
+            background,
+            background_luminance,
+        ) else {
             continue;
         };
         let target = if contrast_ratio(style.foreground, background) >= MINIMUM_DARK_LINK_CONTRAST {
@@ -3698,7 +3814,7 @@ fn apply_dark_mode_link_contrast(
                     continue;
                 };
                 let original = [pixel[0], pixel[1], pixel[2]];
-                if !is_blue_link_ink(original, background) {
+                if !is_blue_link_ink(original, background, background_luminance) {
                     continue;
                 }
                 let delta = [
@@ -3764,6 +3880,7 @@ fn darkest_blue_link_ink(
     height: u32,
     rectangle: PageLinkRect,
     background: [u8; 3],
+    background_luminance: f32,
 ) -> Option<[u8; 3]> {
     let left = rectangle.left.min(width);
     let right = rectangle.right.min(width);
@@ -3778,7 +3895,7 @@ fn darkest_blue_link_ink(
             let offset = row_start.checked_add(usize::try_from(x).ok()?.checked_mul(4)?)?;
             let pixel = rgba.get(offset..offset.checked_add(3)?)?;
             let pixel = [pixel[0], pixel[1], pixel[2]];
-            if !is_blue_link_ink(pixel, background) {
+            if !is_blue_link_ink(pixel, background, background_luminance) {
                 continue;
             }
             let distance = pixel
@@ -3795,9 +3912,9 @@ fn darkest_blue_link_ink(
     farthest
 }
 
-fn is_blue_link_ink(pixel: [u8; 3], background: [u8; 3]) -> bool {
+fn is_blue_link_ink(pixel: [u8; 3], background: [u8; 3], background_luminance: f32) -> bool {
     pixel[2].saturating_sub(pixel[0].max(pixel[1])) >= DARK_LINK_BLUE_DOMINANCE
-        && relative_luminance(pixel) > relative_luminance(background) + 0.005
+        && relative_luminance(pixel) > background_luminance + 0.005
         && pixel
             .iter()
             .zip(background)
@@ -3815,16 +3932,25 @@ fn contrast_ratio(first: [u8; 3], second: [u8; 3]) -> f32 {
     (lighter + 0.05) / (darker + 0.05)
 }
 
+fn srgb_linear_lut() -> &'static [f32; 256] {
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|channel| {
+            let channel = channel as f32 / 255.0;
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })
+}
+
 fn relative_luminance(color: [u8; 3]) -> f32 {
-    let linear = color.map(|channel| {
-        let channel = f32::from(channel) / 255.0;
-        if channel <= 0.04045 {
-            channel / 12.92
-        } else {
-            ((channel + 0.055) / 1.055).powf(2.4)
-        }
-    });
-    linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
+    let lut = srgb_linear_lut();
+    lut[usize::from(color[0])] * 0.2126
+        + lut[usize::from(color[1])] * 0.7152
+        + lut[usize::from(color[2])] * 0.0722
 }
 
 fn blend_highlight_rectangle(

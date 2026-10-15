@@ -136,6 +136,17 @@ impl InverseTask {
                 self.click.synctex
             }
         };
+        let discovered_snapshot =
+            if self.best_guess && self.source_snapshot.is_none() && self.inverse_search.is_none() {
+                self.editor
+                    .source_snapshot(&self.path, self.revision, &self.operation)?
+            } else {
+                None
+            };
+        let source_snapshot = self
+            .source_snapshot
+            .as_deref()
+            .or(discovered_snapshot.as_deref());
         let mut result = if let Some(endpoint) = &self.inverse_search {
             crate::typst::resolve_inverse(endpoint, self.revision.pdf, point, &self.operation)?
         } else {
@@ -145,7 +156,7 @@ impl InverseTask {
                 word,
                 self.radius,
                 &self.operation,
-                self.source_snapshot.as_deref(),
+                source_snapshot,
                 self.best_guess,
             )?
         };
@@ -177,7 +188,7 @@ impl InverseTask {
                 pdf: &self.path,
                 revision: self.revision.pdf,
                 document_revision: self.revision,
-                source_snapshot: self.source_snapshot.as_deref(),
+                source_snapshot,
                 warning: result.warning.as_deref(),
             }),
         )?;

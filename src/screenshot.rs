@@ -208,7 +208,7 @@ fn pixel_count(viewport: Viewport) -> io::Result<usize> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "viewport is too large"))
 }
 
-pub fn blank_overlay(viewport: Viewport) -> io::Result<Vec<u8>> {
+fn blank_overlay(viewport: Viewport) -> io::Result<Vec<u8>> {
     Ok(vec![0; pixel_count(viewport)?])
 }
 
@@ -324,11 +324,13 @@ fn decompress(frame: &Frame) -> io::Result<Vec<u8>> {
 fn compose(
     viewport: Viewport,
     pages: &[Page<'_>],
-    overlay: &[u8],
+    overlay: Option<&[u8]>,
     background: [u8; 3],
 ) -> io::Result<Vec<u8>> {
     let expected = pixel_count(viewport)?;
-    if overlay.len() != expected {
+    if let Some(overlay) = overlay
+        && overlay.len() != expected
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "overlay dimensions do not match viewport",
@@ -392,13 +394,15 @@ fn compose(
             }
         }
     }
-    for (dst, src) in output
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(overlay.as_chunks::<4>().0)
-    {
-        blend(dst, src);
+    if let Some(overlay) = overlay {
+        for (dst, src) in output
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(overlay.as_chunks::<4>().0)
+        {
+            blend(dst, src);
+        }
     }
     Ok(output)
 }
@@ -409,7 +413,7 @@ pub fn save(
     path: &Path,
     viewport: Viewport,
     pages: &[Page<'_>],
-    overlay: &[u8],
+    overlay: Option<&[u8]>,
     background: [u8; 3],
 ) -> io::Result<()> {
     if !path.is_absolute() {
@@ -554,7 +558,7 @@ mod tests {
                 placement,
                 row: 0,
             }],
-            &[0; 4 * 4 * 4],
+            Some(&[0; 4 * 4 * 4]),
             [0, 0, 0],
         )
         .unwrap();

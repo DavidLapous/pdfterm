@@ -30,7 +30,7 @@ pub struct Crop {
 }
 
 pub fn compress_rgba(rgba: &[u8]) -> io::Result<Vec<u8>> {
-    let mut compressor = ZlibEncoder::new(Vec::new(), Compression::fast());
+    let mut compressor = ZlibEncoder::new(Vec::with_capacity(rgba.len() / 16), Compression::fast());
     compressor.write_all(rgba)?;
     compressor.finish()
 }
@@ -65,11 +65,17 @@ pub fn transmit_compressed_rgba(
         ),
         None => String::new(),
     };
-    let encoded = STANDARD.encode(compressed_rgba);
-    let chunks = encoded.as_bytes().chunks(PAYLOAD_CHUNK_SIZE);
-    let chunk_count = chunks.len();
+    const RAW_CHUNK_SIZE: usize = (PAYLOAD_CHUNK_SIZE / 4) * 3;
+    let chunk_count = compressed_rgba.len().div_ceil(RAW_CHUNK_SIZE).max(1);
+    let mut encoded = [0u8; PAYLOAD_CHUNK_SIZE];
 
-    for (index, chunk) in chunks.enumerate() {
+    for index in 0..chunk_count {
+        let start = index * RAW_CHUNK_SIZE;
+        let end = (start + RAW_CHUNK_SIZE).min(compressed_rgba.len());
+        let chunk = &compressed_rgba[start..end];
+        let encoded_len = STANDARD
+            .encode_slice(chunk, &mut encoded)
+            .expect("chunk fits in base64 buffer");
         let more = u8::from(index + 1 < chunk_count);
         if index == 0 {
             write!(
@@ -86,7 +92,7 @@ pub fn transmit_compressed_rgba(
         } else {
             write!(output, "\x1b_Gq=2,m={more};")?;
         }
-        output.write_all(chunk)?;
+        output.write_all(&encoded[..encoded_len])?;
         output.write_all(b"\x1b\\")?;
     }
     output.flush()

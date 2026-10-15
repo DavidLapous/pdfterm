@@ -127,6 +127,66 @@ local function cached_text(document, path)
   return bytes, manifest
 end
 
+local function snapshot_request(document)
+  return { action = 'source_snapshot', pdf = document.pdf, document_revision = vim.deepcopy(document.revision) }
+end
+
+local function snapshot_query(request, callback)
+  local socket, delivered = require('pdfterm.socket'), 0
+  local path = directory .. '/snapshot.sock'
+  local close = socket.listen(path, function() delivered = delivered + 1 end,
+    callback ~= false and (callback or source.snapshot) or nil)
+  local done, failure, result = false
+  socket.request(path, vim.json.encode(request), function(error, connection_error, reply)
+    assert(not connection_error, tostring(error))
+    done, failure, result = true, error, reply
+  end, 3000)
+  local completed = vim.wait(4000, function() return done end, 5)
+  close()
+  assert(completed and delivered == 0, 'snapshot query failed to complete without navigation')
+  return failure, result
+end
+
+local function delayed_socket_dispatch(request, query, shutdown)
+  local socket, calls, queued = require('pdfterm.socket'), 0, {}
+  local path = directory .. '/delayed-snapshot.sock'
+  local close = socket.listen(path, function() calls = calls + 1 end, function()
+    calls = calls + 1
+    return nil
+  end)
+  local client, chunks, complete = assert(vim.uv.new_pipe(false)), {}, false
+  local schedule = vim.schedule
+  vim.schedule = function(callback) queued[#queued + 1] = callback end
+  client:connect(path, function(error)
+    assert(not error, tostring(error))
+    client:read_start(function(read_error, chunk)
+      assert(not read_error, tostring(read_error))
+      if chunk then chunks[#chunks + 1] = chunk
+      else complete = true; client:close() end
+    end)
+    client:write(vim.json.encode(request), function(write_error)
+      assert(not write_error, tostring(write_error))
+      client:shutdown(function(shutdown_error) assert(not shutdown_error, tostring(shutdown_error)) end)
+    end)
+  end)
+  local pending = vim.wait(1000, function() return #queued > 0 end, 5)
+  vim.wait(1100, function() return false end, 10)
+  vim.schedule = schedule
+  if shutdown then close() end
+  for _, callback in ipairs(queued) do callback() end
+  local completed = vim.wait(2000, function() return complete end, 5)
+  close()
+  if not client:is_closing() then client:close() end
+  assert(pending and completed, 'accepted EOF did not survive delayed main-loop dispatch')
+  assert(calls == (shutdown and 0 or 1), 'delayed socket request was lost or dispatched after shutdown')
+  if query and not shutdown then
+    local reply = vim.json.decode(table.concat(chunks))
+    assert(reply.ok == true and reply.source_snapshot == vim.NIL, vim.inspect(reply))
+  else
+    assert(#chunks == 0, 'ordinary inverse delivery unexpectedly replied')
+  end
+end
+
 if replay then
   local child_ok, child_failure = xpcall(function()
     if replay.mode == 'fifo' then
@@ -141,6 +201,15 @@ if replay then
       print('nonblocking FIFO source replay passed')
       return
     end
+    if replay.mode == 'legacy-snapshot' then
+      assert(source.snapshot(replay.info.pdf, replay.info.revision) == nil)
+      assert(source.ensure(replay.project, replay.info) == nil)
+      local query_error, query_reply = snapshot_query(snapshot_request(replay.info))
+      assert(not query_error and query_reply.source_snapshot == vim.NIL, tostring(query_error))
+      return
+    end
+    local query_error, query_reply = snapshot_query(snapshot_request(replay.info))
+    assert(not query_error and type(query_reply.source_snapshot) == 'string', tostring(query_error))
     vim.cmd.edit(vim.fn.fnameescape(replay.project.main))
     local buffer = api.nvim_get_current_buf()
     local document = assert(source.ensure(replay.project, replay.info))
@@ -340,6 +409,46 @@ local ok, failure = xpcall(function()
   local wrong_epoch = location(new_document, multiple.main, 1, 14)
   wrong_epoch.document_revision = sidecar_document.revision
   operational(function() source.inverse(wrong_epoch) end)
+  local query_error, query_reply
+  local before_query = {
+    buffer = api.nvim_get_current_buf(), cursor = api.nvim_win_get_cursor(0),
+    text = api.nvim_buf_get_lines(multiple_buffer, 0, -1, false),
+    tick = api.nvim_buf_get_changedtick(multiple_buffer), modified = vim.bo[multiple_buffer].modified,
+    disk = read_bytes(multiple.main), register = vim.fn.getreg('"'),
+  }
+  for _, selected in ipairs({ old_document, new_document, sidecar_document }) do
+    assert(source.snapshot(multiple.pdf, selected.revision) == selected.source_snapshot)
+    query_error, query_reply = snapshot_query(snapshot_request(selected))
+    assert(not query_error and query_reply.source_snapshot == selected.source_snapshot, tostring(query_error))
+  end
+  local unavailable = snapshot_request(sidecar_document)
+  unavailable.document_revision.companion[2].inode = unavailable.document_revision.companion[2].inode + 1
+  query_error, query_reply = snapshot_query(unavailable)
+  assert(not query_error and query_reply.source_snapshot == vim.NIL, tostring(query_error))
+  for _, invalidate in ipairs({
+    function(value) value.pdf = 'relative.pdf' end,
+    function(value) value.document_revision = nil end,
+    function(value) value.document_revision.companion = { 'invalid', value.document_revision.pdf } end,
+  }) do
+    local invalid = snapshot_request(sidecar_document)
+    invalidate(invalid)
+    query_error = snapshot_query(invalid)
+    assert(query_error == 'invalid source snapshot request', tostring(query_error))
+  end
+  query_error = snapshot_query(snapshot_request(sidecar_document), function() error('required authority failed') end)
+  assert(query_error and query_error:find('required authority failed', 1, true), tostring(query_error))
+  query_error = snapshot_query(snapshot_request(sidecar_document), false)
+  assert(query_error == 'source snapshot lookup is unavailable', tostring(query_error))
+  delayed_socket_dispatch({ file = multiple.main, line = 1, byte_column = 0 }, false, false)
+  delayed_socket_dispatch(snapshot_request(sidecar_document), true, false)
+  delayed_socket_dispatch(snapshot_request(sidecar_document), true, true)
+  assert(api.nvim_get_current_buf() == before_query.buffer
+    and vim.deep_equal(api.nvim_win_get_cursor(0), before_query.cursor)
+    and vim.deep_equal(api.nvim_buf_get_lines(multiple_buffer, 0, -1, false), before_query.text)
+    and api.nvim_buf_get_changedtick(multiple_buffer) == before_query.tick
+    and vim.bo[multiple_buffer].modified == before_query.modified
+    and read_bytes(multiple.main) == before_query.disk and vim.fn.getreg('"') == before_query.register,
+    'source snapshot lookup changed live editor state')
 
   -- Failed builds, unchanged output and superseded callbacks cannot rebase or
   -- overwrite previously published source bytes, even after saved edits.
@@ -409,8 +518,8 @@ local ok, failure = xpcall(function()
   no_map_info.warning = 'compiled source list unavailable: no SyncTeX sidecar'
   warned(source.forward(assert(source.publish(no_map_capture, no_map_info)), scoped_buffer, 0, 12))
 
-  -- A pre-existing PDF without a captured build uses the warm pre-write disk
-  -- baseline, never the newly saved file disguised as historical compiler text.
+  -- External builds have no captured authority: ordinary saved-source guessing
+  -- must not create an unverified snapshot that suppresses word refinement.
   local unknown = { main = directory .. '/unknown.tex', pdf = directory .. '/unknown.pdf', cwd = directory }
   vim.fn.writefile({ 'Old needle context' }, unknown.main)
   pdf_fixture(unknown.pdf)
@@ -418,14 +527,16 @@ local ok, failure = xpcall(function()
   local unknown_buffer = api.nvim_get_current_buf()
   api.nvim_buf_set_text(unknown_buffer, 0, 0, 0, 0, { 'New ' })
   vim.cmd.write()
-  local unknown_document = assert(source.ensure(unknown, info(unknown)))
-  warned(source.forward(unknown_document, unknown_buffer, 0, 8))
-  text, manifest = cached_text(unknown_document, unknown.main)
-  assert(text == 'Old needle context\n' and manifest.warnings[unknown.main])
+  assert(source.snapshot(unknown.pdf, info(unknown).revision) == nil)
+  query_error, query_reply = snapshot_query(snapshot_request(info(unknown)))
+  assert(not query_error and query_reply.source_snapshot == vim.NIL, tostring(query_error))
+  assert(source.ensure(unknown, info(unknown)) == nil)
   api.nvim_buf_set_text(unknown_buffer, 0, 0, 0, 0, { 'Another ' })
   vim.cmd.write()
+  assert(source.ensure(unknown, info(unknown)) == nil)
+  local unknown_document = finish(unknown, source.capture(unknown, { unknown.main }))
   assert(source.ensure(unknown, info(unknown)) == unknown_document)
-  assert(cached_text(unknown_document, unknown.main) == 'Old needle context\n')
+  assert(cached_text(unknown_document, unknown.main) == 'Another New Old needle context\n')
 
   -- Excluded inverse inputs and missing metadata remain explicit best guesses.
   local orphan = directory .. '/orphan.tex'
@@ -440,7 +551,7 @@ local ok, failure = xpcall(function()
   local no_sidecar_info = info(no_sidecar, {})
   no_sidecar_info.main = vim.NIL
   no_sidecar_info.warning = 'compiled source list unavailable: no SyncTeX sidecar'
-  warned(source.forward(assert(source.ensure(no_sidecar, no_sidecar_info)), api.nvim_get_current_buf(), 0, 2))
+  assert(source.ensure(no_sidecar, no_sidecar_info) == nil)
   local all_deleted, all_buffer, all_document = fresh('all-deleted', { 'First target', 'Second target' })
   api.nvim_buf_set_lines(all_buffer, 0, -1, false, {})
   inverse = warned(source.inverse(location(all_document, all_deleted.main, 2, 3)))
@@ -462,20 +573,32 @@ local ok, failure = xpcall(function()
   local authority_location = location(unknown_document, unknown.main, 1, 0)
   -- The same warm anchor can back later revisions. Each selected entry must
   -- still validate its own cache, not the last cache attached to that anchor.
-  vim.fn.writefile({ '% shared source revision' }, unknown.pdf, 'a')
-  local shared_document = assert(source.ensure(unknown, info(unknown)))
+  local shared_document = finish(unknown, source.capture(unknown, { unknown.main }))
   assert(shared_document.source_snapshot ~= unknown_document.source_snapshot)
   local implicit_authority = implicit_location(unknown_document, unknown.main, 1, 0)
-  assert(warned(source.inverse(implicit_authority)).buffer == unknown_buffer)
+  assert(source.inverse(implicit_authority).buffer == unknown_buffer)
+  local source_alias = directory .. '/unknown-alias.tex'
+  assert(vim.uv.fs_symlink(unknown.main, source_alias))
+  local alias_inverse = source.inverse(location(unknown_document, source_alias, 1, 0))
+  assert(alias_inverse.buffer == unknown_buffer and alias_inverse.file == unknown.main and alias_inverse.warning == nil)
   local manifest_backup = unknown_document.source_snapshot .. '.saved'
   assert(vim.uv.fs_rename(unknown_document.source_snapshot, manifest_backup))
   local explicit_error = operational(function() source.inverse(authority_location) end)
   assert(operational(function() source.inverse(implicit_authority) end) == explicit_error)
+  query_error = snapshot_query(snapshot_request(unknown_document))
+  assert(query_error and query_error:find('source snapshot manifest is not a regular file', 1, true),
+    tostring(query_error))
   operational(function() source.forward(unknown_document, unknown_buffer, 0, 0) end)
   local missing_identity = vim.deepcopy(implicit_authority)
   missing_identity.document_revision = nil
   assert(warned(source.inverse(missing_identity)).buffer == unknown_buffer)
   assert(vim.uv.fs_rename(manifest_backup, unknown_document.source_snapshot))
+  local manifest_bytes = read_bytes(unknown_document.source_snapshot)
+  write_bytes(unknown_document.source_snapshot, '{')
+  query_error = snapshot_query(snapshot_request(unknown_document))
+  assert(query_error and query_error:find('source snapshot manifest changed after publication', 1, true),
+    tostring(query_error))
+  write_bytes(unknown_document.source_snapshot, manifest_bytes)
   local cache_text, cache_manifest = cached_text(unknown_document, unknown.main)
   local cache_file = vim.fs.dirname(unknown_document.source_snapshot) .. '/' .. cache_manifest.files[unknown.main]
   local cache_backup = cache_file .. '.saved'
@@ -496,13 +619,13 @@ local ok, failure = xpcall(function()
   operational(function() source.forward(unknown_document, unknown_buffer, 0, 0) end,
     'cached source changed after publication')
   write_bytes(cache_file, cache_text)
-  assert(warned(source.inverse(implicit_authority)).buffer == unknown_buffer)
+  assert(source.inverse(implicit_authority).buffer == unknown_buffer)
   local shared_text, shared_manifest = cached_text(shared_document, unknown.main)
   local shared_file = vim.fs.dirname(shared_document.source_snapshot) .. '/' .. shared_manifest.files[unknown.main]
   write_bytes(shared_file, changed_cache_text)
   operational(function() source.inverse(implicit_location(shared_document, unknown.main, 1, 0)) end,
     'cached source changed after publication')
-  assert(warned(source.inverse(implicit_authority)).buffer == unknown_buffer)
+  assert(source.inverse(implicit_authority).buffer == unknown_buffer)
   write_bytes(shared_file, shared_text)
   local invalid_digests = {
     function(value) value.digests = nil end,
@@ -526,12 +649,12 @@ local ok, failure = xpcall(function()
     query.source_snapshot = path
     operational(function() source.inverse(query) end)
   end
-  assert(warned(source.inverse(implicit_authority)).buffer == unknown_buffer)
+  assert(source.inverse(implicit_authority).buffer == unknown_buffer)
   local cache_directory_link = directory .. '/snapshot-directory-link'
   assert(vim.uv.fs_symlink(vim.fs.dirname(unknown_document.source_snapshot), cache_directory_link))
   local directory_alias_location = location(unknown_document, unknown.main, 1, 0)
   directory_alias_location.source_snapshot = cache_directory_link .. '/manifest.json'
-  assert(warned(source.inverse(directory_alias_location)).buffer == unknown_buffer)
+  assert(source.inverse(directory_alias_location).buffer == unknown_buffer)
   local first_output = directory .. '/real-first-output'
   local linked_output = directory .. '/linked-first-output'
   vim.fn.mkdir(first_output)
@@ -577,6 +700,18 @@ local ok, failure = xpcall(function()
     }):wait(10000)
     assert(cold_result.code == 0, (cold_result.stderr or '') .. (cold_result.stdout or ''))
   end
+  local legacy_manifest = vim.json.decode(manifest_bytes)
+  legacy_manifest.warnings[unknown.main] = 'compiled source baseline is unverified; external build'
+  write_bytes(unknown_document.source_snapshot, vim.json.encode(legacy_manifest))
+  local legacy_info = info(unknown)
+  legacy_info.revision = unknown_document.revision
+  local legacy_result = vim.system({ vim.v.progpath, '--headless', '-u', 'NONE', '-l', root .. '/tests/nvim_source.lua' }, {
+    cwd = root, text = true, env = { PDFTERM_SOURCE_CACHE_REPLAY = vim.json.encode({
+      mode = 'legacy-snapshot', directory = directory, project = unknown, info = legacy_info,
+    }) },
+  }):wait(10000)
+  write_bytes(unknown_document.source_snapshot, manifest_bytes)
+  assert(legacy_result.code == 0, (legacy_result.stderr or '') .. (legacy_result.stdout or ''))
   print('source anchor regressions passed: inline/line shifts, insert/replace/delete, undo/redo, UTF-8, reload/unload/rename, PDF/revision identity, compiler races, immutable cache, unknown inputs')
 end, debug.traceback)
 

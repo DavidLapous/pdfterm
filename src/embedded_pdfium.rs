@@ -2,11 +2,13 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PDFIUM_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/", env!("PDFIUM_LIBRARY_NAME")));
 const PDFIUM_REVISION: &str = env!("PDFIUM_REVISION");
 const PDFIUM_LIBRARY_NAME: &str = env!("PDFIUM_LIBRARY_NAME");
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn materialize() -> io::Result<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
@@ -36,7 +38,11 @@ fn materialize_in(cache_root: &Path) -> io::Result<PathBuf> {
     if verified_file(&library)? {
         return Ok(library);
     }
-    let temporary = directory.join(format!(".{PDFIUM_LIBRARY_NAME}.{}.tmp", std::process::id()));
+    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".{PDFIUM_LIBRARY_NAME}.{}.{id}.tmp",
+        std::process::id()
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

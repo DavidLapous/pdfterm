@@ -2,6 +2,7 @@
 local M = {}
 local MAX_SOURCE, MAX_MANIFEST, MAX_WARNING = 2 * 1024 * 1024, 4 * 1024 * 1024, 4096
 local documents, manifests, latest, pending, warm, tracked, buffers = {}, {}, {}, {}, {}, {}, {}
+local parsed_by_digest, parsed_count = {}, 0
 local serial, installed = 0, false
 local namespace_prefix = 'pdfterm.source.' .. tostring(vim.uv.hrtime()) .. '.'
 
@@ -158,6 +159,13 @@ local function saved_revision(stat)
     changed_seconds = stat.ctime.sec, changed_nanoseconds = stat.ctime.nsec }
 end
 
+local function same_stat(first, second)
+  return first ~= nil and second ~= nil
+    and first.dev == second.dev and first.ino == second.ino and first.size == second.size
+    and first.mtime.sec == second.mtime.sec and first.mtime.nsec == second.mtime.nsec
+    and first.ctime.sec == second.ctime.sec and first.ctime.nsec == second.ctime.nsec
+end
+
 local function read_bytes(path, bound, no_follow)
   local fd, reason = vim.uv.fs_open(path, open_flags(no_follow), 0)
   if not fd then return nil, reason end
@@ -170,7 +178,7 @@ local function read_bytes(path, bound, no_follow)
   local closed, close_error = vim.uv.fs_close(fd)
   if not closed then return nil, close_error end
   if not bytes then return nil, reason end
-  if #bytes ~= stat.size or stable(saved_revision(stat)) ~= stable(saved_revision(after)) then
+  if #bytes ~= stat.size or not same_stat(stat, after) then
     return nil, 'file changed while reading'
   end
   return bytes, nil, saved_revision(stat)
@@ -240,10 +248,19 @@ local function lines_for(source)
   if source.lines then return source.lines end
   local bytes, reason = contents(source)
   assert(bytes, 'pdfterm: could not read captured source: ' .. tostring(reason))
+  local cached = source.digest and parsed_by_digest[source.digest]
+  if cached then
+    source.lines, source.starts = cached.lines, cached.starts
+    return source.lines
+  end
   source.lines, source.starts = split_lines(bytes), {}
   local offset = 0
   for index, line in ipairs(source.lines) do
     source.starts[index], offset = offset, offset + #line + 1
+  end
+  if source.digest then
+    if parsed_count >= 64 then parsed_by_digest, parsed_count = {}, 0 end
+    parsed_by_digest[source.digest], parsed_count = { lines = source.lines, starts = source.starts }, parsed_count + 1
   end
   return source.lines
 end
@@ -706,6 +723,17 @@ function M.publish(capture, info)
   return document
 end
 
+local function captured_document(document)
+  if document then
+    for _, entry in pairs(document.files) do
+      if entry.warning and entry.warning:find('compiled source baseline is unverified', 1, true) == 1 then
+        return nil
+      end
+    end
+  end
+  return document
+end
+
 function M.ensure(project, info)
   metadata(info)
   local pdf = assert(absolute(info.pdf, info.cwd), 'pdfterm: missing source metadata PDF')
@@ -718,23 +746,11 @@ function M.ensure(project, info)
     if vim.uv.fs_stat(vim.fs.dirname(path)) then
       document = load_document(path, pdf, info.revision)
     else
-      local sources, warnings = {}, {}
-      for original in pairs(input_paths(project, info)) do
-        local source = warm[original]
-        local read_error
-        if not source then
-          local text
-          text, read_error = source_bytes(original)
-          if text then source = new_source(original, text, source_buffer(original)) end
-        end
-        warnings[original] = warning('compiled source baseline is unverified; using a best-guess source anchor', info.warning)
-        if source then sources[original] = source
-        else warnings[original] = warning(warnings[original], read_error) end
-      end
-      if not next(sources) then return nil end
-      document = persist(project, info, sources, warnings)
+      return nil
     end
   end
+  document = captured_document(document)
+  if not document then return nil end
   if not next(document.files) then return nil end
   latest[pdf] = document
   return document
@@ -771,13 +787,17 @@ local function unchanged_anchor(source, mark)
 end
 
 local function source_for(document, buffer)
-  for _, path in ipairs(sorted_keys(document.files)) do
-    local entry = document.files[path]
-    if entry.source.buffer == buffer then attach(entry.source, buffer); return path, entry end
-  end
   local path = absolute(vim.api.nvim_buf_get_name(buffer), nil, true)
-  local entry = document.files[path]
-  if entry and attach(entry.source, buffer) then return path, entry end
+  local direct = path and document.files[path]
+  if direct and direct.source.buffer == buffer then
+    attach(direct.source, buffer)
+    return path, direct
+  end
+  for _, key in ipairs(sorted_keys(document.files)) do
+    local entry = document.files[key]
+    if entry.source.buffer == buffer then attach(entry.source, buffer); return key, entry end
+  end
+  if direct and attach(direct.source, buffer) then return path, direct end
 end
 
 local function default_entry(document)
@@ -884,6 +904,27 @@ local function approximate_inverse(location, reason, source)
     warning = warning(location.warning, reason) }
 end
 
+local function matching_document(pdf, full_revision)
+  pdf = absolute(pdf)
+  if not pdf or type(full_revision) ~= 'table' or type(full_revision.pdf) ~= 'table' then return nil end
+  local key = document_key(pdf, full_revision)
+  local known = documents[key]
+  local path = known and known.source_snapshot
+  if not path then
+    local root = absolute(vim.fn.stdpath('cache') .. '/pdfterm/sources', nil, true)
+    local candidate = root .. '/' .. key .. '/manifest.json'
+    local stat, reason, code = vim.uv.fs_lstat(vim.fs.dirname(candidate))
+    assert(stat or code == 'ENOENT', 'pdfterm: source snapshot lookup failed: ' .. tostring(reason))
+    if stat then path = candidate end
+  end
+  if path then return captured_document(load_document(path, pdf, full_revision)) end
+end
+
+function M.snapshot(pdf, full_revision)
+  local document = matching_document(pdf, full_revision)
+  return document and next(document.files) and document.source_snapshot or nil
+end
+
 function M.inverse(location)
   assert(type(location) == 'table' and absolute(location.file), 'pdfterm: invalid inverse source location')
   local explicit = location.source_snapshot ~= nil and location.source_snapshot ~= vim.NIL
@@ -894,19 +935,16 @@ function M.inverse(location)
   local pdf = absolute(location.pdf)
   local full_revision = location.document_revision ~= vim.NIL and location.document_revision or nil
   local document
-  if not snapshot and pdf and type(full_revision) == 'table' and type(full_revision.pdf) == 'table' then
-    local key = document_key(pdf, full_revision)
-    document = documents[key]
-    if document then snapshot = document.source_snapshot
-    else
-      local root = absolute(vim.fn.stdpath('cache') .. '/pdfterm/sources', nil, true)
-      local candidate = root .. '/' .. key .. '/manifest.json'
-      if vim.uv.fs_lstat(vim.fs.dirname(candidate)) then snapshot = candidate end
-    end
-  end
-  if snapshot then document = load_document(snapshot, pdf, full_revision) end
+  if snapshot then document = load_document(snapshot, pdf, full_revision)
+  else document = matching_document(pdf, full_revision) end
   local original = document and absolute(location.file, document.cwd)
   local entry = document and document.files[original]
+  if document and not entry then
+    local resolved = absolute(location.file, document.cwd, true)
+    if resolved and document.files[resolved] then
+      original, entry = resolved, document.files[resolved]
+    end
+  end
   local main
   if document and not entry then main = select(2, default_entry(document)) end
   local selected = entry or main

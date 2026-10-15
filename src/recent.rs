@@ -1,8 +1,12 @@
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_RECENTS: usize = 50;
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Loads the recently opened documents, most-recent first. Returns an empty
 /// list when no history file exists or it cannot be read.
@@ -23,19 +27,41 @@ pub fn load() -> Vec<PathBuf> {
 /// front of the history and capping the list. Failures are ignored so history
 /// never blocks opening a document.
 pub fn record(path: &Path) {
+    if path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        return;
+    }
     let Some(store) = recent_path() else {
         return;
     };
     let entries = promote(load(), path, MAX_RECENTS);
-    if let Some(parent) = store.parent() {
-        let _ = fs::create_dir_all(parent);
+    let Some(parent) = store.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
     }
     let contents = entries
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("\n");
-    let _ = fs::write(&store, contents);
+    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".recent.{}.{id}.tmp", std::process::id()));
+    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&temp) else {
+        return;
+    };
+    if file.write_all(contents.as_bytes()).is_ok() {
+        drop(file);
+        let _ = fs::rename(&temp, &store);
+    } else {
+        drop(file);
+    }
+    let _ = fs::remove_file(&temp);
 }
 
 /// Moves `path` to the front of `entries`, removing any earlier occurrence and

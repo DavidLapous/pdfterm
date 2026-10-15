@@ -258,7 +258,14 @@ impl ForwardReply {
         };
         // Poll the WRITE side: on macOS, a read-side HUP also occurs for the
         // normal request half-close, and events=0 does not report peer closure.
-        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        let result = loop {
+            descriptor.revents = 0;
+            let rc = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break rc;
+        };
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -304,12 +311,12 @@ impl Drop for ForwardReply {
     }
 }
 
-fn request_reply(
+pub(crate) fn exchange<T: serde::de::DeserializeOwned>(
     socket: &str,
     bytes: &[u8],
     kind: &str,
     operation: &crate::process::Operation,
-) -> io::Result<()> {
+) -> io::Result<T> {
     let mut stream = connect(socket, operation)?;
     send(&mut stream, bytes, operation)?;
     let mut response = [0; 4097];
@@ -341,8 +348,18 @@ fn request_reply(
     if length > 4096 {
         return Err(io::Error::other(format!("{kind} reply exceeds 4096 bytes")));
     }
-    let reply: Reply = serde_json::from_str(response)?;
+    let reply = serde_json::from_str(response)?;
     operation.check()?;
+    Ok(reply)
+}
+
+fn request_reply(
+    socket: &str,
+    bytes: &[u8],
+    kind: &str,
+    operation: &crate::process::Operation,
+) -> io::Result<()> {
+    let reply: Reply = exchange(socket, bytes, kind, operation)?;
     if reply.ok {
         Ok(())
     } else {
@@ -386,6 +403,9 @@ pub fn screenshot(socket: &str, path: &Path) -> io::Result<()> {
     )
 }
 
+// JSON escaping and path/word metadata need room beyond the 4096-byte warning.
+const MAX_VIEWER_REQUEST_BYTES: usize = 64 * 1024;
+
 /// Incremental request reads. A slow client never sleeps on the event thread.
 struct Incoming {
     stream: UnixStream,
@@ -404,10 +424,10 @@ impl Incoming {
                     );
                 }
                 Ok(n) => {
-                    if self.bytes.len() + n > 4096 {
+                    if self.bytes.len() + n > MAX_VIEWER_REQUEST_BYTES {
                         return Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "viewer request exceeds 4096 bytes",
+                            format!("viewer request exceeds {MAX_VIEWER_REQUEST_BYTES} bytes"),
                         )));
                     }
                     self.bytes.extend_from_slice(&buffer[..n]);
@@ -601,6 +621,10 @@ mod tests {
 
         let (client, server) = UnixStream::pair().unwrap();
         let reply = ForwardReply::new(server);
+        // Shut down the socket before dropping so concurrent test threads that
+        // fork() during the non-atomic socketpair()+FIOCLEX window on macOS
+        // cannot hold the peer open and delay POLLHUP.
+        let _ = client.shutdown(Shutdown::Both);
         drop(client);
         assert!(reply.disconnected().unwrap());
     }
@@ -657,6 +681,74 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "replacement");
     }
 
+    fn poll_viewer_request(
+        listener: &mut ForwardListener,
+    ) -> (io::Result<ViewerRequest>, ForwardReply) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut ready = listener.poll().unwrap();
+            if !ready.is_empty() {
+                assert_eq!(ready.len(), 1);
+                return ready.pop().unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "viewer request was not dispatched"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn maximum_warning_forward_requests_dispatch_and_acknowledge() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("private/forward.sock");
+        let mut listener = ForwardListener::bind(&socket).unwrap();
+        let pdf = root.path().join("document.pdf");
+        fs::write(&pdf, b"revision fixture").unwrap();
+        for warning in [
+            "w".repeat(crate::source_snapshot::MAX_WARNING_BYTES),
+            "\"\\".repeat(crate::source_snapshot::MAX_WARNING_BYTES / 2),
+        ] {
+            let request = ForwardRequest {
+                revision: crate::synctex::PdfRevision::read(&pdf).unwrap(),
+                pdf: pdf.clone(),
+                page: 1,
+                h: 10.0,
+                v: 20.0,
+                width: 5.0,
+                height: 5.0,
+                word: Some(crate::synctex::ForwardWord {
+                    words: vec!["w".repeat(128); 7],
+                    selected: 3,
+                }),
+                inverse_search: Some(
+                    root.path()
+                        .join("private/inverse.sock")
+                        .display()
+                        .to_string(),
+                ),
+                source_snapshot: Some(root.path().join("snapshot/quoted\"\\manifest.json")),
+                best_guess: true,
+                warning: Some(warning),
+            };
+            request.validate().unwrap();
+            let payload = serde_json::to_vec(&request).unwrap();
+            assert!(payload.len() > 4096);
+            assert!(payload.len() <= MAX_VIEWER_REQUEST_BYTES);
+            let socket = socket.clone();
+            let expected = serde_json::to_value(&request).unwrap();
+            let client = std::thread::spawn(move || forward(socket.to_str().unwrap(), &request));
+            let (received, mut reply) = poll_viewer_request(&mut listener);
+            let ViewerRequest::Forward(received) = received.unwrap() else {
+                panic!("forward request was not dispatched");
+            };
+            assert_eq!(serde_json::to_value(received).unwrap(), expected);
+            reply.finish(None);
+            client.join().unwrap().unwrap();
+        }
+    }
+
     #[test]
     fn incomplete_clients_do_not_block_complete_requests_or_future_connections() {
         let root = tempfile::tempdir().unwrap();
@@ -678,18 +770,20 @@ mod tests {
             expired[0].0.as_ref().unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
-        let mut next = UnixStream::connect(&path).unwrap();
-        next.write_all(&vec![b'x'; 4097]).unwrap();
-        drop(next); // Also exercises a full peer close before acceptance on macOS.
-        let oversized = listener.poll().unwrap();
-        assert_eq!(oversized.len(), 1);
-        assert!(
-            oversized[0]
-                .0
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("4096")
+        let next = UnixStream::connect(&path).unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut next = next;
+            next.write_all(&vec![b'x'; MAX_VIEWER_REQUEST_BYTES + 1])
+                .unwrap();
+            drop(next); // Also exercises a full peer close on macOS.
+        });
+        let (oversized, _) = poll_viewer_request(&mut listener);
+        writer.join().unwrap();
+        let error = oversized.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!("viewer request exceeds {MAX_VIEWER_REQUEST_BYTES} bytes")
         );
     }
 

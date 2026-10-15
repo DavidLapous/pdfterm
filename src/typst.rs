@@ -6,7 +6,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read},
-    os::unix::fs::{FileTypeExt, MetadataExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, MetadataExt},
+    },
     path::Path,
     time::Duration,
 };
@@ -70,7 +73,13 @@ pub(crate) fn resolve_inverse(
                 response.extend_from_slice(&buffer[..count]);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2));
+                let timeout = operation.remaining()?.min(Duration::from_millis(20));
+                let mut descriptor = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis().max(1) as i32) };
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),

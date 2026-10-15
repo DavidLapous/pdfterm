@@ -8,4 +8,5 @@ __pycache__/
 /review.md
 /next_steps.md
 /invariants/
-
+.ruff_cache/
+/.nvim-*/

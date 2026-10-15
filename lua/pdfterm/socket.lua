@@ -212,7 +212,7 @@ local function document_context(location)
   )
 end
 
-function M.listen(path, on_location)
+function M.listen(path, on_location, on_snapshot)
   local parent = assert(vim.uv.fs_lstat(vim.fs.dirname(path)))
   assert(
     parent.type == 'directory' and parent.uid == vim.uv.getuid() and bit.band(parent.mode, 63) == 0,
@@ -229,8 +229,9 @@ function M.listen(path, on_location)
     server:close()
     error('pdfterm: cannot identify socket: ' .. tostring(stat_error))
   end
-  local clients, count = {}, 0
+  local clients, count, closed = {}, 0, false
   local function close()
+    closed = true
     for finish in pairs(clients) do
       finish('editor stopped')
     end
@@ -255,35 +256,85 @@ function M.listen(path, on_location)
       return
     end
     local client = assert(vim.uv.new_pipe(false))
-    server:accept(client)
-    if count >= 16 then
+    if not server:accept(client) or count >= 16 then
       client:close()
       return
     end
     count = count + 1
     local timer = assert(vim.uv.new_timer())
-    local chunks, size = {}, 0
-    local finish
-    finish = function(message, deliver)
-      if client:is_closing() then
-        return
-      end
+    local chunks, size, done, responding = {}, 0, false, false
+    local function finish(message)
+      if done then return end
+      done = true
       clients[finish] = nil
       count = count - 1
       timer:stop()
       timer:close()
-      client:close()
-      vim.schedule(function()
-        if message then
+      if not client:is_closing() then client:close() end
+      if message and not (closed and message == 'editor stopped') then
+        vim.schedule(function()
           vim.notify('pdfterm inverse search: ' .. message, vim.log.levels.ERROR)
-        elseif deliver and size > 0 then
+        end)
+      end
+    end
+    local function reply(value)
+      if done or responding then return end
+      responding = true
+      client:read_stop()
+      local encoded, bytes = pcall(vim.json.encode, value)
+      if not encoded or #bytes > 4096 then
+        bytes = vim.json.encode({ ok = false, error = encoded
+          and 'source snapshot reply exceeds 4096 bytes' or 'source snapshot reply is not valid JSON' })
+      end
+      timer:start(1000, 0, function() finish('reply timed out') end)
+      local sent, write_error = client:write(bytes, function(error) finish(error) end)
+      if not sent then finish(write_error) end
+    end
+    clients[finish] = true
+    timer:start(1000, 0, function()
+      reply({ ok = false, error = 'request timed out' })
+    end)
+    client:read_start(function(read_error, chunk)
+      if done or responding then return end
+      if read_error then
+        finish(read_error)
+      elseif not chunk then
+        -- Complete input must survive a busy main loop without a read timeout.
+        timer:stop()
+        client:read_stop()
+        vim.schedule(function()
+          if done or closed or responding then return end
+          if size == 0 then finish(); return end
           local decoded, location = pcall(vim.json.decode, table.concat(chunks))
+          if not decoded or type(location) ~= 'table' then
+            reply({ ok = false, error = 'invalid inverse-search JSON request' })
+            vim.notify('pdfterm: invalid inverse-search JSON location', vim.log.levels.ERROR)
+            return
+          end
+          if location.action ~= nil then
+            local document = location.document_revision
+            if location.action ~= 'source_snapshot' or type(document) ~= 'table'
+              or not document_context({ pdf = location.pdf, document_revision = document, revision = document.pdf }) then
+              reply({ ok = false, error = 'invalid source snapshot request' })
+              return
+            end
+            if not on_snapshot then
+              reply({ ok = false, error = 'source snapshot lookup is unavailable' })
+              return
+            end
+            local call_ok, snapshot = pcall(on_snapshot, location.pdf, document)
+            if not call_ok then
+              reply({ ok = false, error = tostring(snapshot) })
+            elseif snapshot ~= nil and not absolute_path(snapshot) then
+              reply({ ok = false, error = 'source snapshot lookup returned an invalid path' })
+            else
+              reply({ ok = true, source_snapshot = snapshot or vim.NIL })
+            end
+            return
+          end
+          finish()
           if
-            not decoded
-            or type(location) ~= 'table'
-            or type(location.file) ~= 'string'
-            or location.file:sub(1, 1) ~= '/'
-            or location.file:find('%z')
+            not absolute_path(location.file)
             or type(location.line) ~= 'number'
             or location.line < 1
             or location.line % 1 ~= 0
@@ -294,24 +345,16 @@ function M.listen(path, on_location)
           then
             vim.notify('pdfterm: invalid inverse-search JSON location', vim.log.levels.ERROR)
           else
-            on_location(location)
+            local call_ok, call_error = pcall(on_location, location)
+            if not call_ok then
+              vim.notify('pdfterm: ' .. tostring(call_error), vim.log.levels.ERROR)
+            end
           end
-        end
-      end)
-    end
-    clients[finish] = true
-    timer:start(1000, 0, function()
-      finish('request timed out')
-    end)
-    client:read_start(function(read_error, chunk)
-      if read_error then
-        finish(read_error)
-      elseif not chunk then
-        finish(nil, true)
+        end)
       else
         size = size + #chunk
         if size > 16384 then
-          finish('request exceeds 16384 bytes')
+          reply({ ok = false, error = 'request exceeds 16384 bytes' })
         else
           chunks[#chunks + 1] = chunk
         end

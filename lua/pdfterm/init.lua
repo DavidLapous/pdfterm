@@ -19,8 +19,66 @@ local function remote_session()
     and (vim.env.PDFTERM_LAUNCH_SOCKET or '') == ''
 end
 
-local function notify(message)
-  vim.notify('pdfterm: ' .. tostring(message), vim.log.levels.ERROR)
+local function log_path()
+  local path = (options or setup_options) and (options or setup_options).log_file
+  if path == vim.NIL or not path or path == '' then
+    return nil
+  end
+  local home = vim.uv.os_homedir() or vim.env.HOME or '~'
+  if path == '~' then
+    return home
+  elseif path:sub(1, 2) == '~/' then
+    return home .. path:sub(2)
+  end
+  return path
+end
+
+local function log_entry(level, message, context)
+  local path = log_path()
+  if not path then
+    return
+  end
+  local timestamp = os.date('%Y-%m-%d %H:%M:%S')
+  local line
+  if context and context ~= '' then
+    line = string.format('[%s] [%s] [%s] %s\n', timestamp, level, context, message)
+  else
+    line = string.format('[%s] [%s] %s\n', timestamp, level, message)
+  end
+  local ok, failure = pcall(function()
+    local dir = vim.fs.dirname(path)
+    if dir and dir ~= '' and vim.fn.isdirectory(dir) == 0 then
+      assert(vim.fn.mkdir(dir, 'p') == 1, 'cannot create log directory ' .. dir)
+    end
+    local file = assert(io.open(path, 'a'))
+    local written, write_error = file:write(line)
+    local closed, close_error = file:close()
+    assert(written, write_error)
+    assert(closed, close_error)
+  end)
+  if not ok then
+    -- Logging failures must not recurse through notify(), which writes this log.
+    vim.notify('pdfterm: cannot append log ' .. path .. ': ' .. tostring(failure), vim.log.levels.ERROR)
+  end
+end
+
+M.log_path = log_path
+M.log_entry = log_entry
+
+local function notify(message, context)
+  local text = message and tostring(message):gsub('%c', ' ') or ''
+  if text ~= '' then
+    log_entry('ERROR', text, context)
+    vim.notify('pdfterm: ' .. text, vim.log.levels.ERROR)
+  end
+end
+
+local function warn(message, context)
+  local text = message and tostring(message):gsub('%c', ' ') or ''
+  if text ~= '' then
+    log_entry('WARN', text, context)
+    vim.notify('pdfterm: ' .. text, vim.log.levels.WARN)
+  end
 end
 local function alive(id)
   return not exiting and project.current(id)
@@ -86,7 +144,8 @@ local function with_document(p, id, callback)
     p.main = p.main or info.main
     local ok, document = pcall(anchors.ensure, p, info)
     if not ok then notify(document); return end
-    callback(document)
+    local call_ok, call_error = pcall(callback, document)
+    if not call_ok then notify(call_error) end
   end)
 end
 
@@ -104,7 +163,10 @@ end
 
 local function warnings(...)
   local message = warning_text(...)
-  if message then vim.notify('pdfterm: ' .. message, vim.log.levels.WARN) end
+  if message then
+    warn(message)
+  end
+  return message
 end
 local function save_buffer(buffer)
   if vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer) then
@@ -116,28 +178,35 @@ end
 
 local function current_source(buffer)
   if vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer) then
-    return table.concat(vim.api.nvim_buf_get_lines(buffer, 0, 20, false), '\n')
+    return table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), '\n')
   end
 end
 
 local function with_saved_project(buffer, file, id, callback, header)
   if not alive(id) then return end
-  local text = current_source(buffer) or header
+  local tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
+  local text = header or current_source(buffer)
   local p = describe(file, text)
   -- Preserve the selected PDF's old source history before writing any live edits.
   local function saved(document)
     if not alive(id) then return end
-    local updated = current_source(buffer)
-    if updated ~= nil and updated ~= text then
-      with_saved_project(buffer, file, id, callback, updated)
-      return
+    local current_tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
+    if current_tick ~= tick then
+      local updated = current_source(buffer)
+      if updated ~= nil and updated ~= text then
+        with_saved_project(buffer, file, id, callback, updated)
+        return
+      end
     end
     save_buffer(buffer)
     if not alive(id) then return end
-    updated = current_source(buffer)
-    if updated ~= nil and updated ~= text then
-      assert(describe(file, updated).main == p.main,
-        'pdfterm: source root changed while saving; repeat the command')
+    local after_tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
+    if after_tick ~= current_tick then
+      local updated = current_source(buffer)
+      if updated ~= nil and updated ~= text then
+        assert(describe(file, updated).main == p.main,
+          'pdfterm: source root changed while saving; repeat the command')
+      end
     end
     callback(p, document)
   end
@@ -166,9 +235,27 @@ local function inverse(location)
   local line = math.max(1, math.min(mapped.line, vim.api.nvim_buf_line_count(0)))
   local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ''
   vim.api.nvim_win_set_cursor(0, { line, math.min(mapped.byte_column, #text) })
-  warnings(location.warning, mapped.warning)
+  local total_lines = vim.api.nvim_buf_line_count(0)
+  local boundary_warn = (mapped.line < 1 or mapped.line > total_lines)
+    and string.format('inverse target line %d is outside buffer bounds (1..%d)', mapped.line, total_lines)
+    or nil
+  local warn_msg = warning_text(location.warning, mapped.warning, boundary_warn)
+  local context = string.format(
+    'inverse: %s:%d:%d (precise=%s)',
+    mapped.file,
+    line,
+    mapped.byte_column,
+    tostring(location.precise == true)
+  )
+  if warn_msg then
+    warn(warn_msg, context)
+  elseif location.precise == false then
+    log_entry('WARN', 'imprecise/coarse line positioning', context)
+  else
+    log_entry('INFO', 'position matched', context)
+  end
   vim.cmd('normal! zvzz')
-  if options.focus_on_inverse then
+  if (options or setup_options).focus_on_inverse then
     if remote_session() or not M._source_terminal then
       notify(
         'could not focus source terminal: '
@@ -187,6 +274,7 @@ local function inverse(location)
     end
   end
 end
+M._inverse = inverse
 
 -- Configuration may load in the background for TOML keybindings, never a listener.
 -- Failed configuration can be retried by the next action without breaking setup.
@@ -248,7 +336,7 @@ local function ready(callback, listen)
       return
     end
     if listen and not close_listener and options.editor.transport == 'socket' then
-      local ok, result = pcall(socket.listen, options.editor.path, inverse)
+      local ok, result = pcall(socket.listen, options.editor.path, inverse, anchors.snapshot)
       if not ok then
         socket.diagnose(options.editor.path, function(status)
           if not exiting then
@@ -614,21 +702,30 @@ local function forward(allow_launch)
         local position = vim.api.nvim_buf_is_valid(buffer)
           and vim.api.nvim_buf_get_extmark_by_id(buffer, point_namespace, point.mark, { details = true }) or {}
         local row, byte = position[1] or point.row, position[2] or point.column
+        local context = string.format('forward: %s:%d:%d', file, row + 1, byte + 1)
         local function resolved(result)
           if not alive(id) then return end
           cancel_resolution = nil
           release_point(point)
           if result.code ~= 0 then
             if result.code == 3 then
-              warnings('Source navigation unavailable; PDF position unchanged.',
-                vim.trim(result.stderr):gsub('^pdfterm:%s*', ''))
+              local text = warning_text(
+                'Source navigation unavailable; PDF position unchanged.',
+                vim.trim(result.stderr):gsub('^pdfterm:%s*', '')
+              )
+              warn(text or 'Source navigation unavailable; PDF position unchanged.', context)
             else
-              notify(vim.trim(result.stderr))
+              notify(vim.trim(result.stderr), context)
             end
             return
           end
           local payload = vim.json.decode(result.stdout)
-          warnings(payload.warning)
+          if payload.warning and payload.warning ~= '' then
+            warn(payload.warning, context)
+          else
+            local page_info = payload.page and string.format(' (page %s)', payload.page) or ''
+            log_entry('INFO', 'position resolved' .. page_info, context)
+          end
           deliver(p.pdf, result.stdout, id, source, source_error, allow_launch, true)
         end
         if p.main:match('%.typ$') then
@@ -646,7 +743,8 @@ local function forward(allow_launch)
           end
           if not mapped then
             release_point(point)
-            warnings(unavailable or 'Source navigation unavailable; PDF position unchanged.')
+            local msg = unavailable or 'Source navigation unavailable; PDF position unchanged.'
+            warn(msg, context)
             return
           end
           if point.boundary or #position == 0 or position[3].invalid then
@@ -675,7 +773,11 @@ local function forward(allow_launch)
       end
       if options.compile or p.main:match('%.typ$') then
         project.build(p, id, function(result)
-          if result.code == 0 then resolve(result.source_document) end
+          if result.code == 0 then
+            resolve(result.source_document)
+          else
+            release_point(point)
+          end
         end)
       else
         resolve(document)
@@ -691,6 +793,24 @@ function M.forward()
 end
 function M.forward_split()
   forward(true)
+end
+function M.show_log()
+  if not initialized then
+    notify('call setup() first')
+    return
+  end
+  ready(function()
+    local path = log_path()
+    if not path then
+      vim.notify('pdfterm: no log_file configured', vim.log.levels.WARN)
+      return
+    end
+    if vim.fn.filereadable(path) == 0 then
+      vim.notify('pdfterm: log file does not exist: ' .. path, vim.log.levels.INFO)
+      return
+    end
+    vim.cmd('split ' .. vim.fn.fnameescape(path))
+  end)
 end
 
 function M.setup(opts)
@@ -781,6 +901,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command('PdfTermViewerCommand', function(args)
     M.viewer_command(args.args ~= '' and args.args or nil)
   end, { nargs = '?', complete = 'file' })
+  vim.api.nvim_create_user_command('PdfTermLog', M.show_log, {})
   vim.api.nvim_create_autocmd('VimLeavePre', {
     group = group,
     once = true,

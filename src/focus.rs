@@ -175,19 +175,34 @@ fn parse_endpoint(endpoint: &str) -> io::Result<SocketAddr> {
 }
 
 fn read_token(path: &str) -> io::Result<String> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(invalid("SSH focus token path is not a regular file"));
-    }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(invalid("SSH focus token path is not a regular file"));
+        }
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
             return Err(invalid("SSH focus token file must be private (mode 0600)"));
         }
-    }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let file = fs::File::open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid("SSH focus token path is not a regular file"));
+        }
+        file
+    };
     let mut bytes = Vec::with_capacity(66);
-    fs::File::open(path)?.take(67).read_to_end(&mut bytes)?;
+    file.take(67).read_to_end(&mut bytes)?;
     if bytes.len() > 66 {
         return Err(invalid(
             "SSH focus token file exceeds 64 hexadecimal characters",
@@ -252,7 +267,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_endpoint, valid_uuid};
+    use super::{parse_endpoint, read_token, valid_uuid};
 
     #[test]
     fn bridge_endpoint_is_loopback_only() {
@@ -273,5 +288,34 @@ mod tests {
         assert!(valid_uuid("01234567-89ab-cdef-0123-456789abcdef"));
         assert!(!valid_uuid("123456"));
         assert!(!valid_uuid("01234567-89ab-cdef-0123-456789abcdeg"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_requires_private_regular_file_without_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = std::env::temp_dir().join(format!(
+            "pdfterm-focus-token-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_path = dir.join("token");
+        let link_path = dir.join("token-link");
+        let hex = "0123456789abcdef".repeat(4);
+        std::fs::write(&token_path, format!("{hex}\n")).unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_token(token_path.to_str().unwrap()).is_err());
+
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_token(token_path.to_str().unwrap()).unwrap(), hex);
+
+        symlink(&token_path, &link_path).unwrap();
+        assert!(read_token(link_path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

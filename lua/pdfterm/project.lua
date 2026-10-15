@@ -141,8 +141,8 @@ end
 
 -- This is a literal source graph, not a TeX interpreter. In particular, macro
 -- filenames, conditionals, search paths and catcode changes are not evaluated.
-local function tex_includes(path)
-  local text = require('pdfterm.source').read_input(path)
+local function tex_includes(path, text)
+  if text == nil then text = require('pdfterm.source').read_input(path) end
   if not text then
     return { inputs = {} }
   end
@@ -206,10 +206,15 @@ local function tex_includes(path)
   end
   local pos = 1
   while pos <= #text do
+    local next_pos = text:find('[%%\\]', pos)
+    if not next_pos then
+      break
+    end
+    pos = next_pos
     local char = text:sub(pos, pos)
     if char == '%' then
       pos = after_comment(pos)
-    elseif char == '\\' then
+    else
       local _, finish, command = text:find('^([%a@]+)', pos + 1)
       if not command then
         -- A control symbol consumes both characters: \\input is not \input.
@@ -245,8 +250,6 @@ local function tex_includes(path)
           end
         end
       end
-    else
-      pos = pos + 1
     end
   end
   return { inputs = inputs, document = document }
@@ -271,7 +274,7 @@ local function automatic_root(source, configured_cwd, current_source)
       return nil
     end
     if not parsed[identity] then
-      parsed[identity] = tex_includes(identity)
+      parsed[identity] = tex_includes(identity, identity == target and current_source or nil)
     end
     return parsed[identity], identity
   end

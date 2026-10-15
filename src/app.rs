@@ -40,7 +40,7 @@ use crate::synctex::{ForwardRequest, PdfRevision};
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
 mod session;
-use session::{FileFingerprint, FileWatcher, PendingOpen, Session, Tab};
+use session::{FileFingerprint, FileWatcher, Session, Tab};
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
@@ -613,6 +613,16 @@ impl LinkPickerState {
         }
     }
 
+    fn reset_for_document(&mut self, page: u32) {
+        self.page = page;
+        self.selected = 0;
+        self.number_input.clear();
+        self.selection_key = None;
+        self.awaiting_current_page = true;
+        self.pending_preview = None;
+        self.preview_origin = None;
+    }
+
     fn sync(&mut self, page: u32, links: &[DocumentLink], indexing: bool) {
         if self.page != page {
             self.page = page;
@@ -983,9 +993,12 @@ impl App {
             Some(path) => {
                 let path = path.canonicalize()?;
                 if let Some(index) = self.tab_index_for_path(&path) {
-                    self.session.active_tab = index;
-                    self.reset_render_state();
-                    self.request_current(output)?;
+                    if index == self.session.active_tab {
+                        self.reset_render_state();
+                        self.request_current(output)?;
+                    } else {
+                        self.select_tab(index, output)?;
+                    }
                 } else {
                     self.begin_open(path, output)?;
                 }
@@ -1911,8 +1924,16 @@ impl App {
     }
 
     fn ensure_link_index(&mut self) {
-        if self.link_mode {
+        if self.link_mode || self.link_picker.is_some() {
             self.start_link_index();
+        }
+    }
+
+    pub(super) fn reset_active_tab_pickers(&mut self) {
+        self.search_picker = None;
+        let page = self.tab().page;
+        if let Some(state) = &mut self.link_picker {
+            state.reset_for_document(page);
         }
     }
 
@@ -2043,7 +2064,9 @@ impl App {
             match result {
                 Ok(crate::ipc::ViewerRequest::Forward(request)) => {
                     self.cancel_forward("forward search superseded by a newer request")?;
-                    self.navigation.inverse.take();
+                    if let Some(previous) = self.navigation.inverse.take() {
+                        previous.operation.cancel();
+                    }
                     self.navigation.forward = Some(PendingForward {
                         request,
                         document_revision: None,
@@ -2175,18 +2198,11 @@ impl App {
             .viewport()
             .map_err(|error| io::Error::other(error.to_string()))?;
         let pages = self.screenshot_pages(viewport)?;
-        let empty_overlay;
-        let overlay = if let Some(overlay) = self.label_overlay.as_deref() {
-            overlay
-        } else {
-            empty_overlay = crate::screenshot::blank_overlay(viewport)?;
-            &empty_overlay
-        };
         crate::screenshot::save(
             path,
             viewport,
             &pages,
-            overlay,
+            self.label_overlay.as_deref(),
             terminal_color_rgb(self.theme.bg),
         )
     }
@@ -2247,18 +2263,17 @@ impl App {
     fn finish_forward(&mut self, error: Option<String>) {
         if let Some(mut pending) = self.navigation.forward.take() {
             if error.is_none() {
-                let path = &self.session.tabs[self.session.active_tab].path;
+                let path = fs::canonicalize(&pending.request.pdf)
+                    .unwrap_or_else(|_| self.session.tabs[self.session.active_tab].path.clone());
                 if let Some(endpoint) = pending.request.inverse_search {
                     self.navigation.source_maps.insert(path.clone(), endpoint);
                 } else {
-                    self.navigation.source_maps.remove(path);
+                    self.navigation.source_maps.remove(&path);
                 }
                 if let Some(source) = pending.source_state {
-                    self.navigation
-                        .source_snapshots
-                        .insert(path.clone(), source);
+                    self.navigation.source_snapshots.insert(path, source);
                 } else {
-                    self.navigation.source_snapshots.remove(path);
+                    self.navigation.source_snapshots.remove(&path);
                 }
             }
             pending
@@ -2305,14 +2320,7 @@ impl App {
             if self.session.tabs[index].revision != pending.request.revision {
                 let document_id = self.session.tabs[index].document_id;
                 let fingerprint = FileFingerprint::read(&pdf)?;
-                self.navigation.inverse.take();
-                self.worker
-                    .open(document_id, pdf)
-                    .map_err(AppError::Renderer)?;
-                self.session.pending_open = Some(PendingOpen::Reload {
-                    document_id,
-                    fingerprint,
-                });
+                self.begin_reload(document_id, pdf, fingerprint, output)?;
                 return Ok(());
             }
             // Take the connection while positioning so internal tab/scroll transitions
@@ -2381,6 +2389,14 @@ impl App {
         let rect = request.rect();
         self.pending_scale = None;
         self.select_tab(index, output)?;
+        if let Some(state) = &mut self.link_picker {
+            state.pending_preview = None;
+            state.preview_origin = None;
+        }
+        if let Some(state) = &mut self.search_picker {
+            state.pending_preview = None;
+            state.preview_origin = None;
+        }
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
         if let Some(previous) = self.navigation.flash.take() {
@@ -4082,8 +4098,18 @@ impl App {
         let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
         self.tab_mut().scroll_x = placement.scroll_x;
         self.tab_mut().scroll_y = placement.scroll_y;
-        let image_id = self.next_image_id;
-        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        let retained_id = self
+            .visible_page
+            .as_ref()
+            .filter(|previous| Arc::ptr_eq(&previous.frame, frame))
+            .map(|previous| previous.image_id);
+        let image_id = if let Some(id) = retained_id {
+            id
+        } else {
+            let id = self.next_image_id;
+            self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+            id
+        };
         let original = PositionedImage {
             left: placement.left,
             top: viewport.top,
@@ -4111,20 +4137,25 @@ impl App {
         self.prepare_image_canvas(output, viewport)?;
         execute!(output, MoveTo(positioned.left, positioned.top))?;
         let transfer_started = Instant::now();
-        kitty::transmit_compressed_rgba(
-            output,
-            &frame.compressed_rgba,
-            frame.width,
-            frame.height,
-            positioned.placement,
-        )?;
+        if retained_id.is_some() {
+            kitty::place_image(output, positioned.placement)?;
+        } else {
+            kitty::transmit_compressed_rgba(
+                output,
+                &frame.compressed_rgba,
+                frame.width,
+                frame.height,
+                positioned.placement,
+            )?;
+        }
         let transfer_elapsed = transfer_started.elapsed();
         if let Some(previous) = self.visible_page.replace(VisiblePage {
             frame: Arc::clone(frame),
             placement,
             top: viewport.top,
             image_id,
-        }) {
+        }) && previous.image_id != image_id
+        {
             kitty::delete_image(output, previous.image_id)?;
         }
         self.submitted_key = Some(frame.key);
@@ -4548,7 +4579,11 @@ impl App {
                 .map(|name| name.to_string_lossy())
                 .unwrap_or_else(|| tab.path.to_string_lossy());
             let label = format!(" {}:{} ", index + 1, name);
-            let label: String = label.chars().take(columns.saturating_sub(used)).collect();
+            let available = columns.saturating_sub(used);
+            if available == 0 {
+                break;
+            }
+            let label = truncate_right(&label, available);
             if label.is_empty() {
                 break;
             }
@@ -4569,7 +4604,7 @@ impl App {
                     Print(&label)
                 )?;
             }
-            used += label.chars().count();
+            used += Line::raw(label.as_str()).width();
         }
         execute!(
             output,
@@ -4644,6 +4679,9 @@ impl App {
         };
         let request_id = self.navigation.next_request_id;
         self.navigation.next_request_id = request_id.wrapping_add(1);
+        if let Some(previous) = self.navigation.inverse.take() {
+            previous.operation.cancel();
+        }
         self.navigation.inverse = Some(PendingInverse {
             revision: frame.revision,
             operation: crate::process::Operation::default(),
@@ -5733,24 +5771,41 @@ fn filter_document_links(links: &[DocumentLink], filter: &str) -> Vec<usize> {
         .split_whitespace()
         .map(|term| term.to_lowercase())
         .collect();
+    if terms.is_empty() {
+        return (0..links.len()).collect();
+    }
+    let mut haystack = String::new();
     links
         .iter()
         .enumerate()
         .filter_map(|(index, link)| {
-            if terms.is_empty() {
-                return Some(index);
+            use std::fmt::Write as _;
+            haystack.clear();
+            match &link.target {
+                LinkTarget::Internal { page, .. } => {
+                    let _ = write!(
+                        haystack,
+                        "{} source page {} pdf page {}",
+                        link.label,
+                        link.source_page + 1,
+                        page + 1
+                    );
+                }
+                LinkTarget::Uri(uri) => {
+                    let _ = write!(
+                        haystack,
+                        "{} source page {} {}",
+                        link.label,
+                        link.source_page + 1,
+                        uri
+                    );
+                }
             }
-            let target = match &link.target {
-                LinkTarget::Internal { page, .. } => format!("pdf page {}", page + 1),
-                LinkTarget::Uri(uri) => uri.clone(),
-            };
-            let haystack = format!(
-                "{} source page {} {}",
-                link.label,
-                link.source_page + 1,
-                target
-            )
-            .to_lowercase();
+            if haystack.is_ascii() {
+                haystack.make_ascii_lowercase();
+            } else {
+                haystack = haystack.to_lowercase();
+            }
             terms
                 .iter()
                 .all(|term| haystack.contains(term))
@@ -7866,14 +7921,7 @@ mod tests {
         let pages = app.screenshot_pages(viewport).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("gap.png");
-        crate::screenshot::save(
-            &path,
-            viewport,
-            &pages,
-            &crate::screenshot::blank_overlay(viewport).unwrap(),
-            [1, 2, 3],
-        )
-        .unwrap();
+        crate::screenshot::save(&path, viewport, &pages, None, [1, 2, 3]).unwrap();
         let mut reader =
             png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
                 .read_info()
@@ -10028,5 +10076,42 @@ mod tests {
             super::visible_match_points(&rects, placement, 0, 120, 40, viewport, (10, 10)),
             Some(((95, 25), (95, 25)))
         );
+    }
+
+    #[test]
+    fn link_picker_resets_preview_and_reindexes_without_link_mode() {
+        let (mut app, _viewport, _file) = continuous_app();
+        app.link_mode = false;
+        let mut picker = LinkPickerState::new(0);
+        picker.filter = "keep".into();
+        picker.number_input = "12".into();
+        picker.selection_key = Some((0, 3));
+        picker.awaiting_current_page = false;
+        picker.pending_preview = Some(super::PendingLinkPreview {
+            selection_key: (0, 3),
+            ready_at: Instant::now(),
+        });
+        picker.preview_origin = Some(super::ViewPosition {
+            page: 0,
+            scroll_x: 10,
+            scroll_y: 20,
+        });
+        app.link_picker = Some(picker);
+        app.search_picker = Some(SearchPickerState::new(0));
+        app.tab_mut().page = 1;
+
+        app.reset_active_tab_pickers();
+        app.ensure_link_index();
+
+        assert!(app.search_picker.is_none());
+        let picker = app.link_picker.as_ref().unwrap();
+        assert_eq!(picker.page, 1);
+        assert_eq!(picker.filter, "keep");
+        assert!(picker.number_input.is_empty());
+        assert!(picker.selection_key.is_none());
+        assert!(picker.awaiting_current_page);
+        assert!(picker.pending_preview.is_none());
+        assert!(picker.preview_origin.is_none());
+        assert!(app.tab().link_index.started());
     }
 }

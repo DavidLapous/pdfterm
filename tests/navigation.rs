@@ -139,6 +139,196 @@ fn beamer_overlay_forward_uses_visible_source_context() {
 }
 
 #[test]
+fn forward_multiline_caption_uses_caption_region_instead_of_graphic_legend() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let graphic_root = root.join("graphic");
+    fs::create_dir(&graphic_root).unwrap();
+    compile_out_of_tree_fixture(
+        &graphic_root,
+        "\\documentclass{article}\n\
+         \\usepackage[paperwidth=220pt,paperheight=80pt,margin=10pt]{geometry}\n\
+         \\pagestyle{empty}\n\
+         \\begin{document}\n\
+         \\noindent LegendQuartz labels the graphic.\n\
+         \\end{document}\n",
+    );
+    let contents = r"\documentclass{article}
+\usepackage{graphicx}
+\usepackage[paperwidth=500pt,paperheight=400pt,margin=30pt]{geometry}
+\pagestyle{empty}
+\begin{document}
+OutsideAmber remains ordinary prose.
+\begin{figure}[h!]
+\centering
+\includegraphics{graphic/build/deck.pdf}
+\caption[ShortQuartz]{CaptionCopper illustrates this literal caption.
+InteriorNickel belongs to the caption rather than the legend above.
+The final literal sentence closes the caption.
+}
+\end{figure}
+\end{document}
+";
+    let (pdf, source) = compile_out_of_tree_fixture(&root, contents);
+    let caption = painted_word_points(&pdf, "CaptionCopper").1;
+    let legend = painted_word_points(&pdf, "LegendQuartz").1;
+    let outside = painted_word_points(&pdf, "OutsideAmber").1;
+    assert_eq!(caption.page, legend.page);
+    assert!(legend.y_from_top < caption.y_from_top);
+    let cursor = |word: &str| {
+        let (index, row) = contents
+            .lines()
+            .enumerate()
+            .find(|(_, row)| row.contains(word))
+            .unwrap();
+        (index as u32 + 1, row.find(word).unwrap() as u32 + 1)
+    };
+    let info = SourceInfo::read(&pdf).unwrap();
+    let cache = root.join("compiled-source");
+    fs::create_dir(&cache).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(cache.join("1.txt"), contents).unwrap();
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(contents.as_bytes()) {
+        write!(&mut digest, "{byte:02x}").unwrap();
+    }
+    let manifest = cache.join("manifest.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "pdf": info.pdf,
+            "revision": info.revision,
+            "cwd": info.cwd,
+            "main": source,
+            "files": std::collections::BTreeMap::from([(source.clone(), "1.txt")]),
+            "digests": std::collections::BTreeMap::from([(source.clone(), digest)]),
+            "warnings": std::collections::BTreeMap::from([
+                (source.clone(), "source changed during compilation"),
+            ]),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _native = pdfium_test_lock();
+    let (line, column) = cursor("OutsideAmber");
+    let prose = synctex::resolve_forward_with_library(
+        &pdf,
+        &source,
+        line,
+        column,
+        None,
+        ForwardSource::default(),
+    )
+    .unwrap();
+    assert_eq!(prose.page, outside.page);
+    assert!((prose.h..=prose.h + prose.width).contains(&outside.x));
+    assert!((prose.v - prose.height..=prose.v).contains(&outside.y_from_top));
+    assert!(!(prose.v - prose.height..=prose.v).contains(&caption.y_from_top));
+    assert!(prose.word.is_none() && prose.warning.is_some());
+    // Without captured source, anchor-only requests must keep the native query.
+    let (line, column) = cursor("CaptionCopper");
+    let raw = synctex::resolve_forward_with_library(
+        &pdf,
+        &source,
+        line,
+        column,
+        None,
+        ForwardSource {
+            anchor_only: true,
+            ..ForwardSource::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(raw.page, legend.page);
+    assert!((raw.h..=raw.h + raw.width).contains(&legend.x));
+    assert!((raw.v - raw.height..=raw.v).contains(&legend.y_from_top));
+    assert!(!(raw.v - raw.height..=raw.v).contains(&caption.y_from_top));
+    assert!(raw.word.is_none() && raw.warning.is_some());
+    for context in [
+        ForwardSource::default(),
+        ForwardSource {
+            snapshot: Some(&manifest),
+            best_guess: true,
+            anchor_only: true,
+        },
+    ] {
+        if context.snapshot.is_some() {
+            // Captured bytes, not the live file, must identify the caption scope.
+            fs::write(&source, "\\relax\n").unwrap();
+        }
+        for word in ["CaptionCopper", "InteriorNickel"] {
+            let (line, column) = cursor(word);
+            let request =
+                synctex::resolve_forward_with_library(&pdf, &source, line, column, None, context)
+                    .unwrap();
+            assert_eq!(request.page, caption.page, "{word}: {request:?}");
+            assert!(
+                (request.h..=request.h + request.width).contains(&caption.x)
+                    && (request.v - request.height..=request.v).contains(&caption.y_from_top),
+                "caption body must reach its printed first row: {word}, {request:?}, {caption:?}"
+            );
+            assert!(
+                !(request.v - request.height..=request.v).contains(&legend.y_from_top),
+                "caption body must not highlight the graphic legend: {word}, {request:?}, {legend:?}"
+            );
+            assert!(request.word.is_none() && request.warning.is_some());
+        }
+    }
+}
+
+#[test]
+fn forward_fancyvrb_literal_captions_keep_their_original_line_regions() {
+    for environment in ["Verbatim", "Verbatim*"] {
+        let contents = format!(
+            "\\documentclass{{article}}\n\
+             \\usepackage{{fancyvrb}}\n\
+             \\usepackage[paperwidth=500pt,paperheight=600pt,margin=30pt]{{geometry}}\n\
+             \\pagestyle{{empty}}\n\
+             \\begin{{document}}\n\
+             \\begin{{{environment}}}\n\
+             \\end{{other}} ignored \\end{{{environment}}}\n\
+             \\caption{{LiteralCopper originally owns this printed line.\n\
+             LiteralNickel owns a separate printed line.\n\
+             }}\n\
+             \\end{{{environment}}}\n\
+             AfterQuartz ordinary prose.\n\
+             \\begin{{figure}}[h]\n\
+             \\caption{{VisibleCopper begins an actual caption.\n\
+             VisibleNickel continues the actual caption.\n\
+             }}\n\
+             \\end{{figure}}\n\
+             \\end{{document}}\n"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (pdf, source) = compile_out_of_tree_fixture(&root, &contents);
+        let copper = painted_word_points(&pdf, "LiteralCopper").1;
+        let nickel = painted_word_points(&pdf, "LiteralNickel").1;
+        let caption = painted_word_points(&pdf, "VisibleCopper").1;
+        let _native = pdfium_test_lock();
+        for (line, column, expected) in [(8, 10, copper), (9, 1, nickel), (15, 1, caption)] {
+            let request = synctex::resolve_forward_with_library(
+                &pdf,
+                &source,
+                line,
+                column,
+                None,
+                ForwardSource::default(),
+            )
+            .unwrap();
+            assert_eq!(request.page, expected.page);
+            assert!(
+                (request.h..=request.h + request.width).contains(&expected.x)
+                    && (request.v - request.height..=request.v).contains(&expected.y_from_top),
+                "{environment}, source {line}:{column}: {request:?}, {expected:?}"
+            );
+            assert!(request.word.is_none() && request.warning.is_some());
+        }
+    }
+}
+
+#[test]
 fn forward_reference_expansion_does_not_join_literal_context() {
     let contents = r"\documentclass{article}
 \newcounter{owner}
@@ -956,6 +1146,23 @@ fn real_compiled_source_snapshot_survives_overwrite_and_warns_on_coarse_navigati
         .unwrap(),
     )
     .unwrap();
+    for best_guess in [false, true] {
+        let saved = synctex::resolve_inverse(
+            &pdf,
+            expected,
+            Some(("Compiled Copper owner remains stable", 9)),
+            4,
+            &Operation::default(),
+            None,
+            best_guess,
+        )
+        .unwrap();
+        assert_eq!(saved.location.file, source.to_str().unwrap());
+        assert_eq!(saved.location.line, 4);
+        assert_eq!(saved.location.byte_column, 9);
+        assert!(saved.location.precise);
+        assert_eq!(saved.warning.is_some(), best_guess);
+    }
     fs::write(&source, "\\relax\n").unwrap();
     let snapshot = SourceSnapshot::load(&manifest, &pdf).unwrap();
     assert_eq!(snapshot.read(&source).unwrap(), contents);

@@ -130,7 +130,24 @@ pub fn output(command: &mut Command, operation: &Operation) -> io::Result<Output
                 stderr: err,
             });
         }
-        std::thread::sleep(Duration::from_millis(2));
+        if out_done && err_done {
+            std::thread::sleep(Duration::from_millis(2));
+        } else {
+            let timeout = operation.remaining()?.min(Duration::from_millis(20));
+            let mut fds = [
+                libc::pollfd {
+                    fd: if out_done { -1 } else { stdout.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if err_done { -1 } else { stderr.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout.as_millis().max(1) as i32) };
+        }
     }
 }
 
