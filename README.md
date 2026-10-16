@@ -41,7 +41,7 @@ Press `?` for the full list in the viewer.
 | `:` | Go to a page |
 | `/` | Search text, or filter the open list |
 | `n` / `N` | Next / previous page with a match |
-| `m` | Cycle fit: page, width, height |
+| `m` | Cycle fit: page, width, height, content |
 | `+` / `-` | Zoom by 25% (up to 400%) |
 | `0` | Reset zoom |
 | `i` | Polaris-style dark mode |
@@ -60,6 +60,10 @@ Press `?` for the full list in the viewer.
 ## Configuration
 
 `$XDG_CONFIG_HOME/pdfterm/config.toml`, or `~/.config/pdfterm/config.toml`. First launch creates defaults; invalid configuration stops startup. See [config.default.toml](config.default.toml) for settings.
+
+`fit_mode = "content"` fits and centers the bounds of text and graphics instead of the paper margins. Empty pages fall back to page fit; full-page backgrounds remain part of the content. Content-fit bitmaps are limited to 16 megapixels and 32,768 pixels per side, so very sparse pages may stop enlarging before filling the viewport. Zoom and source navigation work in every fit mode.
+
+Content fit centers on entry, including when `R` reloads a different configured fit mode into content fit. Subsequent redraws preserve panning; back/forward history and canceled navigation previews restore the saved view.
 
 ## Neovim
 

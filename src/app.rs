@@ -328,7 +328,10 @@ pub fn run(
                         break;
                     }
                 }
-                Event::Resize(_, _) => app.request_current(&mut output)?,
+                Event::Resize(_, _) => {
+                    app.tab_mut().center_content = true;
+                    app.request_current(&mut output)?;
+                }
                 Event::Mouse(mouse) => {
                     if !matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
                         app.pending_scale = None;
@@ -492,8 +495,9 @@ impl AppDefaults {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ViewPosition {
     page: u32,
-    scroll_x: u32,
+    scroll_x: i64,
     scroll_y: u32,
+    center_content: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1128,6 +1132,7 @@ impl App {
             tab.page = page;
             tab.scroll_x = 0;
             tab.scroll_y = 0;
+            tab.center_content = true;
         }
         self.reset_render_state();
         self.request_current(output)
@@ -1472,7 +1477,7 @@ impl App {
                         viewport.place(
                             frame.width,
                             frame.height,
-                            self.tab().scroll_x,
+                            self.tab().scroll_x.max(0) as u32,
                             self.tab().scroll_y,
                         ),
                         viewport.top,
@@ -1664,7 +1669,7 @@ impl App {
                             viewport.place(
                                 frame.width,
                                 frame.height,
-                                self.tab().scroll_x,
+                                self.tab().scroll_x.max(0) as u32,
                                 self.tab().scroll_y,
                             ),
                             viewport.top,
@@ -1949,6 +1954,7 @@ impl App {
             self.session.tabs[index].page = page;
             self.session.tabs[index].scroll_x = 0;
             self.session.tabs[index].scroll_y = 0;
+            self.session.tabs[index].center_content = true;
             self.request_current(output)?;
         } else if !self.session.tabs[index].search.matches.is_empty()
             || self.search_picker.is_some()
@@ -2001,6 +2007,7 @@ impl App {
         self.tab_mut().page = page;
         self.tab_mut().scroll_x = 0;
         self.tab_mut().scroll_y = 0;
+        self.tab_mut().center_content = true;
         self.request_current(output)
     }
 
@@ -2114,6 +2121,7 @@ impl App {
             page: self.tab().page,
             scroll_x: self.tab().scroll_x,
             scroll_y: self.tab().scroll_y,
+            center_content: self.tab().center_content,
         };
         let state = self.link_picker.as_mut().expect("link picker state");
         state.preview_origin.get_or_insert(origin);
@@ -2124,6 +2132,7 @@ impl App {
         tab.page = link.source_page;
         tab.scroll_x = 0;
         tab.scroll_y = 0;
+        tab.center_content = true;
         tab.pending_destination = Some(LinkDestination {
             page: link.source_page,
             top_ratio: Some((link.source_top_ratio - 0.08).max(0.0)),
@@ -2528,6 +2537,7 @@ impl App {
             page: tab.page,
             scroll_x: tab.scroll_x,
             scroll_y: tab.scroll_y,
+            center_content: tab.center_content,
         };
         if let Some(origin) = preview_origin {
             tab.link_history.push(origin);
@@ -2543,6 +2553,7 @@ impl App {
                 page: tab.page,
                 scroll_x: tab.scroll_x,
                 scroll_y: tab.scroll_y,
+                center_content: tab.center_content,
             },
         );
         self.navigation.flash = Some(PendingFlash {
@@ -2659,6 +2670,7 @@ impl App {
             page: self.tab().page,
             scroll_x: self.tab().scroll_x,
             scroll_y: self.tab().scroll_y,
+            center_content: self.tab().center_content,
         };
         let state = self.search_picker.as_mut().expect("search picker state");
         state.preview_origin.get_or_insert(origin);
@@ -2668,6 +2680,7 @@ impl App {
         tab.page = pending.page;
         tab.scroll_x = 0;
         tab.scroll_y = 0;
+        tab.center_content = true;
         self.request_current(output)
     }
 
@@ -2784,11 +2797,13 @@ impl App {
                     page: self.tab().page,
                     scroll_x: self.tab().scroll_x,
                     scroll_y: self.tab().scroll_y,
+                    center_content: self.tab().center_content,
                 };
                 let page = page.min(self.tab().page_count - 1);
                 let tab = self.tab_mut();
                 tab.search.initial_navigation_pending = false;
                 tab.page = page;
+                tab.center_content = true;
                 if top_ratio.is_some() {
                     tab.scroll_y = 0;
                 }
@@ -2798,6 +2813,7 @@ impl App {
                         page: tab.page,
                         scroll_x: tab.scroll_x,
                         scroll_y: tab.scroll_y,
+                        center_content: tab.center_content,
                     },
                 );
                 tab.pending_destination = Some(LinkDestination {
@@ -2824,6 +2840,7 @@ impl App {
             page: self.tab().page,
             scroll_x: self.tab().scroll_x,
             scroll_y: self.tab().scroll_y,
+            center_content: self.tab().center_content,
         };
         let Some(previous) = self.tab_mut().link_history.backward(current) else {
             self.draw_status(output, self.viewport()?, "no link history")?;
@@ -2834,6 +2851,7 @@ impl App {
         tab.page = previous.page.min(tab.page_count - 1);
         tab.scroll_x = previous.scroll_x;
         tab.scroll_y = previous.scroll_y;
+        tab.center_content = previous.center_content;
         tab.pending_destination = None;
         self.request_current(output)
     }
@@ -2848,6 +2866,7 @@ impl App {
         tab.page = next.page.min(tab.page_count - 1);
         tab.scroll_x = next.scroll_x;
         tab.scroll_y = next.scroll_y;
+        tab.center_content = next.center_content;
         tab.pending_destination = None;
         self.request_current(output)
     }
@@ -2990,6 +3009,7 @@ impl App {
             tab.page = origin.page.min(tab.page_count - 1);
             tab.scroll_x = origin.scroll_x;
             tab.scroll_y = origin.scroll_y;
+            tab.center_content = origin.center_content;
             tab.pending_destination = None;
             self.clear_viewer(output)?;
             self.reset_render_state();
@@ -3556,6 +3576,7 @@ impl App {
         tab.page = page;
         tab.scroll_y = 0;
         tab.pending_destination = None;
+        tab.center_content = true;
         self.request_current(output)
     }
 
@@ -3598,24 +3619,30 @@ impl App {
                 Ok(())
             };
         };
-        let (mut max_x, max_y) = viewport.max_scroll(frame.width, frame.height);
+        let (max_x, max_y) = viewport.max_scroll(frame.width, frame.height);
+        let mut min_x = 0_i64;
+        let mut max_x = i64::from(max_x);
         if self.viewer.continuous_scroll
             && self.link_picker.is_none()
             && self.search_picker.is_none()
         {
             for page in &self.visible_pages {
+                let origin = content_horizontal_scroll(0, &frame, &page.frame, viewport);
+                min_x = min_x.min(-origin);
                 max_x = max_x.max(
-                    page.frame
-                        .width
-                        .saturating_sub(u32::from(viewport.pixel_width)),
+                    i64::from(
+                        page.frame
+                            .width
+                            .saturating_sub(u32::from(viewport.pixel_width)),
+                    ) - origin,
                 );
             }
         }
-        let (axis_max, current) = match axis {
-            Axis::Vertical => (max_y, self.tab().scroll_y),
-            Axis::Horizontal => (max_x, self.tab().scroll_x),
+        let (axis_min, axis_max, current) = match axis {
+            Axis::Vertical => (0, i64::from(max_y), i64::from(self.tab().scroll_y)),
+            Axis::Horizontal => (min_x, max_x, self.tab().scroll_x),
         };
-        if axis_max == 0 {
+        if axis_min == axis_max {
             return if allow_page_step {
                 self.page_step(forward, output)
             } else {
@@ -3641,19 +3668,19 @@ impl App {
                     Ok(())
                 };
             }
-            (current + step).min(axis_max)
+            (current + i64::from(step)).min(axis_max)
         } else {
-            if current == 0 {
+            if current <= axis_min {
                 return if allow_page_step {
                     self.page_step(false, output)
                 } else {
                     Ok(())
                 };
             }
-            current.saturating_sub(step)
+            (current - i64::from(step)).max(axis_min)
         };
         match axis {
-            Axis::Vertical => self.tab_mut().scroll_y = next,
+            Axis::Vertical => self.tab_mut().scroll_y = next as u32,
             Axis::Horizontal => self.tab_mut().scroll_x = next,
         }
         self.redraw_current(output)
@@ -3759,6 +3786,20 @@ impl App {
                         self.tab_mut().scroll_y = (offset + delta) as u32;
                         self.pending_vertical_scroll = 0;
                     } else {
+                        if frame.key.fit == FitMode::Content {
+                            let next = self.page_key(page + 1, viewport);
+                            let Some(next) = self.tab().cache.get(&next) else {
+                                self.request_visible_page(next)?;
+                                return Ok(false);
+                            };
+                            let scroll_x = content_horizontal_scroll(
+                                self.tab().scroll_x,
+                                frame,
+                                next,
+                                viewport,
+                            );
+                            self.tab_mut().scroll_x = scroll_x;
+                        }
                         self.pending_vertical_scroll = offset + delta - span;
                         self.tab_mut().page += 1;
                         self.tab_mut().scroll_y = 0;
@@ -3774,6 +3815,11 @@ impl App {
                     return Ok(false);
                 };
                 let span = previous.height + cell;
+                if frame.key.fit == FitMode::Content {
+                    let scroll_x =
+                        content_horizontal_scroll(self.tab().scroll_x, frame, previous, viewport);
+                    self.tab_mut().scroll_x = scroll_x;
+                }
                 self.pending_vertical_scroll += offset;
                 self.tab_mut().page -= 1;
                 self.tab_mut().scroll_y = span;
@@ -3853,6 +3899,15 @@ impl App {
         // Anchor to the displayed position, not an unfinished scroll target.
         self.smooth_scroll_remaining = 0;
         self.pending_vertical_scroll = 0;
+        if fit == FitMode::Content && self.tab().fit != FitMode::Content {
+            let tab = self.tab_mut();
+            tab.fit = fit;
+            tab.zoom = zoom;
+            tab.scroll_x = 0;
+            tab.scroll_y = 0;
+            tab.center_content = true;
+            return self.request_current(output);
+        }
         let viewport = self.viewport()?;
         let tab = self.tab();
         let current_key = self.render_key(viewport);
@@ -3898,10 +3953,30 @@ impl App {
         };
         let page_size = |page| {
             page_frame(page).map(|frame| {
-                (
-                    scale_zoom(frame.width, frame.key.zoom, old_zoom),
-                    scale_zoom(frame.height, frame.key.zoom, old_zoom),
-                )
+                let (width, height) = if tab.fit == FitMode::Content {
+                    fitted_page_size(
+                        viewport,
+                        frame.page_width_pt,
+                        frame.page_height_pt,
+                        frame.content_bounds,
+                        tab.fit,
+                        old_zoom,
+                    )
+                } else {
+                    (
+                        scale_zoom(frame.width, frame.key.zoom, old_zoom),
+                        scale_zoom(frame.height, frame.key.zoom, old_zoom),
+                    )
+                };
+                let origin = (tab.fit == FitMode::Content).then(|| {
+                    content_axis_scroll(
+                        frame.content_bounds[0],
+                        frame.content_bounds[2],
+                        width,
+                        viewport.pixel_width,
+                    )
+                });
+                (width, height, origin)
             })
         };
         let position = centered_scaled_view(
@@ -3910,22 +3985,31 @@ impl App {
             tab.page_count,
             (tab.scroll_x, tab.scroll_y),
             |page, width, height| {
-                if fit == tab.fit {
-                    Some((
+                let frame = page_frame(page)?;
+                let (width, height) = if fit == tab.fit && fit != FitMode::Content {
+                    (
                         scale_zoom(width, old_zoom, zoom),
                         scale_zoom(height, old_zoom, zoom),
-                    ))
+                    )
                 } else {
-                    page_frame(page).map(|frame| {
-                        fitted_page_size(
-                            viewport,
-                            frame.page_width_pt,
-                            frame.page_height_pt,
-                            fit,
-                            zoom,
-                        )
-                    })
-                }
+                    fitted_page_size(
+                        viewport,
+                        frame.page_width_pt,
+                        frame.page_height_pt,
+                        frame.content_bounds,
+                        fit,
+                        zoom,
+                    )
+                };
+                let origin = (fit == FitMode::Content).then(|| {
+                    content_axis_scroll(
+                        frame.content_bounds[0],
+                        frame.content_bounds[2],
+                        width,
+                        viewport.pixel_width,
+                    )
+                });
+                Some((width, height, origin))
             },
             self.viewer.continuous_scroll
                 && self.link_picker.is_none()
@@ -4061,6 +4145,9 @@ impl App {
         for tab in &mut self.session.tabs {
             if fit_changed {
                 tab.fit = defaults.fit;
+                if defaults.fit == FitMode::Content {
+                    tab.center_content = true;
+                }
             }
             if invert_changed {
                 tab.invert = defaults.invert;
@@ -4104,6 +4191,7 @@ impl App {
         self.performance_snapshot = None;
 
         if let Some(frame) = self.tab().cache.get(&key).cloned() {
+            self.position_content_frame(&frame, viewport);
             self.draw_frame(&frame, viewport, output)?;
             self.prefetch_neighbors(key);
         } else {
@@ -4191,6 +4279,9 @@ impl App {
             self.set_view_scale(fit, zoom, output)?;
             return Ok(());
         }
+        if self.desired_key == Some(key) {
+            self.position_content_frame(&frame, self.viewport()?);
+        }
 
         // Center across page boundaries only when the active display is continuous.
         let flash_scroll = match self.navigation.flash.as_mut() {
@@ -4214,12 +4305,12 @@ impl App {
         if let Some((left, right, top, bottom)) = flash_scroll {
             let viewport = self.viewport()?;
             self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
-                self.tab().scroll_x,
+                self.tab().scroll_x.max(0) as u32,
                 frame.width,
                 u32::from(viewport.pixel_width),
                 left as f32,
                 right as f32,
-            );
+            ) as i64;
             let center = if self.viewer.center_forward_search {
                 (i64::from(top) + i64::from(bottom)) / 2
             } else {
@@ -4245,6 +4336,7 @@ impl App {
                     page: tab.page,
                     scroll_x: tab.scroll_x,
                     scroll_y: tab.scroll_y,
+                    center_content: tab.center_content,
                 };
                 tab.link_history.update_tip(updated);
             }
@@ -4258,6 +4350,7 @@ impl App {
                         page: tab.page,
                         scroll_x: tab.scroll_x,
                         scroll_y: tab.scroll_y,
+                        center_content: tab.center_content,
                     };
                     tab.link_history.update_tip(updated);
                 }
@@ -4288,6 +4381,7 @@ impl App {
                         page: tab.page,
                         scroll_x: tab.scroll_x,
                         scroll_y: tab.scroll_y,
+                        center_content: tab.center_content,
                     };
                     tab.link_history.update_tip(updated);
                 }
@@ -4296,6 +4390,17 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn position_content_frame(&mut self, frame: &Frame, viewport: Viewport) {
+        if self.tab().fit != FitMode::Content || !self.tab().center_content {
+            return;
+        }
+        let (scroll_x, scroll_y) = content_scroll(frame, viewport);
+        let tab = self.tab_mut();
+        tab.scroll_x = scroll_x;
+        tab.scroll_y = scroll_y;
+        tab.center_content = false;
     }
 
     fn draw_frame(
@@ -4400,12 +4505,12 @@ impl App {
             if let Some(left_ratio) = destination.left_ratio {
                 let target_x = left_ratio * frame.width as f32;
                 self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
-                    self.tab().scroll_x,
+                    self.tab().scroll_x.max(0) as u32,
                     frame.width,
                     u32::from(viewport.pixel_width),
                     target_x,
                     target_x,
-                );
+                ) as i64;
             }
             if let Some(top_ratio) = destination.top_ratio {
                 self.tab_mut().scroll_y = (top_ratio * frame.height as f32).round() as u32;
@@ -4422,6 +4527,7 @@ impl App {
                     page: tab.page,
                     scroll_x: tab.scroll_x,
                     scroll_y: tab.scroll_y,
+                    center_content: tab.center_content,
                 };
                 tab.link_history.update_tip(updated);
             }
@@ -4429,8 +4535,13 @@ impl App {
         }
         self.retain_primary_image(output)?;
         let tab = self.tab();
-        let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
-        self.tab_mut().scroll_x = placement.scroll_x;
+        let placement = viewport.place(
+            frame.width,
+            frame.height,
+            tab.scroll_x.max(0) as u32,
+            tab.scroll_y,
+        );
+        self.tab_mut().scroll_x = i64::from(placement.scroll_x);
         self.tab_mut().scroll_y = placement.scroll_y;
         if resolved_destination {
             let tab = self.tab_mut();
@@ -4438,6 +4549,7 @@ impl App {
                 page: tab.page,
                 scroll_x: tab.scroll_x,
                 scroll_y: tab.scroll_y,
+                center_content: tab.center_content,
             };
             tab.link_history.update_tip(updated);
         }
@@ -4617,11 +4729,14 @@ impl App {
             if let Some(placement) = viewport.place_continuous(
                 rendered.width,
                 rendered.height,
-                self.tab().scroll_x.min(
-                    rendered
-                        .width
-                        .saturating_sub(u32::from(viewport.pixel_width)),
-                ),
+                content_horizontal_scroll(self.tab().scroll_x, frame, &rendered, viewport).clamp(
+                    0,
+                    i64::from(
+                        rendered
+                            .width
+                            .saturating_sub(u32::from(viewport.pixel_width)),
+                    ),
+                ) as u32,
                 offset,
                 top,
             ) {
@@ -4669,14 +4784,15 @@ impl App {
         // A narrow preceding page must not hide a wider visible jump or zoom target.
         // Each placement clamps independently, including retained overlay frames.
         // An uncached visible page may be wider; retain the requested offset until it renders.
-        if self.missing_visible_page.is_none()
+        if frame.key.fit != FitMode::Content
+            && self.missing_visible_page.is_none()
             && let Some(scroll_x) = self
                 .visible_pages
                 .iter()
                 .map(|page| page.placement.scroll_x)
                 .max()
         {
-            self.tab_mut().scroll_x = scroll_x;
+            self.tab_mut().scroll_x = i64::from(scroll_x);
         }
         for old in old_pages {
             if !self
@@ -5425,10 +5541,41 @@ fn scale_pixels(value: u32, old_size: u32, new_size: u32) -> u32 {
         as u32
 }
 
+fn content_axis_scroll(start: f32, end: f32, size: u32, visible: u16) -> u32 {
+    (((start + end) * 0.5 * size as f32 - f32::from(visible) * 0.5)
+        .round()
+        .max(0.0) as u32)
+        .min(size.saturating_sub(u32::from(visible)))
+}
+
+fn content_scroll(frame: &Frame, viewport: Viewport) -> (i64, u32) {
+    let [left, top, right, bottom] = frame.content_bounds;
+    (
+        i64::from(content_axis_scroll(
+            left,
+            right,
+            frame.width,
+            viewport.pixel_width,
+        )),
+        content_axis_scroll(top, bottom, frame.height, viewport.pixel_height),
+    )
+}
+
+// Keep content-relative pan signed until placement: a narrower first visible
+// page must not clamp the horizontal anchor of a wider following page.
+fn content_horizontal_scroll(scroll_x: i64, from: &Frame, to: &Frame, viewport: Viewport) -> i64 {
+    if from.key.fit == FitMode::Content {
+        scroll_x - content_scroll(from, viewport).0 + content_scroll(to, viewport).0
+    } else {
+        scroll_x
+    }
+}
+
 fn fitted_page_size(
     viewport: Viewport,
     width: f32,
     height: f32,
+    content: [f32; 4],
     fit: FitMode,
     zoom: u16,
 ) -> (u32, u32) {
@@ -5436,49 +5583,46 @@ fn fitted_page_size(
     let target_height = (u32::from(viewport.pixel_height) * u32::from(zoom) / 100).max(1);
     // Match PDFium's f32 scaling and final rounding, using the original PDF
     // dimensions: reconstructing aspect ratio from a raster amplifies rounding.
-    let mut scale = match fit {
-        FitMode::Page | FitMode::Width => target_width as f32 / width,
-        FitMode::Height => target_height as f32 / height,
-    };
-    if fit == FitMode::Page && height * scale > target_height as f32 {
-        scale = target_height as f32 / height;
-    }
-    (
-        (width * scale).round().max(1.0) as u32,
-        (height * scale).round().max(1.0) as u32,
-    )
+    fit.raster_size(width, height, content, target_width, target_height)
 }
 
 /// Keep the PDF point under the viewport center fixed, even if it belongs to
 /// the next visible page. Page gaps stay one terminal row rather than scaling.
+/// Geometry includes an optional content-centered horizontal origin. Rebase
+/// between these origins when the center page and first visible page differ.
 fn centered_scaled_view(
     viewport: Viewport,
     mut page: u32,
     page_count: u32,
-    (scroll_x, scroll_y): (u32, u32),
-    scaled_size: impl Fn(u32, u32, u32) -> Option<(u32, u32)>,
+    (scroll_x, scroll_y): (i64, u32),
+    scaled_size: impl Fn(u32, u32, u32) -> Option<(u32, u32, Option<u32>)>,
     continuous: bool,
-    page_size: impl Fn(u32) -> Option<(u32, u32)>,
-) -> Result<(u32, u32, u32), u32> {
+    page_size: impl Fn(u32) -> Option<(u32, u32, Option<u32>)>,
+) -> Result<(u32, i64, u32), u32> {
     let width = u32::from(viewport.pixel_width);
     let height = u32::from(viewport.pixel_height);
     let half_width = i64::from(width / 2);
     let half_height = i64::from(height / 2);
     let gap = (height / u32::from(viewport.rows).max(1)).max(1);
     let mut center_y = i64::from(scroll_y) + half_height;
+    let mut geometry = page_size(page).ok_or(page)?;
+    let initial_origin = geometry.2.unwrap_or(0);
     if continuous {
         while page + 1 < page_count {
-            let (_, page_height) = page_size(page).ok_or(page)?;
-            let span = i64::from(page_height) + i64::from(gap);
+            let span = i64::from(geometry.1) + i64::from(gap);
             if center_y < span {
                 break;
             }
             center_y -= span;
             page += 1;
+            geometry = page_size(page).ok_or(page)?;
         }
     }
-    let (page_width, page_height) = page_size(page).ok_or(page)?;
-    let (new_width, new_height) = scaled_size(page, page_width, page_height).ok_or(page)?;
+    let (page_width, page_height, origin) = geometry;
+    let scroll_x =
+        (scroll_x - i64::from(initial_origin) + i64::from(origin.unwrap_or(0))).max(0) as u32;
+    let (new_width, new_height, new_origin) =
+        scaled_size(page, page_width, page_height).ok_or(page)?;
     let center_x = if page_width < width {
         // Narrow images are centered by whole terminal cells; leftover pixels
         // stay on the right, not symmetrically around the image midpoint.
@@ -5504,7 +5648,7 @@ fn centered_scaled_view(
     if continuous {
         while y < 0 && page > 0 {
             page -= 1;
-            let (previous_width, previous_height) = page_size(page).ok_or(page)?;
+            let (previous_width, previous_height, _) = page_size(page).ok_or(page)?;
             y += i64::from(
                 scaled_size(page, previous_width, previous_height)
                     .ok_or(page)?
@@ -5512,7 +5656,7 @@ fn centered_scaled_view(
             ) + i64::from(gap);
         }
         while page + 1 < page_count {
-            let (current_width, current_height) = page_size(page).ok_or(page)?;
+            let (current_width, current_height, _) = page_size(page).ok_or(page)?;
             let span = i64::from(
                 scaled_size(page, current_width, current_height)
                     .ok_or(page)?
@@ -5525,10 +5669,14 @@ fn centered_scaled_view(
             page += 1;
         }
     }
-    let (top_page_width, top_page_height) = page_size(page).ok_or(page)?;
-    let scaled_height = scaled_size(page, top_page_width, top_page_height)
-        .ok_or(page)?
-        .1;
+    let (top_page_width, top_page_height, _) = page_size(page).ok_or(page)?;
+    let (_, scaled_height, top_origin) =
+        scaled_size(page, top_page_width, top_page_height).ok_or(page)?;
+    let x = if let (Some(new_origin), Some(top_origin)) = (new_origin, top_origin) {
+        i64::from(x) - i64::from(new_origin) + i64::from(top_origin)
+    } else {
+        i64::from(x)
+    };
     let max_y = if continuous && page + 1 < page_count {
         scaled_height.saturating_add(gap - 1)
     } else {
@@ -7546,7 +7694,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("Alt-1 … Alt-9", "select tab"),
     ];
     const VIEWER: &[(&str, &str)] = &[
-        ("m", "cycle fit mode"),
+        ("m", "fit page / width / height / content"),
         ("+ / -", "zoom in / out"),
         ("0", "reset zoom"),
         ("i", "toggle dark mode"),
@@ -8251,6 +8399,7 @@ mod tests {
             height: 240,
             page_width_pt: 80.0,
             page_height_pt: 240.0,
+            content_bounds: [0.0, 0.0, 1.0, 1.0],
             compressed_rgba: crate::kitty::compress_rgba(&[255; 80 * 240 * 4]).unwrap(),
             render_elapsed: std::time::Duration::ZERO,
             dark_mode_elapsed: None,
@@ -9996,11 +10145,12 @@ mod tests {
         assert_eq!(stepped_zoom(ZOOM_MAX - ZOOM_STEP, true), ZOOM_MAX);
     }
 
-    fn zoom_size(old: u16, new: u16) -> impl Fn(u32, u32, u32) -> Option<(u32, u32)> {
+    fn zoom_size(old: u16, new: u16) -> impl Fn(u32, u32, u32) -> Option<(u32, u32, Option<u32>)> {
         move |_, width, height| {
             Some((
                 super::scale_zoom(width, old, new),
                 super::scale_zoom(height, old, new),
+                None,
             ))
         }
     }
@@ -10023,19 +10173,19 @@ mod tests {
                 (0, 0),
                 zoom_size(100, 300),
                 false,
-                |_| Some((60, 40))
+                |_| Some((60, 40, None))
             ),
             Ok((0, 40, 20))
         );
         assert_eq!(
             centered_scaled_view(viewport, 0, 1, (30, 50), zoom_size(100, 150), false, |_| {
-                Some((200, 160))
+                Some((200, 160, None))
             }),
             Ok((0, 70, 95))
         );
         assert_eq!(
             centered_scaled_view(viewport, 0, 1, (70, 95), zoom_size(150, 100), false, |_| {
-                Some((300, 240))
+                Some((300, 240, None))
             }),
             Ok((0, 30, 50))
         );
@@ -10047,7 +10197,7 @@ mod tests {
                 (200, 160),
                 zoom_size(150, 100),
                 false,
-                |_| Some((300, 240))
+                |_| Some((300, 240, None))
             ),
             Ok((0, 100, 80))
         );
@@ -10073,7 +10223,7 @@ mod tests {
                 (0, 0),
                 zoom_size(100, 125),
                 false,
-                |_| Some((870, 580))
+                |_| Some((870, 580, None))
             ),
             Ok((0, 75, 73))
         );
@@ -10091,13 +10241,21 @@ mod tests {
         };
         assert_eq!(
             centered_scaled_view(viewport, 0, 2, (0, 90), zoom_size(100, 200), true, |page| {
-                Some(if page == 0 { (200, 100) } else { (100, 120) })
+                Some(if page == 0 {
+                    (200, 100, None)
+                } else {
+                    (100, 120, None)
+                })
             }),
             Ok((1, 50, 0))
         );
         assert_eq!(
             centered_scaled_view(viewport, 1, 2, (50, 0), zoom_size(200, 100), true, |page| {
-                Some(if page == 0 { (400, 200) } else { (200, 240) })
+                Some(if page == 0 {
+                    (400, 200, None)
+                } else {
+                    (200, 240, None)
+                })
             }),
             Ok((0, 0, 90))
         );
@@ -10123,7 +10281,13 @@ mod tests {
                 (100, 0),
                 zoom_size(100, 200),
                 true,
-                |page| { Some(if page == 0 { (120, 60) } else { (300, 180) }) }
+                |page| {
+                    Some(if page == 0 {
+                        (120, 60, None)
+                    } else {
+                        (300, 180, None)
+                    })
+                }
             ),
             Ok((0, 90, 40)),
         );
@@ -10141,15 +10305,222 @@ mod tests {
         };
         assert_eq!(
             centered_scaled_view(viewport, 1, 2, (0, 0), zoom_size(200, 100), true, |page| {
-                (page == 1).then_some((200, 160))
+                (page == 1).then_some((200, 160, None))
             }),
             Err(0)
         );
         assert_eq!(
             centered_scaled_view(viewport, 0, 1, (0, 0), zoom_size(100, 125), true, |_| Some(
-                (100, 70)
+                (100, 70, None)
             )),
             Ok((0, 13, 8))
+        );
+    }
+
+    #[test]
+    fn content_zoom_keeps_the_center_across_differently_indented_pages() {
+        let viewport = Viewport {
+            columns: 8,
+            rows: 10,
+            pixel_width: 80,
+            pixel_height: 200,
+            top: 0,
+            status_row: 10,
+        };
+        assert_eq!(
+            centered_scaled_view(
+                viewport,
+                0,
+                2,
+                (480, 650),
+                |page, _, _| Some((800, 800, Some(if page == 0 { 610 } else { 110 }))),
+                true,
+                |page| Some((640, 640, Some(if page == 0 { 480 } else { 80 }))),
+            ),
+            Ok((1, 110, 13))
+        );
+        assert_eq!(
+            centered_scaled_view(
+                viewport,
+                1,
+                2,
+                (110, 13),
+                |page, _, _| Some((640, 640, Some(if page == 0 { 480 } else { 80 }))),
+                true,
+                |page| Some((800, 800, Some(if page == 0 { 610 } else { 110 }))),
+            ),
+            Ok((0, 480, 650))
+        );
+    }
+
+    #[test]
+    fn content_zoom_preserves_pan_with_a_narrow_preceding_page() {
+        let viewport = Viewport {
+            columns: 8,
+            rows: 10,
+            pixel_width: 80,
+            pixel_height: 200,
+            top: 0,
+            status_row: 10,
+        };
+        let position = centered_scaled_view(
+            viewport,
+            1,
+            2,
+            (320, 0),
+            |page, _, _| {
+                Some(if page == 0 {
+                    (80, 80, Some(0))
+                } else {
+                    (640, 640, Some(280))
+                })
+            },
+            true,
+            |page| {
+                Some(if page == 0 {
+                    (100, 100, Some(0))
+                } else {
+                    (800, 800, Some(360))
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(position, (0, -32, 80));
+        let (mut app, _, _file) = continuous_app();
+        app.tab_mut().fit = crate::pdf::FitMode::Content;
+        app.tab_mut().center_content = false;
+        let revision = app.tab().cache.values().next().unwrap().revision;
+        for (page, size, bounds) in [
+            (0, 80, [0.0, 0.0, 1.0, 1.0]),
+            (1, 640, [0.4, 0.4, 0.6, 0.6]),
+        ] {
+            let key = app.page_key(page, viewport);
+            let mut frame = continuous_frame(key, revision, false);
+            let data = std::sync::Arc::get_mut(&mut frame).unwrap();
+            data.width = size;
+            data.height = size;
+            data.content_bounds = bounds;
+            app.tab_mut().cache.insert(key, frame);
+        }
+        app.tab_mut().page = position.0;
+        app.tab_mut().scroll_x = position.1;
+        app.tab_mut().scroll_y = position.2;
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        app.draw_continuous(&primary, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!(app.tab().scroll_x, -32);
+        assert_eq!(app.visible_pages[0].frame.key.page, 1);
+        assert_eq!(app.visible_pages[0].placement.scroll_x, 248);
+        app.pending_vertical_scroll = 20;
+        assert!(app.apply_vertical_scroll(viewport).unwrap());
+        assert_eq!((app.tab().page, app.tab().scroll_x), (1, 248));
+        app.pending_vertical_scroll = -20;
+        assert!(app.apply_vertical_scroll(viewport).unwrap());
+        assert_eq!((app.tab().page, app.tab().scroll_x), (0, -32));
+    }
+
+    #[test]
+    fn content_fit_centers_asymmetric_margins_only_once() {
+        let (mut app, viewport, _file) = continuous_app();
+        app.tab_mut().fit = crate::pdf::FitMode::Content;
+        let key = app.render_key(viewport);
+        let mut frame = continuous_frame(
+            key,
+            app.tab().cache.values().next().unwrap().revision,
+            false,
+        );
+        let data = std::sync::Arc::get_mut(&mut frame).unwrap();
+        data.width = 400;
+        data.height = 800;
+        data.content_bounds = [0.6, 0.5, 0.9, 0.75];
+        app.tab_mut().center_content = true;
+        app.position_content_frame(&frame, viewport);
+        assert_eq!((app.tab().scroll_x, app.tab().scroll_y), (260, 400));
+        app.tab_mut().scroll_x = 200;
+        app.tab_mut().scroll_y = 350;
+        app.reset_render_state();
+        app.position_content_frame(&frame, viewport);
+        assert_eq!((app.tab().scroll_x, app.tab().scroll_y), (200, 350));
+
+        let page_config = toml::from_str("fit_mode = \"page\"").unwrap();
+        let content_config = toml::from_str("fit_mode = \"content\"").unwrap();
+        app.apply_config(&page_config);
+        app.apply_config(&content_config);
+        app.position_content_frame(&frame, viewport);
+        assert_eq!((app.tab().scroll_x, app.tab().scroll_y), (260, 400));
+        app.tab_mut().scroll_x = 200;
+        app.tab_mut().scroll_y = 350;
+        app.apply_config(&content_config);
+        app.position_content_frame(&frame, viewport);
+        assert_eq!((app.tab().scroll_x, app.tab().scroll_y), (200, 350));
+    }
+
+    #[test]
+    fn forward_history_restores_pending_content_centering() {
+        let (mut app, viewport, _file) = continuous_app();
+        app.tab_mut().fit = crate::pdf::FitMode::Content;
+        app.tab_mut().center_content = false;
+        let origin = super::ViewPosition {
+            page: 0,
+            scroll_x: 37,
+            scroll_y: 91,
+            center_content: false,
+        };
+        let destination = super::ViewPosition {
+            page: 1,
+            center_content: true,
+            ..origin
+        };
+        app.tab_mut().link_history.jump(origin, destination);
+        app.tab_mut().link_history.backward(destination).unwrap();
+        let key = app.page_key(1, viewport);
+        let frame = continuous_frame(
+            key,
+            app.tab().cache.values().next().unwrap().revision,
+            false,
+        );
+        app.tab_mut().cache.insert(key, frame);
+        app.follow_link_forward(&mut Vec::new()).unwrap();
+        assert_eq!(app.tab().page, 1);
+        assert_eq!((app.tab().scroll_x, app.tab().scroll_y), (0, 20));
+    }
+
+    #[test]
+    fn content_scrolling_keeps_differently_indented_pages_visible() {
+        let (mut app, viewport, _file) = continuous_app();
+        app.tab_mut().fit = crate::pdf::FitMode::Content;
+        app.tab_mut().center_content = false;
+        let revision = app.tab().cache.values().next().unwrap().revision;
+        for (page, bounds) in [(0, [0.7, 0.4, 0.9, 0.6]), (1, [0.1, 0.4, 0.3, 0.6])] {
+            let key = app.page_key(page, viewport);
+            let mut frame = continuous_frame(key, revision, false);
+            let data = std::sync::Arc::get_mut(&mut frame).unwrap();
+            data.width = 400;
+            data.height = 400;
+            data.content_bounds = bounds;
+            app.tab_mut().cache.insert(key, frame);
+        }
+        let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
+        app.tab_mut().scroll_x = super::content_scroll(&primary, viewport).0 + 10;
+        app.tab_mut().scroll_y = 350;
+        app.draw_continuous(&primary, viewport, &mut Vec::new())
+            .unwrap();
+        assert_eq!(app.visible_pages.len(), 2);
+        assert_eq!(app.visible_pages[0].placement.scroll_x, 290);
+        assert_eq!(app.visible_pages[1].placement.scroll_x, 50);
+        assert_eq!(app.tab().scroll_x, 290);
+
+        app.pending_vertical_scroll = 70;
+        assert!(app.apply_vertical_scroll(viewport).unwrap());
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (1, 50, 10)
+        );
+        app.pending_vertical_scroll = -70;
+        assert!(app.apply_vertical_scroll(viewport).unwrap());
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (0, 290, 350)
         );
     }
 
@@ -10179,16 +10550,18 @@ mod tests {
                     1,
                     scroll,
                     |_, width, height| {
-                        Some(super::fitted_page_size(
+                        let (width, height) = super::fitted_page_size(
                             viewport,
                             width as f32,
                             height as f32,
+                            [0.0, 0.0, 1.0, 1.0],
                             fit,
                             200,
-                        ))
+                        );
+                        Some((width, height, None))
                     },
                     false,
-                    |_| Some(size),
+                    |_| Some((size.0, size.1, None)),
                 ),
                 Ok(expected),
                 "{fit:?}, {size:?}"
@@ -10218,11 +10591,17 @@ mod tests {
                     viewport,
                     width as f32,
                     height as f32,
+                    [0.0, 0.0, 1.0, 1.0],
                     FitMode::Width,
                     100
-                )),
+                ))
+                .map(|(width, height)| (width, height, None)),
                 true,
-                |page| Some(if page == 0 { (100, 40) } else { (40, 80) }),
+                |page| Some(if page == 0 {
+                    (100, 40, None)
+                } else {
+                    (40, 80, None)
+                }),
             ),
             Ok((1, 0, 23))
         );
@@ -10237,11 +10616,13 @@ mod tests {
                     viewport,
                     width as f32,
                     height as f32,
+                    [0.0, 0.0, 1.0, 1.0],
                     FitMode::Height,
                     100
-                )),
+                ))
+                .map(|(width, height)| (width, height, None)),
                 true,
-                |page| (page == 1).then_some((100, 200)),
+                |page| (page == 1).then_some((100, 200, None)),
             ),
             Err(0)
         );
@@ -10255,11 +10636,17 @@ mod tests {
                     viewport,
                     width as f32,
                     height as f32,
+                    [0.0, 0.0, 1.0, 1.0],
                     FitMode::Height,
                     100
-                )),
+                ))
+                .map(|(width, height)| (width, height, None)),
                 true,
-                |page| Some(if page == 0 { (100, 40) } else { (100, 200) }),
+                |page| Some(if page == 0 {
+                    (100, 40, None)
+                } else {
+                    (100, 200, None)
+                }),
             ),
             Ok((0, 0, 75))
         );
@@ -10287,11 +10674,13 @@ mod tests {
                     viewport,
                     210.0,
                     10000.0,
+                    [0.0, 0.0, 1.0, 1.0],
                     crate::pdf::FitMode::Width,
                     100,
-                )),
+                ))
+                .map(|(width, height)| (width, height, None)),
                 false,
-                |_| Some((17, 800)),
+                |_| Some((17, 800, None)),
             ),
             Ok((0, 0, 23410))
         );
@@ -10561,6 +10950,7 @@ mod tests {
             page: 0,
             scroll_x: 10,
             scroll_y: 20,
+            center_content: false,
         });
         app.link_picker = Some(picker);
         app.search_picker = Some(SearchPickerState::new(0));
@@ -11001,11 +11391,13 @@ mod tests {
             page: 0,
             scroll_x: 0,
             scroll_y: 0,
+            center_content: false,
         };
         let destination = ViewPosition {
             page: 0,
             scroll_x: 0,
             scroll_y: 120,
+            center_content: false,
         };
         let mut history = JumpList::default();
         history.jump(origin, origin);
@@ -11020,21 +11412,25 @@ mod tests {
             page: 5,
             scroll_x: 0,
             scroll_y: 0,
+            center_content: false,
         };
         let p4 = ViewPosition {
             page: 4,
             scroll_x: 0,
             scroll_y: 0,
+            center_content: false,
         };
         let p1 = ViewPosition {
             page: 1,
             scroll_x: 0,
             scroll_y: 0,
+            center_content: false,
         };
         let p0 = ViewPosition {
             page: 0,
             scroll_x: 0,
             scroll_y: 0,
+            center_content: false,
         };
         clamped.push(p5);
         clamped.push(p4);
@@ -11048,6 +11444,7 @@ mod tests {
                 page: 2,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             })
         );
 
@@ -11057,6 +11454,7 @@ mod tests {
                 page,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             });
         }
         assert_eq!(
@@ -11064,11 +11462,13 @@ mod tests {
                 page: 3,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             }),
             Some(ViewPosition {
                 page: 6,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             })
         );
         multi_run.clamp_pages(5);
@@ -11078,6 +11478,7 @@ mod tests {
                 page: 3,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             })
         );
         assert_eq!(
@@ -11085,11 +11486,13 @@ mod tests {
                 page: 3,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             }),
             Some(ViewPosition {
                 page: 4,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             })
         );
         assert_eq!(
@@ -11097,11 +11500,13 @@ mod tests {
                 page: 4,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             }),
             Some(ViewPosition {
                 page: 0,
                 scroll_x: 0,
                 scroll_y: 0,
+                center_content: false,
             })
         );
     }
