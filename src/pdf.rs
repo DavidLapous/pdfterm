@@ -99,8 +99,13 @@ impl FitMode {
         let mut scale = match self {
             Self::Page | Self::Width => target_width as f32 / width,
             Self::Height => target_height as f32 / height,
-            Self::Content => (target_width as f32 / (width * (content[2] - content[0])))
-                .min(target_height as f32 / (height * (content[3] - content[1]))),
+            Self::Content => {
+                // Reserve a little breathing room without changing page geometry.
+                const INNER_FRACTION: f32 = 0.96;
+                (target_width as f32 * INNER_FRACTION / (width * (content[2] - content[0]))).min(
+                    target_height as f32 * INNER_FRACTION / (height * (content[3] - content[1])),
+                )
+            }
         };
         if self == Self::Page && height * scale > target_height as f32 {
             scale = target_height as f32 / height;
@@ -5750,7 +5755,7 @@ mod tests {
             content,
         );
         let bitmap = page.render_with_config(&config).unwrap();
-        assert_eq!((bitmap.width(), bitmap.height()), (600, 600));
+        assert_eq!((bitmap.width(), bitmap.height()), (576, 576));
         let mut empty = pdfium.create_new_pdf().unwrap();
         let page = empty
             .pages_mut()
@@ -5770,7 +5775,7 @@ mod tests {
             content,
         );
         let bitmap = page.render_with_config(&config).unwrap();
-        assert_eq!((bitmap.width(), bitmap.height()), (200, 300));
+        assert_eq!((bitmap.width(), bitmap.height()), (192, 288));
     }
 
     fn fit_page_keeps_landscape_pages_landscape(pdfium: &pdfium_render::prelude::Pdfium) {
