@@ -51,7 +51,7 @@ impl Config {
         Self::load_path(&path).map_err(|error| format!("{}: {error}", path.display()).into())
     }
 
-    fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         fs::create_dir_all(path.parent().ok_or("config path has no parent")?)?;
         match fs::OpenOptions::new()
             .write(true)
@@ -279,7 +279,7 @@ impl Default for ViewerSettings {
             smooth_scroll: false,
             scroll_frame_ms: 16,
             scroll_ease_divisor: 4,
-            scroll_step_percent: 12,
+            scroll_step_percent: 5,
             page_scroll_percent: 85,
             set_window_title: true,
             center_forward_search: true,

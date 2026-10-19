@@ -1,7 +1,7 @@
 -- Saved compiler inputs are immutable; Neovim range extmarks own every live edit.
 local M = {}
 local MAX_SOURCE, MAX_MANIFEST, MAX_WARNING = 2 * 1024 * 1024, 4 * 1024 * 1024, 4096
-local documents, manifests, latest, pending, warm, tracked, buffers = {}, {}, {}, {}, {}, {}, {}
+local documents, manifests, latest, pending, warm, tracked, buffers, document_order = {}, {}, {}, {}, {}, {}, {}, {}
 local parsed_by_digest, parsed_count = {}, 0
 local serial, installed = 0, false
 local namespace_prefix = 'pdfterm.source.' .. tostring(vim.uv.hrtime()) .. '.'
@@ -414,6 +414,17 @@ local function warm_buffer(buffer)
   end
 end
 
+local function detach_source(source)
+  if source.buffer and vim.api.nvim_buf_is_valid(source.buffer) and source.namespace then
+    if vim.api.nvim_buf_is_loaded(source.buffer) then
+      vim.api.nvim_buf_clear_namespace(source.buffer, source.namespace, 0, -1)
+    end
+    local state = buffers[source.buffer]
+    if state then state.sources[source] = nil end
+  end
+  tracked[source] = nil
+end
+
 function M.setup(group)
   if installed then return end
   installed = true
@@ -427,7 +438,13 @@ function M.setup(group)
       if not state then return end
       for source in pairs(state.sources) do
         freeze(source)
-        if event.event == 'BufWipeout' then source.buffer = nil end
+        if event.event == 'BufWipeout' then
+          source.buffer = nil
+          if source.warm and not source.document then
+            if warm[source.original] == source then warm[source.original] = nil end
+            tracked[source] = nil
+          end
+        end
       end
       if event.event == 'BufWipeout' then buffers[event.buf] = nil end
     end,
@@ -448,16 +465,7 @@ local function release(capture)
   if not capture or capture.released then return end
   capture.released = true
   for _, source in pairs(capture.sources) do
-    if not source.document and not source.warm then
-      if source.buffer and vim.api.nvim_buf_is_valid(source.buffer) and source.namespace then
-        if vim.api.nvim_buf_is_loaded(source.buffer) then
-          vim.api.nvim_buf_clear_namespace(source.buffer, source.namespace, 0, -1)
-        end
-        local state = buffers[source.buffer]
-        if state then state.sources[source] = nil end
-      end
-      tracked[source] = nil
-    end
+    if not source.document and not source.warm then detach_source(source) end
   end
 end
 
@@ -510,7 +518,31 @@ local function sorted_keys(values)
 end
 
 local function remember(document)
+  if not documents[document.key] then document_order[#document_order + 1] = document.key end
   documents[document.key], manifests[document.source_snapshot] = document, document
+  if #document_order > 64 then
+    for index, key in ipairs(document_order) do
+      local evicted = documents[key]
+      if evicted and latest[evicted.pdf] ~= evicted then
+        table.remove(document_order, index)
+        documents[key], manifests[evicted.source_snapshot] = nil, nil
+        for _, entry in pairs(evicted.files) do
+          local shared = entry.source.warm
+          for _, other in pairs(documents) do
+            for _, other_entry in pairs(other.files) do
+              if other_entry.source == entry.source then shared = true; break end
+            end
+            if shared then break end
+          end
+          if not shared then
+            entry.source.document = nil
+            detach_source(entry.source)
+          end
+        end
+        break
+      end
+    end
+  end
   return document
 end
 
@@ -717,6 +749,12 @@ function M.publish(capture, info)
   if not next(sources) then release(capture); pending[pdf] = nil; return nil end
   local document = persist(capture.project, info, sources, warnings)
   if not next(document.files) then release(capture); pending[pdf] = nil; return nil end
+  for path in pairs(document.files) do
+    if warm[path] and not warm[path].document then
+      detach_source(warm[path])
+      warm[path] = nil
+    end
+  end
   latest[pdf] = document
   release(capture)
   pending[pdf] = nil

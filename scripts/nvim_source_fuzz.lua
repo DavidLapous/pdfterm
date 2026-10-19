@@ -62,7 +62,7 @@ end
 
 local function location(point)
   return {
-    file = original, line = point[1], byte_column = point[2], pdf = document.pdf,
+    file = original, line = point[1], byte_column = point[2], precise = true, pdf = document.pdf,
     revision = vim.deepcopy(document.revision.pdf),
     document_revision = vim.deepcopy(document.revision), source_snapshot = document.source_snapshot,
   }
@@ -87,10 +87,19 @@ local function warn_since(index)
   return warnings
 end
 
-local function deliver(path, point)
+local function log_lines(plugin)
+  local path = plugin.log_path and plugin.log_path() or nil
+  if not path then return {} end
+  local bytes = read_bytes(path, true)
+  if bytes == vim.NIL or bytes == '' then return {} end
+  return vim.split(bytes:gsub('\n$', ''), '\n', { plain = true })
+end
+
+local function deliver(path, point, plugin)
   -- The sentinel makes completion observable even if the source cursor is unchanged.
   api.nvim_set_current_buf(guard)
   local before = #result.notifications
+  local log_before = #log_lines(plugin)
   local pipe = assert(uv.new_pipe(false))
   local finished, failure = false, nil
   local function fail(reason)
@@ -118,10 +127,17 @@ local function deliver(path, point)
   assert(completed, 'inverse listener delivery timed out after 2000ms')
   assert(not failure, 'inverse socket failure: ' .. tostring(failure))
   local warnings = warn_since(before)
+  local logs = log_lines(plugin)
+  local appended = {}
+  for i = log_before + 1, #logs do
+    assert(not logs[i]:find('%[ERROR%]'), 'unexpected error log: ' .. logs[i])
+    appended[#appended + 1] = logs[i]
+  end
   assert(api.nvim_get_current_buf() ~= guard, 'inverse listener did not select a source buffer')
   local cursor = api.nvim_win_get_cursor(0)
   return {
-    file = api.nvim_buf_get_name(0), line = cursor[1], byte_column = cursor[2], warnings = warnings,
+    file = api.nvim_buf_get_name(0), line = cursor[1], byte_column = cursor[2],
+    warnings = warnings, logs = appended,
   }
 end
 
@@ -190,6 +206,7 @@ local function main()
   local plugin = require('pdfterm')
   plugin.setup({ executable = input.binary, session = session, attach_only = true,
     focus_on_inverse = false, focus_on_forward = false, compile = false, open_pdf = false,
+    log_file = directory .. '/s/pdfterm.log',
     keys = { forward = '', build = '', main_file = '', compile = '' } })
   local source = require('pdfterm.source')
 
@@ -261,7 +278,7 @@ local function main()
         byte_column = mapped.byte_column, warning = mapped.warning or vim.NIL }
     end
     context.stage, context.query_index = 'delivery', nil
-    state.delivery = deliver(config.editor.path, spec.delivery)
+    state.delivery = deliver(config.editor.path, spec.delivery, plugin)
     local after = observation()
     for key, value in pairs(after) do state[key] = value end
     state.buffer_preserved = vim.deep_equal(before.lines, after.lines) and before.modified == after.modified

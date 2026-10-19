@@ -594,20 +594,31 @@ local ok, failure = xpcall(function()
     not vim.uv.fs_stat(directory .. '/artifacts/navigation.synctex.gz'),
     'opening PDF unexpectedly rebuilt TeX'
   )
-  -- Unavailable source geometry warns without sending unrelated page-one navigation.
+  -- Unavailable source geometry warns without sending unrelated page-one navigation when launch is disabled.
   adapter.toggle_compile()
   local navigation_notices = {}
   vim.notify = function(message, level)
     assert(not vim.in_fast_event(), 'navigation warning emitted from process callback')
     navigation_notices[#navigation_notices + 1] = { message = message, level = level }
   end
-  adapter.forward()
+  adapter.forward(false)
   wait(function()
     return #navigation_notices > 0
   end)
   assert(#requests == 2, 'missing source geometry changed the viewer position')
   for _, notice in ipairs(navigation_notices) do
     assert(notice.level == vim.log.levels.WARN, 'unavailable source geometry did not warn')
+  end
+  -- Default forward / forward_split still opens the PDF at page 1 when source geometry is unavailable.
+  navigation_notices = {}
+  adapter.forward()
+  wait(function()
+    return #requests == 3 and #navigation_notices > 0
+  end)
+  local split_fallback = table.remove(requests)
+  assert(split_fallback.page == 1 and split_fallback.best_guess == true, 'forward did not open PDF at page 1')
+  for _, notice in ipairs(navigation_notices) do
+    assert(notice.level == vim.log.levels.WARN, 'forward unavailable source geometry did not warn')
   end
   -- A usable source line resumes navigation after the sidecar becomes available.
   assert(vim.uv.fs_rename(preserved_sidecar, sidecar))
@@ -807,20 +818,20 @@ local ok, failure = xpcall(function()
   vim.notify = function(message, level)
     notices[#notices + 1] = { message = message, level = level }
   end
-  vim.cmd('PdfTermForward')
+  adapter.forward(false)
   wait(function()
     return #notices >= 2
   end)
-  assert(launches == 0 and #requests == 8, 'ordinary forward launched a viewer')
+  assert(launches == 0 and #requests == 8, 'attach-only forward launched a viewer')
   assert(notices[#notices].message:find('PdfTermForwardSplit', 1, true))
   focused = nil
-  vim.cmd('PdfTermForwardSplit')
+  vim.cmd('PdfTermForward')
   wait(function()
     return #requests == 9 and focused == 'viewer'
   end)
   assert(
     launches == 1 and requests[9].page == 1,
-    'explicit split did not launch and focus its viewer after forward'
+    'default forward did not launch and focus its viewer'
   )
   focused = nil
   adapter.forward_search(pdf, vim.json.encode(requests[1]), { kind = 'ghostty', id = 'source' })

@@ -14,14 +14,15 @@ local ok, failure = xpcall(function()
   pdfterm.log_entry('INFO', 'should not write because no path configured')
   assert(vim.fn.filereadable(log_file) == 0, 'file should not be created if unconfigured')
 
-  -- 2. Setup with log_file
+  -- 2. Setup with ~/log_file
+  vim.env.HOME = directory
   pdfterm.setup({
     executable = binary,
-    log_file = log_file,
+    log_file = '~/logs/pdfterm.log',
     session = 'test-log-session',
   })
 
-  assert(pdfterm.log_path() == log_file, 'log_path must match configured path')
+  assert(pdfterm.log_path() == log_file, 'log_path must expand ~/ to configured path')
 
   -- 3. Test log_entry writes formatted lines
   pdfterm.log_entry('INFO', 'hello world', 'test_ctx')

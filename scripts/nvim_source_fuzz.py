@@ -355,6 +355,10 @@ def check(trace: dict, models: list[History], actual: dict):
             return failure('delivery_projection', state_index, queries['delivery'], expected, delivered)
         if expected is None and not delivered.get('warnings'):
             return failure('delivery_warning', state_index, queries['delivery'], 'coarse warning', delivered)
+        logs = delivered.get('logs') or []
+        expected_log = '[INFO]' if expected is not None else '[WARN]'
+        if not any(expected_log in line for line in logs):
+            return failure('delivery_log', state_index, queries['delivery'], expected_log, delivered)
         if model.text != model.saved_text and not observed.get('modified'):
             return failure('dirty_buffer_saved', state_index, None, True, observed.get('modified'))
     return None
@@ -431,7 +435,8 @@ def main():
     parser.add_argument('--seed', type=int, default=20261011)
     parser.add_argument('--cases', type=int, default=1_000_000)
     parser.add_argument('--steps', type=int, default=32)
-    parser.add_argument('--binary', type=Path, default=Path(shutil.which('pdfterm') or ROOT / 'target/release/pdfterm'))
+    release = ROOT / 'target/release/pdfterm'
+    parser.add_argument('--binary', type=Path, default=release if release.is_file() else Path(shutil.which('pdfterm') or release))
     parser.add_argument('--nvim', default='nvim')
     parser.add_argument('--timeout', type=float, default=30)
     parser.add_argument('--output', type=Path)

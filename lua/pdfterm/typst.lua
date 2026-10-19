@@ -409,6 +409,8 @@ function M.resolve(project, file, line, byte_column, callback)
   end
   local function fail(g, reason)
     if stopped or generation ~= g or g.stopped then return end
+    g.inputs[project.main] = g.inputs[project.main] or fingerprint(project.main)
+    g.before = revision(project.pdf)
     g.error = 'Typst source navigation: ' .. tostring(reason)
     answer(g.query, { ok = false, error = g.error })
     g.query = nil
@@ -517,7 +519,8 @@ function M.resolve(project, file, line, byte_column, callback)
         published, g.ready = revision(project.pdf), true
         if g.timer then g.timer:stop(); g.timer:close(); g.timer = nil end
         if not completed then
-          private = canonical(assert(vim.uv.fs_mkdtemp('/tmp/pdfterm-XXXXXX')), '/')
+          local tmp = vim.fn.isdirectory('/tmp') == 1 and '/tmp' or vim.uv.os_tmpdir():gsub('/+$', '')
+          private = canonical(assert(vim.uv.fs_mkdtemp(tmp .. '/pdfterm-XXXXXX')), '/')
           assert(vim.uv.fs_chmod(private, 448))
           local owner = assert(vim.uv.fs_lstat(private))
           assert(owner.uid == vim.uv.getuid() and bit.band(owner.mode, 511) == 448,
@@ -606,7 +609,7 @@ function M.resolve(project, file, line, byte_column, callback)
       end
       g.rpc = vim.lsp.rpc.start({ 'tinymist', 'lsp' }, {
         notification = guarded(g, function(method, params)
-          if method == 'window/showMessage' and params.type <= 2 then
+          if method == 'window/showMessage' and params.type == 1 then
             fail(g, params.message)
           elseif method == 'tinymist/preview/scrollSource' and g.query then
             assert(type(params) == 'table' and type(params.start) == 'table',

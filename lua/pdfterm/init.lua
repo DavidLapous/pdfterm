@@ -24,10 +24,8 @@ local function log_path()
   if path == vim.NIL or not path or path == '' then
     return nil
   end
-  local home = vim.uv.os_homedir() or vim.env.HOME or '~'
-  if path == '~' then
-    return home
-  elseif path:sub(1, 2) == '~/' then
+  if path:sub(1, 2) == '~/' then
+    local home = vim.uv.os_homedir() or vim.env.HOME or '~'
     return home .. path:sub(2)
   end
   return path
@@ -182,7 +180,7 @@ local function current_source(buffer)
   end
 end
 
-local function with_saved_project(buffer, file, id, callback, header)
+local function with_saved_project(buffer, file, id, callback, header, depth)
   if not alive(id) then return end
   local tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
   local text = header or current_source(buffer)
@@ -194,8 +192,12 @@ local function with_saved_project(buffer, file, id, callback, header)
     if current_tick ~= tick then
       local updated = current_source(buffer)
       if updated ~= nil and updated ~= text then
-        with_saved_project(buffer, file, id, callback, updated)
-        return
+        if describe(file, updated).main ~= p.main then
+          assert((depth or 0) < 4, 'pdfterm: source root changed repeatedly while saving; repeat the command')
+          with_saved_project(buffer, file, id, callback, updated, (depth or 0) + 1)
+          return
+        end
+        text = updated
       end
     end
     save_buffer(buffer)
@@ -503,9 +505,10 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch, foc
         end
         if not allow_launch then
           notify(
-            options.attach_only and 'viewer unavailable; attach_only requires an existing viewer'
+            options.attach_only
+                and 'viewer unavailable; attach_only requires an existing viewer (use :PdfTermViewerCommand for manual pairing)'
               or remote_session() and 'viewer unavailable; use :PdfTermViewerCommand for manual pairing'
-              or 'viewer unavailable; use :PdfTermForwardSplit to launch one'
+              or 'viewer unavailable; use :PdfTermForwardSplit to launch one or :PdfTermViewerCommand for manual pairing'
           )
           return
         end
@@ -679,6 +682,9 @@ function M.build()
   end)
 end
 local function forward(allow_launch)
+  if type(allow_launch) ~= 'boolean' then
+    allow_launch = true
+  end
   local id = intent()
   local buffer, cursor = vim.api.nvim_get_current_buf(), vim.api.nvim_win_get_cursor(0)
   local file = vim.api.nvim_buf_get_name(buffer)
@@ -709,11 +715,14 @@ local function forward(allow_launch)
           release_point(point)
           if result.code ~= 0 then
             if result.code == 3 then
-              local text = warning_text(
-                'Source navigation unavailable; PDF position unchanged.',
-                vim.trim(result.stderr):gsub('^pdfterm:%s*', '')
-              )
-              warn(text or 'Source navigation unavailable; PDF position unchanged.', context)
+              local fallback = allow_launch
+                and 'Source navigation unavailable; opening PDF at page 1 without source positioning.'
+                or 'Source navigation unavailable; PDF position unchanged.'
+              local text = warning_text(fallback, vim.trim(result.stderr):gsub('^pdfterm:%s*', ''))
+              warn(text or fallback, context)
+              if allow_launch then
+                open_pdf(p.pdf, id, source, source_error, true, true)
+              end
             else
               notify(vim.trim(result.stderr), context)
             end
@@ -743,8 +752,15 @@ local function forward(allow_launch)
           end
           if not mapped then
             release_point(point)
-            local msg = unavailable or 'Source navigation unavailable; PDF position unchanged.'
+            local fallback = allow_launch
+              and 'Source navigation unavailable; opening PDF at page 1 without source positioning.'
+              or 'Source navigation unavailable; PDF position unchanged.'
+            local msg = allow_launch and (warning_text(fallback, unavailable) or fallback)
+              or (unavailable or fallback)
             warn(msg, context)
+            if allow_launch then
+              open_pdf(p.pdf, id, source, source_error, true, true)
+            end
             return
           end
           if point.boundary or #position == 0 or position[3].invalid then
@@ -788,8 +804,8 @@ local function forward(allow_launch)
     end, true)
   end)
 end
-function M.forward()
-  forward(false)
+function M.forward(allow_launch)
+  forward(allow_launch)
 end
 function M.forward_split()
   forward(true)

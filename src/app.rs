@@ -1077,13 +1077,33 @@ impl App {
         }
     }
 
-    fn begin_goto(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+    fn begin_goto(
+        &mut self,
+        initial: impl Into<String>,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
         if self.session.pending_open.is_some() {
             return Ok(());
         }
-        self.goto_input = Some(String::new());
+        self.goto_input = Some(initial.into());
         let viewport = self.viewport()?;
         self.draw_goto(output, viewport)?;
+        Ok(())
+    }
+
+    fn finish_goto(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let input = self.goto_input.take().unwrap_or_default();
+        let target = input
+            .trim()
+            .trim_end_matches('g')
+            .parse::<u32>()
+            .ok()
+            .filter(|number| *number >= 1)
+            .map(|number| (number - 1).min(self.tab().page_count - 1));
+        match target {
+            Some(page) if page != self.tab().page => self.set_page(page, output)?,
+            _ => self.redraw_current(output)?,
+        }
         Ok(())
     }
 
@@ -1093,17 +1113,23 @@ impl App {
                 self.goto_input = None;
                 self.redraw_current(output)?;
             }
-            KeyCode::Enter => {
-                let input = self.goto_input.take().unwrap_or_default();
-                let target = input
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|number| *number >= 1)
-                    .map(|number| (number - 1).min(self.tab().page_count - 1));
-                match target {
-                    Some(page) if page != self.tab().page => self.set_page(page, output)?,
-                    _ => self.redraw_current(output)?,
+            KeyCode::Enter | KeyCode::Char('G') => self.finish_goto(output)?,
+            KeyCode::Char('g') if key.modifiers == KeyModifiers::SHIFT => {
+                self.finish_goto(output)?
+            }
+            KeyCode::Char('g') if key.modifiers == KeyModifiers::NONE => {
+                if self
+                    .goto_input
+                    .as_deref()
+                    .is_some_and(|buffer| buffer.ends_with('g'))
+                {
+                    self.finish_goto(output)?;
+                } else {
+                    if let Some(buffer) = self.goto_input.as_mut() {
+                        buffer.push('g');
+                    }
+                    let viewport = self.viewport()?;
+                    self.draw_goto(output, viewport)?;
                 }
             }
             KeyCode::Backspace => {
@@ -1114,7 +1140,11 @@ impl App {
                 self.draw_goto(output, viewport)?;
             }
             KeyCode::Char(character) if character.is_ascii_digit() => {
-                if let Some(buffer) = self.goto_input.as_mut().filter(|buffer| buffer.len() < 9) {
+                if let Some(buffer) = self
+                    .goto_input
+                    .as_mut()
+                    .filter(|buffer| !buffer.ends_with('g') && buffer.len() < 9)
+                {
                     buffer.push(character);
                 }
                 let viewport = self.viewport()?;
@@ -1130,7 +1160,7 @@ impl App {
         let theme = self.theme;
         let input = self.goto_input.as_deref().unwrap_or_default();
         let hint = format!(
-            "  (1-{}, enter to jump, esc to cancel)",
+            "  (1-{}, enter/G/gg to jump, esc to cancel)",
             self.tab().page_count
         );
         execute!(
@@ -3053,6 +3083,10 @@ impl App {
                 self.follow_link_back(output)?;
                 return Ok(());
             }
+            KeyCode::Char('o') if control && !alt => {
+                self.follow_link_back(output)?;
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -3174,24 +3208,22 @@ impl App {
         key: KeyEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers == KeyModifiers::SHIFT;
         if matches!(
             key.code,
             KeyCode::Down
-                | KeyCode::Char('j')
+                | KeyCode::Char(
+                    'j' | 'k' | 'J' | 'K' | ' ' | 'g' | 'G' | 'm' | 'i' | 'd' | 'u' | 'f' | 'b'
+                )
                 | KeyCode::Up
-                | KeyCode::Char('k')
                 | KeyCode::PageDown
-                | KeyCode::Char(' ')
                 | KeyCode::PageUp
                 | KeyCode::Backspace
                 | KeyCode::Right
                 | KeyCode::Left
-                | KeyCode::Char('g')
                 | KeyCode::Home
-                | KeyCode::Char('G')
                 | KeyCode::End
-                | KeyCode::Char('m')
-                | KeyCode::Char('i')
         ) {
             if let Some(state) = self.link_picker.as_mut() {
                 state.pending_preview = None;
@@ -3203,6 +3235,10 @@ impl App {
             }
         }
         match key.code {
+            KeyCode::Char('J') => self.page_step(true, output)?,
+            KeyCode::Char('j') if shift => self.page_step(true, output)?,
+            KeyCode::Char('K') => self.page_step(false, output)?,
+            KeyCode::Char('k') if shift => self.page_step(false, output)?,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_view(Axis::Vertical, true, false, true, output)?
             }
@@ -3213,6 +3249,22 @@ impl App {
                 self.move_view(Axis::Vertical, true, true, true, output)?
             }
             KeyCode::PageUp | KeyCode::Backspace => {
+                self.move_view(Axis::Vertical, false, true, true, output)?
+            }
+            KeyCode::Char('d')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
+            {
+                self.move_view(Axis::Vertical, true, true, true, output)?
+            }
+            KeyCode::Char('u')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
+            {
+                self.move_view(Axis::Vertical, false, true, true, output)?
+            }
+            KeyCode::Char('f') if control => {
+                self.move_view(Axis::Vertical, true, true, true, output)?
+            }
+            KeyCode::Char('b') if control => {
                 self.move_view(Axis::Vertical, false, true, true, output)?
             }
             KeyCode::Right => self.move_view(Axis::Horizontal, true, false, true, output)?,
@@ -3253,6 +3305,8 @@ impl App {
             self.select_tab(index, output)?;
             return Ok(false);
         }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers == KeyModifiers::SHIFT;
         match key.code {
             KeyCode::Char('x') if self.session.pending_open.is_none() && !self.link_mode => {
                 self.begin_label_mode(output)?
@@ -3260,24 +3314,49 @@ impl App {
             KeyCode::Char('?') => self.open_help(output)?,
             KeyCode::Char('q') if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Char('q') => return self.close_current(output),
-            KeyCode::Char(':') => self.begin_goto(output)?,
+            KeyCode::Char(':') => self.begin_goto(String::new(), output)?,
+            KeyCode::Char(digit @ '1'..='9') if key.modifiers == KeyModifiers::NONE => {
+                self.begin_goto(digit.to_string(), output)?
+            }
             KeyCode::Char('/') => self.begin_search(output)?,
             KeyCode::Char('n') => self.navigate_search(true, output)?,
             KeyCode::Char('N') => self.navigate_search(false, output)?,
             KeyCode::Char('L') => self.toggle_link_mode(output)?,
+            KeyCode::Char('b') if control => {
+                self.move_view(Axis::Vertical, false, true, true, output)?
+            }
             KeyCode::Char('b') => self.follow_link_back(output)?,
+            KeyCode::Char('o') if control => self.follow_link_back(output)?,
             KeyCode::Enter => self.open_link_picker(output)?,
             KeyCode::Esc if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Esc if self.clear_search(output)? => {}
             KeyCode::Esc => return Ok(true),
+            KeyCode::Char('f') if control => {
+                self.move_view(Axis::Vertical, true, true, true, output)?
+            }
             KeyCode::Char('f') => self.open_picker(output)?,
             KeyCode::Char('D')
                 if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
             {
                 self.duplicate_tab(output)?
             }
+            KeyCode::Char('d') if shift => self.duplicate_tab(output)?,
+            KeyCode::Char('d')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
+            {
+                self.move_view(Axis::Vertical, true, true, true, output)?
+            }
+            KeyCode::Char('u')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
+            {
+                self.move_view(Axis::Vertical, false, true, true, output)?
+            }
             KeyCode::Tab => self.switch_tab(1, output)?,
             KeyCode::BackTab => self.switch_tab(-1, output)?,
+            KeyCode::Char('J') => self.page_step(true, output)?,
+            KeyCode::Char('j') if shift => self.page_step(true, output)?,
+            KeyCode::Char('K') => self.page_step(false, output)?,
+            KeyCode::Char('k') if shift => self.page_step(false, output)?,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_view(Axis::Vertical, true, false, true, output)?
             }
@@ -3310,13 +3389,17 @@ impl App {
             {
                 self.toggle_smooth_scroll(output)?
             }
-            KeyCode::Char('s') if key.modifiers == KeyModifiers::SHIFT => {
-                self.toggle_smooth_scroll(output)?
-            }
+            KeyCode::Char('s') if shift => self.toggle_smooth_scroll(output)?,
             KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
             KeyCode::Char('T') => self.open_theme_picker(output)?,
             KeyCode::Char('y') => self.request_copy(output)?,
+            KeyCode::Char('R')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.reload_config(output)?
+            }
+            KeyCode::Char('r') if shift => self.reload_config(output)?,
             _ => {}
         }
         Ok(false)
@@ -3404,9 +3487,9 @@ impl App {
             Axis::Horizontal => u32::from(viewport.pixel_width),
         };
         let step = if large {
-            (span * 85 / 100).max(1)
+            (span * self.viewer.page_scroll_percent as u32 / 100).max(1)
         } else {
-            (span / 8).max(1)
+            (span * self.viewer.scroll_step_percent as u32 / 100).max(1)
         };
 
         let next = if forward {
@@ -3772,6 +3855,66 @@ impl App {
         let state = snapshot.status(self.show_performance, self.link_mode);
         self.draw_status(output, self.viewport()?, &state)?;
         Ok(())
+    }
+
+    fn reload_config(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let config = match Config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                let viewport = self.viewport()?;
+                self.draw_status(output, viewport, &format!("config error: {error}"))?;
+                return Ok(());
+            }
+        };
+        self.apply_config(&config);
+        self.clear_viewer(output)?;
+        self.reset_render_state();
+        self.request_current(output)?;
+        let viewport = self.viewport()?;
+        self.draw_status(output, viewport, "config reloaded")?;
+        Ok(())
+    }
+
+    fn apply_config(&mut self, config: &Config) {
+        let defaults = AppDefaults::from_config(config, self.focus_token.clone());
+        let fit_changed = self.default_fit != defaults.fit;
+        let invert_changed = self.default_invert != defaults.invert;
+        self.default_fit = defaults.fit;
+        self.default_invert = defaults.invert;
+        self.persistent_link_picker = defaults.persistent_link_picker;
+        self.link_picker_geometry = defaults.link_picker_geometry;
+        if self.link_picker_geometry.layout == LinkPickerLayout::Floating {
+            if let Some(state) = &mut self.link_picker {
+                state.focus = LinkPickerFocus::Links;
+            }
+            if let Some(state) = &mut self.search_picker {
+                state.focus = LinkPickerFocus::Links;
+            }
+        }
+        self.synctex_enabled = defaults.synctex_enabled;
+        if self.forward_socket.is_none()
+            || !matches!(defaults.editor, crate::editor::Editor::Socket { .. })
+        {
+            self.editor = defaults.editor;
+        }
+        self.viewer = defaults.viewer;
+        if !self.viewer.set_window_title {
+            self.title_document = None;
+        }
+        if !self.viewer.smooth_scroll {
+            self.smooth_scroll_remaining = 0;
+        }
+        self.themes = defaults.themes;
+        self.flash_font = None;
+        self.apply_theme(defaults.theme_index);
+        for tab in &mut self.session.tabs {
+            if fit_changed {
+                tab.fit = defaults.fit;
+            }
+            if invert_changed {
+                tab.invert = defaults.invert;
+            }
+        }
     }
 
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -4492,8 +4635,10 @@ impl App {
 
     fn prefetch_neighbors(&mut self, key: RenderKey) {
         let page_count = self.tab().page_count;
-        for page in (1..=u32::try_from(self.viewer.prefetch_pages)
-            .expect("validated prefetch_pages exceeds u32"))
+        let max_distance = u32::try_from(self.viewer.prefetch_pages)
+            .expect("validated prefetch_pages exceeds u32")
+            .min(page_count.saturating_sub(1));
+        for page in (1..=max_distance)
             .flat_map(|distance| {
                 [
                     key.page.checked_sub(distance),
@@ -4622,6 +4767,10 @@ impl App {
     }
 
     fn viewport(&self) -> io::Result<Viewport> {
+        #[cfg(test)]
+        if let Some(viewport) = self.canvas_viewport {
+            return Ok(viewport);
+        }
         Viewport::detect(u16::from(self.session.tabs.len() > 1))
     }
 
@@ -5360,10 +5509,12 @@ fn pick_theme(
             KeyCode::Char('k') if !filtering => {
                 selected = if selected == 0 { last } else { selected - 1 };
             }
-            KeyCode::Char('f') if control => {
+            KeyCode::Char('f' | 'd') if control => {
                 selected = (selected + visible_height).min(last);
             }
-            KeyCode::Char('b') if control => selected = selected.saturating_sub(visible_height),
+            KeyCode::Char('b' | 'u') if control => {
+                selected = selected.saturating_sub(visible_height);
+            }
             KeyCode::Char('g') if !filtering && !control && !alt => selected = 0,
             KeyCode::Char('G') if !filtering && !control && !alt => selected = last,
             KeyCode::Home => selected = 0,
@@ -5754,8 +5905,8 @@ fn link_picker_navigation_index(
     match key.code {
         KeyCode::Down | KeyCode::Char('j') => Some((selected + 1) % link_count),
         KeyCode::Up | KeyCode::Char('k') => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
-        KeyCode::Char('f') if control => Some((selected + visible_height).min(link_count - 1)),
-        KeyCode::Char('b') if control => Some(selected.saturating_sub(visible_height)),
+        KeyCode::Char('f' | 'd') if control => Some((selected + visible_height).min(link_count - 1)),
+        KeyCode::Char('b' | 'u') if control => Some(selected.saturating_sub(visible_height)),
         KeyCode::Char('g') if !control && !alt => Some(0),
         KeyCode::Char('G') if !control && !alt => Some(link_count - 1),
         KeyCode::Home => Some(0),
@@ -5902,10 +6053,12 @@ fn pick_outline(
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Char('j') if !filtering => selected = (selected + 1).min(last),
             KeyCode::Char('k') if !filtering => selected = selected.saturating_sub(1),
-            KeyCode::Char('f') if control => {
+            KeyCode::Char('f' | 'd') if control => {
                 selected = (selected + visible_height).min(last);
             }
-            KeyCode::Char('b') if control => selected = selected.saturating_sub(visible_height),
+            KeyCode::Char('b' | 'u') if control => {
+                selected = selected.saturating_sub(visible_height);
+            }
             KeyCode::Char('g') if !filtering && !control && !alt => selected = 0,
             KeyCode::Char('G') if !filtering && !control && !alt => selected = last,
             KeyCode::Home => selected = 0,
@@ -6101,8 +6254,8 @@ fn apply_picker_navigation(
         KeyCode::Up => browser.select_up(),
         KeyCode::Char('j') if !filtering => browser.select_down(),
         KeyCode::Char('k') if !filtering => browser.select_up(),
-        KeyCode::Char('f') if control => browser.page_down(visible_height),
-        KeyCode::Char('b') if control => browser.page_up(visible_height),
+        KeyCode::Char('f' | 'd') if control => browser.page_down(visible_height),
+        KeyCode::Char('b' | 'u') if control => browser.page_up(visible_height),
         KeyCode::Char('g')
             if !control && !key.modifiers.contains(KeyModifiers::ALT) && !filtering =>
         {
@@ -7106,10 +7259,11 @@ fn link_picker_label(label: &str) -> String {
 fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
     const NAVIGATION: &[(&str, &str)] = &[
         ("j/k · ↑/↓", "scroll vertically"),
+        ("J / K", "next / previous page"),
         ("h/l · ←/→", "move horizontally"),
-        ("Space · PgDn", "page viewport forward"),
-        ("Backspace · PgUp", "page viewport backward"),
-        ("g / G", "first / last page"),
+        ("d/u · ^d/^u · ^f/^b", "page viewport down / up"),
+        ("Space/PgDn · Bksp/PgUp", "page viewport down / up"),
+        ("g / G · [N]G / [N]gg", "first / last / page N"),
         (":", "go to page"),
         ("/", "search document"),
         ("n / N", "next / prev match"),
@@ -7118,7 +7272,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("Click", "follow PDF link"),
         ("h / l (split)", "focus PDF/pane"),
         ("/ (pane)", "filter/new search"),
-        ("Ctrl-b/f (pane)", "page results"),
+        ("Ctrl-b/f/d/u (pane)", "page results"),
         ("g / G (pane)", "first/last"),
         ("Tab / Shift-Tab", "switch tabs"),
         ("Alt-1 … Alt-9", "select tab"),
@@ -7137,9 +7291,10 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("y", "copy page text"),
         ("L", "link mode + browser"),
         ("s / a", "cycle / auto layout"),
-        ("b", "back from link"),
+        ("b / Ctrl-o", "back from link"),
         ("f", "open PDF in new tab"),
         ("D", "duplicate tab at current view"),
+        ("R", "reload config"),
         ("q", "leave mode / close tab"),
         ("Esc", "leave mode / clear / exit"),
         ("?", "open help"),
@@ -7213,7 +7368,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
             Line::from("[viewer]: flash_duration_ms, flash_label_font, word_precision, source_context_lines"),
             Line::from("[viewer]: flash_label_foreground, flash_label_background (#RRGGBB)"),
             Line::from("[nvim]: focus_on_forward, focus_on_inverse, compile; [nvim.keys]: editor keys"),
-            Line::from("Commented defaults on first launch. Edit config, then restart."),
+            Line::from("Commented defaults on first launch. Press R to reload config."),
         ])
         .style(Style::default().bg(colors.surface).fg(colors.text))
         .wrap(Wrap { trim: true }),
@@ -10114,4 +10269,321 @@ mod tests {
         assert!(picker.preview_origin.is_none());
         assert!(app.tab().link_index.started());
     }
+
+    #[test]
+    fn apply_config_updates_viewer_and_tab_defaults() {
+        let (mut app, _viewport, _file) = continuous_app();
+        let config: crate::config::Config = toml::from_str(
+            "fit_mode = \"width\"\ndark_mode = true\npersistent_link_picker = true\n\
+             [viewer]\nscroll_step_percent = 8\nsmooth_scroll = true\n",
+        )
+        .expect("config");
+        app.apply_config(&config);
+        assert_eq!(app.viewer.scroll_step_percent, 8);
+        assert!(app.viewer.smooth_scroll);
+        assert!(app.persistent_link_picker);
+        assert_eq!(app.default_fit, crate::pdf::FitMode::Width);
+        assert!(app.default_invert);
+        assert_eq!(app.tab().fit, crate::pdf::FitMode::Width);
+        assert!(app.tab().invert);
+    }
+
+    #[test]
+    fn classic_vim_zathura_motions_navigate_pages_and_history() {
+        let (mut app, viewport, file) = continuous_app();
+        let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+        app.tab_mut().page_count = 15;
+        app.pending.clear();
+        for page in 0..15 {
+            let key = app.page_key(page, viewport);
+            app.tab_mut()
+                .cache
+                .insert(key, continuous_frame(key, revision, false));
+        }
+        let mut output = Vec::new();
+
+        // J / K step pages directly even in continuous_scroll mode
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 0);
+
+        // [count]G jumps to page
+        for key in [
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+        ] {
+            app.handle_key(key, &mut output).unwrap();
+        }
+        assert_eq!(app.tab().page, 11);
+        assert!(app.goto_input.is_none());
+
+        // [count]gg jumps to page without the second 'g' hitting normal mode
+        for key in [
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        ] {
+            app.handle_key(key, &mut output).unwrap();
+        }
+        assert_eq!(app.tab().page, 13);
+        assert!(app.goto_input.is_none());
+
+        // [count]<Enter> jumps to page
+        for key in [
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            app.handle_key(key, &mut output).unwrap();
+        }
+        assert_eq!(app.tab().page, 2);
+
+        // Ctrl-o pops link history like 'b'
+        app.tab_mut().link_history.push(super::ViewPosition {
+            page: 7,
+            scroll_x: 0,
+            scroll_y: 0,
+        });
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 7);
+
+        // d / u and Ctrl-d / Ctrl-u / Ctrl-f / Ctrl-b page viewport
+        app.viewer.continuous_scroll = false;
+        app.tab_mut().scroll_y = 0;
+        for (down, up) in [
+            (
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            ),
+        ] {
+            let before = app.tab().page;
+            app.handle_key(down, &mut output).unwrap();
+            assert_eq!((app.tab().page, app.tab().scroll_y), (before, 40));
+            app.handle_key(up, &mut output).unwrap();
+            assert_eq!((app.tab().page, app.tab().scroll_y), (before, 0));
+        }
+
+        // Picker Ctrl-d / Ctrl-u paging
+        assert_eq!(
+            link_picker_navigation_index(
+                2,
+                20,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                5,
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            link_picker_navigation_index(
+                7,
+                20,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                5,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn fuzz_config_combinations_and_live_viewer_transitions() {
+        let (mut app, viewport, file) = continuous_app();
+        let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+        app.tab_mut().page_count = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let fit_modes = ["page", "width", "height"];
+        let dark_modes = ["dark_mode = false", "dark_mode = true", "invert = true"];
+        let themes = [
+            "",
+            "theme = \"\"",
+            "theme = \"Tokyo Night\"",
+            "theme = \"Catppuccin Latte\"",
+            "theme = \"/nonexistent/theme.toml\"",
+        ];
+        let catalogs = [
+            "",
+            "theme_catalog = \"\"",
+            "theme_catalog = \"/nonexistent/catalog.toml\"",
+        ];
+        let split_percents = [
+            "",
+            "link_picker_split_percent = 0",
+            "link_picker_split_percent = 20",
+            "link_picker_split_percent = 50",
+            "link_picker_split_percent = 80",
+            "link_picker_split_percent = 100",
+        ];
+        let layouts = ["auto", "vertical", "horizontal", "floating"];
+        let synctex_flags = ["", "synctex_enabled = false", "synctex_enabled = true"];
+        let editors = [
+            "[editor]\ntransport = \"none\"",
+            "[editor]\ntransport = \"socket\"\npath = \"editor.sock\"",
+            "[editor]\ntransport = \"command\"\nargv = [\"nvim\", \"+{line}\", \"{file}\"]",
+        ];
+        let forward_sockets = ["", "forward_socket = \"\"", "forward_socket = \"forward.sock\""];
+        let prefetch_values = [0u64, 1, 3, u32::MAX as u64];
+        let step_percents = [1u64, 5, 100];
+        let page_percents = [1u64, 85, 100];
+        let ease_divisors = [1u64, 4, 100];
+        let frame_ms_values = [1u64, 16, 1000];
+        let flash_durations = [1u64, 1000, 60000];
+        let context_lines = [0u64, 4, 100];
+        let flash_fonts = ["monospace", "", "nonexistent-font"];
+
+        let mut output = Vec::new();
+        for i in 0..96usize {
+            let fit = fit_modes[i % fit_modes.len()];
+            let dark = dark_modes[(i / 3) % dark_modes.len()];
+            let theme = themes[(i / 5) % themes.len()];
+            let catalog = catalogs[(i / 7) % catalogs.len()];
+            let persistent = i % 2 == 1;
+            let split = split_percents[(i / 2) % split_percents.len()];
+            let layout = layouts[(i / 4) % layouts.len()];
+            let synctex = synctex_flags[(i / 6) % synctex_flags.len()];
+            let editor = editors[(i / 8) % editors.len()];
+            let forward_socket = forward_sockets[(i / 9) % forward_sockets.len()];
+            let continuous = (i / 2) % 2 == 0;
+            let smooth = (i / 3) % 2 == 1;
+            let prefetch = prefetch_values[(i / 4) % prefetch_values.len()];
+            let step_pct = step_percents[(i / 5) % step_percents.len()];
+            let page_pct = page_percents[(i / 6) % page_percents.len()];
+            let ease_div = ease_divisors[(i / 7) % ease_divisors.len()];
+            let frame_ms = frame_ms_values[(i / 8) % frame_ms_values.len()];
+            let set_title = (i / 5) % 2 == 0;
+            let center_forward = (i / 6) % 2 == 0;
+            let flash_ms = flash_durations[(i / 9) % flash_durations.len()];
+            let font = flash_fonts[(i / 10) % flash_fonts.len()];
+            let word_precision = (i / 7) % 2 == 0;
+            let ctx_lines = context_lines[(i / 11) % context_lines.len()];
+            let nvim_bool = i % 2 == 0;
+
+            let toml_text = format!(
+                "fit_mode = \"{fit}\"\n\
+                 {dark}\n\
+                 {theme}\n\
+                 {catalog}\n\
+                 persistent_link_picker = {persistent}\n\
+                 {split}\n\
+                 link_picker_layout = \"{layout}\"\n\
+                 {synctex}\n\
+                 {forward_socket}\n\
+                 {editor}\n\
+                 [viewer]\n\
+                 continuous_scroll = {continuous}\n\
+                 prefetch_pages = {prefetch}\n\
+                 smooth_scroll = {smooth}\n\
+                 scroll_frame_ms = {frame_ms}\n\
+                 scroll_ease_divisor = {ease_div}\n\
+                 scroll_step_percent = {step_pct}\n\
+                 page_scroll_percent = {page_pct}\n\
+                 set_window_title = {set_title}\n\
+                 center_forward_search = {center_forward}\n\
+                 flash_duration_ms = {flash_ms}\n\
+                 flash_label_font = \"{font}\"\n\
+                 flash_label_foreground = \"#000000\"\n\
+                 flash_label_background = \"#c0caf5\"\n\
+                 word_precision = {word_precision}\n\
+                 source_context_lines = {ctx_lines}\n\
+                 [nvim]\n\
+                 compile = {nvim_bool}\n\
+                 focus_on_inverse = {nvim_bool}\n\
+                 focus_on_forward = {nvim_bool}\n\
+                 attach_only = {nvim_bool}\n\
+                 executable = \"nvim\"\n"
+            );
+            std::fs::write(&config_path, &toml_text).unwrap();
+            let config = crate::config::Config::load_path(&config_path).unwrap();
+
+            let mut link_state = LinkPickerState::new(app.tab().page);
+            link_state.focus = LinkPickerFocus::Document;
+            app.link_picker = if i % 3 == 0 { Some(link_state) } else { None };
+            let mut search_state = SearchPickerState::new(app.tab().page);
+            search_state.focus = LinkPickerFocus::Document;
+            app.search_picker = if i % 5 == 0 && app.link_picker.is_none() {
+                Some(search_state)
+            } else {
+                None
+            };
+
+            app.apply_config(&config);
+            if app.link_picker_geometry.layout == LinkPickerLayout::Floating {
+                assert!(
+                    app.link_picker
+                        .as_ref()
+                        .is_none_or(|state| state.focus == LinkPickerFocus::Links)
+                );
+                assert!(
+                    app.search_picker
+                        .as_ref()
+                        .is_none_or(|state| state.focus == LinkPickerFocus::Links)
+                );
+            }
+            if !app.viewer.smooth_scroll {
+                assert_eq!(app.smooth_scroll_remaining, 0);
+            }
+            if !app.viewer.set_window_title {
+                assert!(app.title_document.is_none());
+            }
+
+            app.link_picker = None;
+            app.search_picker = None;
+            app.canvas_viewport = Some(viewport);
+            app.reset_render_state();
+            for page in 0..6 {
+                let key = app.page_key(page, viewport);
+                app.tab_mut()
+                    .cache
+                    .insert(key, continuous_frame(key, revision, false));
+            }
+            app.request_current(&mut output).unwrap();
+            let key = app.render_key(viewport);
+            app.receive_frame(
+                std::sync::Arc::into_inner(continuous_frame(key, revision, false)).unwrap(),
+                &mut output,
+            )
+            .unwrap();
+
+            // Exercise small & large vertical/horizontal scrolling + smooth scroll tick
+            for page in 0..6 {
+                let key = app.page_key(page, viewport);
+                app.tab_mut()
+                    .cache
+                    .insert(key, continuous_frame(key, revision, false));
+            }
+            app.move_view(super::Axis::Vertical, true, false, true, &mut output)
+                .unwrap();
+            app.move_view(super::Axis::Vertical, true, true, true, &mut output)
+                .unwrap();
+            app.move_view(super::Axis::Horizontal, true, false, false, &mut output)
+                .unwrap();
+            app.smooth_scroll_tick = Instant::now() - std::time::Duration::from_secs(2);
+            app.poll_smooth_scroll(&mut output).unwrap();
+            app.move_view(super::Axis::Vertical, false, false, true, &mut output)
+                .unwrap();
+        }
+    }
 }
+
