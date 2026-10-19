@@ -279,7 +279,12 @@ return liveIDs as text''', *sorted(identifiers), deadline=deadline)
 
     def close(self, identifier, deadline=None):
         applescript('''repeat 15 times
-if not (exists terminal id (item 1 of argv)) then return
+if not (exists terminal id (item 1 of argv)) then
+try
+focus (focused terminal of selected tab of front window)
+end try
+return
+end if
 send key "c" modifiers "control" to terminal id (item 1 of argv)
 delay 0.1
 end repeat

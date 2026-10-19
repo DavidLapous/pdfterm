@@ -225,6 +225,7 @@ package.loaded['pdfterm.platform'].applescript = function(script, argv, callback
     return
   end
   assert(script:find('send key "c"', 1, true))
+  assert(script:find('focus (focused terminal of selected tab of front window)', 1, true))
   assert(argv[1] == 'ghostty-child', 'rollback must never target the source or an independent surface')
   ghostty_calls[#ghostty_calls + 1] = { 'close', argv[1] }
   return { wait = function()

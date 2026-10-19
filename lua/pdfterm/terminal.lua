@@ -99,7 +99,13 @@ function ghostty.close(split)
 on run argv
   tell application "Ghostty"
     repeat 20 times
-      if not (exists terminal id (item 1 of argv)) then return
+      if not (exists terminal id (item 1 of argv)) then
+        -- Collapsing an unfocused split swaps SwiftUI's subtree identity and drops firstResponder.
+        try
+          focus (focused terminal of selected tab of front window)
+        end try
+        return
+      end if
       -- Ctrl-C quits the reader; another key dismisses Ghostty's retained exit screen.
       send key "c" modifiers "control" to terminal id (item 1 of argv)
       delay 0.1
