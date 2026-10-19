@@ -146,8 +146,8 @@ local function warning(first, second)
   first = first and first:gsub('%c', ' '):gsub('\194[\128-\159]', ' ')
   second = second and second:gsub('%c', ' '):gsub('\194[\128-\159]', ' ')
   local combined
-  if not first or first == '' then combined = second
-  elseif not second or second == '' or first == second then combined = first
+  if not first or first == '' or (second and second:sub(1, #first + 2) == first .. '; ') then combined = second
+  elseif not second or second == '' or first == second or first:sub(1, #second + 2) == second .. '; ' then combined = first
   else combined = first .. '; ' .. second end
   return combined and combined:sub(1, byte_boundary(combined, MAX_WARNING)) or nil
 end

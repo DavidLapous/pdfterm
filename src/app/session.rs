@@ -25,7 +25,7 @@ pub(super) struct Tab {
     pub(super) outline: Arc<Vec<OutlineItem>>,
     pub(super) cache: HashMap<RenderKey, Arc<Frame>>,
     pub(super) search: SearchState,
-    pub(super) link_history: Vec<ViewPosition>,
+    pub(super) link_history: JumpList,
     pub(super) pending_destination: Option<LinkDestination>,
     pub(super) link_index: LinkIndexState,
 }
@@ -224,7 +224,7 @@ impl App {
                 tab.outline = Arc::new(outline);
                 tab.cache.clear();
                 tab.search = SearchState::default();
-                tab.link_history.clear();
+                tab.link_history.clamp_pages(pages);
                 tab.pending_destination = None;
                 tab.link_index = LinkIndexState::new(pages);
                 if index == self.session.active_tab {
@@ -262,7 +262,7 @@ impl App {
                     outline: Arc::new(outline),
                     cache: HashMap::new(),
                     search: SearchState::default(),
-                    link_history: Vec::new(),
+                    link_history: JumpList::default(),
                     pending_destination: None,
                     link_index: LinkIndexState::new(pages),
                 });

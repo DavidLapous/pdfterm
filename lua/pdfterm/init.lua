@@ -241,7 +241,7 @@ local function inverse(location)
   local boundary_warn = (mapped.line < 1 or mapped.line > total_lines)
     and string.format('inverse target line %d is outside buffer bounds (1..%d)', mapped.line, total_lines)
     or nil
-  local warn_msg = warning_text(location.warning, mapped.warning, boundary_warn)
+  local warn_msg = warning_text(mapped.warning, boundary_warn)
   local context = string.format(
     'inverse: %s:%d:%d (precise=%s)',
     mapped.file,

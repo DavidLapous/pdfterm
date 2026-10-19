@@ -1,7 +1,10 @@
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::style::{ResetColor, SetBackgroundColor, SetForegroundColor, force_color_output};
 use crossterm::terminal::{
@@ -225,6 +228,7 @@ impl TerminalGuard {
             output,
             EnterAlternateScreen,
             EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg),
             DisableLineWrap,
@@ -245,6 +249,7 @@ impl Drop for TerminalGuard {
         let _ = kitty::delete_all(&mut output);
         let _ = execute!(
             output,
+            PopKeyboardEnhancementFlags,
             DisableMouseCapture,
             ResetColor,
             Show,

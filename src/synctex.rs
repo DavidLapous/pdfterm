@@ -1339,6 +1339,17 @@ impl InverseQuery<'_> {
             }
             if !generated
                 && let Some(map) = source_map.as_ref().and_then(|result| result.as_ref().ok())
+                && if location.is_some() {
+                    source_frame_range(&source, target.line).is_some()
+                } else {
+                    allows_metadata_fallback(
+                        &source,
+                        target.line,
+                        self.radius,
+                        self.point.y_from_top,
+                        self.point.page_height_pt,
+                    )
+                }
             {
                 if self.metadata.is_none() {
                     self.metadata = Some(document_metadata_word_location(
@@ -1424,6 +1435,33 @@ fn validate_forward_source_position(source: &str, line: u32, column: u32) -> io:
     Ok(text)
 }
 
+fn allows_metadata_fallback(
+    source: &str,
+    line: u32,
+    radius: u32,
+    y_from_top: f32,
+    page_height_pt: f32,
+) -> bool {
+    if source_frame_range(source, line).is_some() {
+        return true;
+    }
+    if page_height_pt > 0.0
+        && (y_from_top <= page_height_pt * 0.12 || y_from_top >= page_height_pt * 0.88)
+    {
+        return true;
+    }
+    let start = line.saturating_sub(radius.saturating_add(1)) as usize;
+    let end = (line as usize).saturating_add(radius as usize);
+    source
+        .lines()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .any(|row| {
+            let text = source_line_text(row);
+            text.contains("\\maketitle") || text.contains("\\titlepage")
+        })
+}
+
 /// A frame title and the running document title may contain the same words.
 /// Preserve a local frame hit except when a footer has stronger metadata context.
 fn metadata_beats_frame(
@@ -1436,7 +1474,7 @@ fn metadata_beats_frame(
     metadata_score: isize,
 ) -> bool {
     let Some(frame) = source_frame_range(source, line) else {
-        return true;
+        return false;
     };
     y_from_top >= page_height_pt / 2.0
         && source_prose_scored_location(
@@ -2365,6 +2403,127 @@ pub(crate) fn words(text: &str) -> Vec<(usize, &str)> {
     result
 }
 
+pub(crate) fn word_index_at(text: &str, words: &[(usize, &str)], offset: usize) -> Option<usize> {
+    if let Some(index) = words
+        .iter()
+        .position(|(start, word)| *start <= offset && offset < start + word.len())
+    {
+        return Some(index);
+    }
+    let ch = text.get(offset..)?.chars().next()?;
+    if matches!(
+        ch,
+        '-' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\'' | '\u{2019}'
+    ) {
+        let next = offset + ch.len_utf8();
+        return words
+            .iter()
+            .position(|(start, word)| start + word.len() == offset || *start == next);
+    }
+    None
+}
+
+fn tex_accent_char(text: &str, at: usize) -> Option<(char, usize)> {
+    let after = at.checked_add(1)?;
+    let cmd = *text.as_bytes().get(after)?;
+    let rest = text.get(after + 1..)?;
+    if matches!(cmd, b'\'' | b'`' | b'^' | b'"' | b'~' | b'=' | b'.') {
+        if let Some(braced) = rest.strip_prefix('{') {
+            if let Some(tail) = braced
+                .strip_prefix("\\i}")
+                .or_else(|| braced.strip_prefix("i}"))
+            {
+                return Some(('i', text.len() - tail.len()));
+            }
+            if let Some(tail) = braced
+                .strip_prefix("\\j}")
+                .or_else(|| braced.strip_prefix("j}"))
+            {
+                return Some(('j', text.len() - tail.len()));
+            }
+            let ch = braced.chars().next().filter(|ch| ch.is_alphabetic())?;
+            let tail = braced.get(ch.len_utf8()..)?.strip_prefix('}')?;
+            return Some((ch, text.len() - tail.len()));
+        }
+        if let Some(tail) = rest.strip_prefix("\\i")
+            && !tail
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@')
+        {
+            return Some(('i', text.len() - tail.len()));
+        }
+        if let Some(tail) = rest.strip_prefix("\\j")
+            && !tail
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@')
+        {
+            return Some(('j', text.len() - tail.len()));
+        }
+        let ch = rest.chars().next().filter(|ch| ch.is_alphabetic())?;
+        return Some((ch, after + 1 + ch.len_utf8()));
+    }
+    if matches!(
+        cmd,
+        b'u' | b'v' | b'H' | b'c' | b'k' | b'r' | b'b' | b'd' | b't'
+    ) && let Some(braced) = rest.strip_prefix('{')
+    {
+        if let Some(tail) = braced.strip_prefix("\\i}") {
+            return Some(('i', text.len() - tail.len()));
+        }
+        if let Some(tail) = braced.strip_prefix("\\j}") {
+            return Some(('j', text.len() - tail.len()));
+        }
+        let ch = braced.chars().next().filter(|ch| ch.is_alphabetic())?;
+        let tail = braced.get(ch.len_utf8()..)?.strip_prefix('}')?;
+        return Some((ch, text.len() - tail.len()));
+    }
+    None
+}
+
+fn tex_accent_at(text: &str, index: usize) -> Option<(char, usize)> {
+    if index > 0 && text.as_bytes()[index - 1] == b'\\' {
+        return None;
+    }
+    match *text.as_bytes().get(index)? {
+        b'\\' => tex_accent_char(text, index),
+        b'{' => {
+            let (ch, next) = tex_accent_char(text, index + 1)?;
+            (text.as_bytes().get(next) == Some(&b'}')).then_some((ch, next + 1))
+        }
+        _ => None,
+    }
+}
+
+fn source_words(text: &str) -> Vec<(usize, usize, String)> {
+    let mut result = Vec::new();
+    let mut start = None;
+    let mut word = String::new();
+    let mut index = 0;
+    while index < text.len() {
+        if let Some((ch, next)) = tex_accent_at(text, index) {
+            start.get_or_insert(index);
+            word.push(ch);
+            index = next;
+            continue;
+        }
+        let ch = text[index..].chars().next().unwrap();
+        if ch.is_alphanumeric() || start.is_some() && is_combining_mark(ch) {
+            start.get_or_insert(index);
+            word.push(ch);
+        } else if let Some(start) = start.take() {
+            result.push((start, index, normalized_word(&word)));
+            word.clear();
+        }
+        index += ch.len_utf8();
+    }
+    if let Some(start) = start {
+        result.push((start, text.len(), normalized_word(&word)));
+    }
+    result
+}
+
 fn normalized_word(word: &str) -> String {
     if word.is_ascii() {
         return word.to_ascii_lowercase();
@@ -2382,13 +2541,11 @@ fn ordinary_word_source_start(
     line: u32,
     byte: usize,
 ) -> Option<usize> {
-    let Some((_, pdf_word)) = words(context)
-        .into_iter()
-        .find(|(start, word)| *start <= offset && offset < start + word.len())
-    else {
+    let pdf = words(context);
+    let Some(selected) = word_index_at(context, &pdf, offset) else {
         return Some(byte);
     };
-    let pdf_word = normalized_word(pdf_word);
+    let pdf_word = normalized_word(pdf[selected].1);
     if pdf_word.len() < 2 || !pdf_word.bytes().all(|ch| ch.is_ascii_alphabetic()) {
         return Some(byte);
     }
@@ -2396,11 +2553,11 @@ fn ordinary_word_source_start(
         .lines()
         .nth(line as usize - 1)
         .and_then(|text| {
-            words(text)
+            source_words(source_line_text(text))
                 .into_iter()
-                .find(|(start, word)| *start <= byte && byte < start + word.len())
+                .find(|(start, end, _)| *start <= byte && byte < *end)
         })
-        .and_then(|(start, word)| (normalized_word(word) == pdf_word).then_some(start))
+        .and_then(|(start, _, word)| (word == pdf_word).then_some(start))
 }
 
 /// Refine prose and mathematical atoms without expanding arbitrary TeX macros.
@@ -2734,9 +2891,7 @@ fn source_prose_scored_location(
     hidden: &[std::ops::Range<usize>],
 ) -> Option<(u32, usize, isize)> {
     let pdf = words(context);
-    let selected = pdf
-        .iter()
-        .position(|(start, word)| *start <= offset && offset < start + word.len())?;
+    let selected = word_index_at(context, &pdf, offset)?;
     let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized_word(word)).collect();
     let frame_header = within_frame
         && source
@@ -2748,13 +2903,13 @@ fn source_prose_scored_location(
     for (index, raw_row) in source.split_inclusive('\n').enumerate().take(lines.end) {
         let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
         if index >= lines.start {
-            for (byte, word) in words(text) {
+            for (byte, _, word) in source_words(text) {
                 if (byte == 0 || !text[..byte].ends_with('\\'))
                     && !hidden
                         .iter()
                         .any(|range| range.contains(&(line_start + byte)))
                 {
-                    candidates.push((index as u32 + 1, byte, normalized_word(word)));
+                    candidates.push((index as u32 + 1, byte, word));
                 }
             }
         }
@@ -3201,13 +3356,13 @@ mod tests {
 
     #[test]
     fn inverse_heading_matches_tex_accent_and_pdf_unicode() {
-        let source = "\\begin{frame}{An example from \\v Cech's construction}\n\
+        let source = "\\begin{frame}{A note on \\v Zora's method}\n\
                       $x$\n\
                       \\end{frame}";
-        let context = "An example from Čech’s construction";
+        let context = "A note on Žora’s method";
         assert_eq!(
-            source_word_location(source, 3, context, context.find('Č').unwrap(), 4),
-            Some((1, source.lines().next().unwrap().find("Cech").unwrap()))
+            source_word_location(source, 3, context, context.find('Ž').unwrap(), 4),
+            Some((1, source.lines().next().unwrap().find("Zora").unwrap()))
         );
     }
 
@@ -3627,15 +3782,15 @@ mod tests {
     fn inverse_frame_title_beats_same_words_in_document_title() {
         let directory = tempfile::tempdir().unwrap();
         let main_path = directory.path().join("original.tex");
-        let source = "\\title{Persistent Homology and Applications in Topological Data Analysis}\n\
+        let source = "\\title{Numerical Analysis and Applications in Computational Fluid Dynamics}\n\
                       \\begin{document}\n\
-                      \\begin{frame}{Topological Data Analysis}{Cell cycle TDA application}\n\
-                      \\begin{figure}\\includegraphics{cycle.png}\\end{figure}\n\
+                      \\begin{frame}{Computational Fluid Dynamics}{Grid refinement application}\n\
+                      \\begin{figure}\\includegraphics{grid.png}\\end{figure}\n\
                       \\end{frame}\n";
         fs::write(&main_path, source).unwrap();
-        let title = "Topological Data Analysis\nCell cycle TDA application\n\
-                     Persistent Homology and Applications in Topological Data Analysis";
-        let title_offset = title.find("Data").unwrap();
+        let title = "Computational Fluid Dynamics\nGrid refinement application\n\
+                     Numerical Analysis and Applications in Computational Fluid Dynamics";
+        let title_offset = title.find("Fluid").unwrap();
         let metadata_score = document_metadata_word_location(
             &main_path,
             title,
@@ -3649,7 +3804,7 @@ mod tests {
         assert!(metadata_score >= 6);
         assert_eq!(
             source_word_location(source, 5, title, title_offset, 4),
-            Some((3, source.lines().nth(2).unwrap().find("Data").unwrap()))
+            Some((3, source.lines().nth(2).unwrap().find("Fluid").unwrap()))
         );
         assert!(!metadata_beats_frame(
             source,
@@ -3660,9 +3815,9 @@ mod tests {
             272.0,
             metadata_score
         ));
-        let footer = "Topological Data Analysis\nCell cycle TDA application\n\
-                      Persistent Homology and Applications in Topological Data Analysis";
-        let footer_offset = footer.rfind("Data").unwrap();
+        let footer = "Computational Fluid Dynamics\nGrid refinement application\n\
+                      Numerical Analysis and Applications in Computational Fluid Dynamics";
+        let footer_offset = footer.rfind("Fluid").unwrap();
         let footer_score = document_metadata_word_location(
             &main_path,
             footer,
@@ -3688,12 +3843,12 @@ mod tests {
     fn inverse_identical_running_title_uses_click_height_for_tie() {
         let directory = tempfile::tempdir().unwrap();
         let main_path = directory.path().join("original.tex");
-        let source = "\\title{Topological Data Analysis}\n\
-                      \\begin{frame}{Topological Data Analysis}\n\
+        let source = "\\title{Computational Fluid Dynamics}\n\
+                      \\begin{frame}{Computational Fluid Dynamics}\n\
                       \\end{frame}\n";
         fs::write(&main_path, source).unwrap();
-        let context = "Topological Data Analysis";
-        let offset = context.find("Data").unwrap();
+        let context = "Computational Fluid Dynamics";
+        let offset = context.find("Fluid").unwrap();
         let metadata_score = document_metadata_word_location(
             &main_path,
             context,
@@ -3755,30 +3910,30 @@ mod tests {
     #[test]
     fn inverse_caption_math_uses_literal_context_not_closing_line_proximity() {
         let source = "\\caption{Selected views.\n\
-            cloud vertices at exact quotient distance at most \\(\\rho_q\\) from the\n\
-            exact reference segment.\n\n\n\n\n\
-            The transverse coordinate is in units of \\(\\rho_q\\), hence magnified.\n\
+            sample points at measured offset at most \\(\\alpha_k\\) from the\n\
+            baseline marker.\n\n\n\n\n\
+            The vertical axis is in units of \\(\\alpha_k\\), hence rescaled.\n\
             End of caption.}\n";
         let line = source.lines().count() as u32;
         for (context, row) in [
-            ("distance at most 𝜌𝑞 from the exact reference segment.", 2),
-            ("coordinate is in units of 𝜌𝑞, hence magnified.", 8),
+            ("offset at most 𝛼𝑘 from the baseline marker.", 2),
+            ("axis is in units of 𝛼𝑘, hence rescaled.", 8),
         ] {
             assert_eq!(
-                source_word_location(source, line, context, context.find('𝜌').unwrap(), 4),
+                source_word_location(source, line, context, context.find('𝛼').unwrap(), 4),
                 Some((
                     row,
                     source
                         .lines()
                         .nth(row as usize - 1)
                         .unwrap()
-                        .find("\\rho")
+                        .find("\\alpha")
                         .unwrap()
                 ))
             );
         }
         // The glyph alone cannot identify which repeated expression was clicked.
-        assert_eq!(source_word_location(source, line, "𝜌𝑞", 0, 4), None);
+        assert_eq!(source_word_location(source, line, "𝛼𝑘", 0, 4), None);
     }
 
     #[test]
@@ -4278,5 +4433,46 @@ More slide text
         assert_eq!(frame_bounds(frame_source, 7), Some((0, 7)));
         assert_eq!(normalized_word("oﬃce"), "office");
         assert_eq!(normalized_word(" Café "), " cafe ");
+
+        let article = "\\title{Sample Document Title for Testing}\n\
+                       \\maketitle\n\
+                       Keywords. Sample-document testing, synthetic examples.\n";
+        assert!(!metadata_beats_frame(
+            article,
+            3,
+            "Sample-document testing,",
+            9,
+            386.5,
+            792.0,
+            6,
+        ));
+        assert!(!allows_metadata_fallback(article, 3, 0, 386.5, 792.0));
+        assert!(allows_metadata_fallback(article, 2, 1, 115.0, 792.0));
+        assert_eq!(
+            source_word_location(article, 3, "Keywords. Sample-document testing", 13, 1),
+            Some((3, 10)),
+        );
+        let accented =
+            "\\author{Jane Example\\thanks{School of Th\\'eorie\nMod\\^ele d'Étude}}";
+        assert_eq!(
+            source_word_location(
+                accented,
+                1,
+                "Center of Études Modêle d’Éxemple",
+                10,
+                1,
+            ),
+            Some((1, 38)),
+        );
+        assert_eq!(
+            source_word_location(
+                accented,
+                2,
+                "Center of Études Modêle d’Éxemple",
+                18,
+                1,
+            ),
+            Some((2, 0)),
+        );
     }
 }

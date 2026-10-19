@@ -576,10 +576,20 @@ def input_path(name: str, pdf: Path, source: Path) -> Path:
     return (pdf.parent / path).resolve()
 
 
+TEX_ACCENT_RE = re.compile(
+    r"""\{?\\(?:['`^"~=.](?:\{\\?([ij])\}|\\([ij])(?![A-Za-z@])|\{([A-Za-z])\}|([A-Za-z]))|[uvHckrbdt]\{\\?([A-Za-z])\})\}?"""
+)
+
+
+def strip_tex_accents(text: str) -> str:
+    return TEX_ACCENT_RE.sub(lambda m: next(g for g in m.groups() if g is not None), text)
+
+
 def line_has_word(line: str, word: str) -> bool:
     text = source_line_text(line)
     hidden = nonprinting_ranges(text)
     text = "".join(" " if any(start <= at < end for start, end in hidden) else char for at, char in enumerate(text))
+    text = strip_tex_accents(text)
     text = re.sub(r"\\[A-Za-z@]+\*?", " ", text)
     needle = normalized_words(word)
     return len(needle) == 1 and needle[0] in normalized_words(text)
@@ -980,8 +990,24 @@ def inverse(
         pdf_word = batch.get("pdf_word")
         entry["pdfium_word"] = pdf_word
         selected_word = pdf_word or word
+        expected_lines = source_info(expected_file)[1]
+        allows_meta = (
+            bounds is not None
+            or point["y"] <= point["page_height"] * 0.12
+            or point["y"] >= point["page_height"] * 0.88
+            or any(
+                "\\maketitle" in row or "\\titlepage" in row
+                for row in expected_lines[max(0, expected_anchor - 5):expected_anchor + 4]
+            )
+            or any(
+                start <= starts[expected_anchor - 1] < end
+                for start, end in meta_spans
+                if resolved_file == expected_file and 1 <= expected_anchor <= len(starts)
+            )
+        )
         metadata = (
-            any(start <= absolute_column < end for start, end in meta_spans)
+            allows_meta
+            and any(start <= absolute_column < end for start, end in meta_spans)
             and line_has_word(resolved_row, selected_word)
         )
         if resolved_file != expected_file and not metadata:
@@ -990,6 +1016,10 @@ def inverse(
             continue
         if bounds and not metadata and not bounds[0] + 1 <= resolved_line <= bounds[1] + 1:
             entry["error"] = "inverse result escaped the page-proven original frame"
+            yield entry
+            continue
+        if not bounds and not metadata and abs(resolved_line - expected_anchor) > 4:
+            entry["error"] = "inverse result escaped the source context radius"
             yield entry
             continue
         entry["mapping_ok"] = True
@@ -1001,13 +1031,13 @@ def inverse(
             entry.update(abstained=True, reason="pdfium_word_mismatch")
         elif line_has_word(resolved_row, pdf_word):
             literal = []
-            for char in resolved_row[len(prefix):]:
+            for char in strip_tex_accents(resolved_row[len(prefix):]):
                 if char.isalnum() or literal and unicodedata.combining(char):
                     literal.append(char)
                 else:
                     break
             enclosing = []
-            for char in reversed(prefix):
+            for char in reversed(strip_tex_accents(prefix)):
                 if char.isalnum() or unicodedata.combining(char):
                     enclosing.append(char)
                 else:

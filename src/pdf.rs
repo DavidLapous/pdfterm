@@ -2079,9 +2079,9 @@ pub fn synctex_edit_batch(
                 best_guess,
             )
             .map_err(|error| error.to_string())?;
-            let pdf_word = words(&context).into_iter().find_map(|(start, word)| {
-                (start <= offset && offset < start + word.len()).then(|| word.to_owned())
-            });
+            let tokens = words(&context);
+            let pdf_word = crate::synctex::word_index_at(&context, &tokens, offset)
+                .map(|index| tokens[index].1.to_owned());
             Ok(serde_json::json!({
                 "ok": true,
                 "page": point.page,

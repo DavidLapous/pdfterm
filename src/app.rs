@@ -491,6 +491,76 @@ struct ViewPosition {
     scroll_y: u32,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct JumpList {
+    entries: Vec<ViewPosition>,
+    cursor: usize,
+}
+
+impl JumpList {
+    fn push(&mut self, position: ViewPosition) {
+        if !self.entries.is_empty() {
+            self.entries.truncate(self.cursor + 1);
+        }
+        if self.entries.last() != Some(&position) {
+            if self.entries.len() == 100 {
+                self.entries.remove(0);
+            }
+            self.entries.push(position);
+        }
+        self.cursor = self.entries.len().saturating_sub(1);
+    }
+
+    fn update_tip(&mut self, position: ViewPosition) {
+        if self.cursor + 1 == self.entries.len()
+            && let Some(last) = self.entries.last_mut()
+        {
+            *last = position;
+            if self.entries.len() >= 2 && self.entries[self.entries.len() - 2] == position {
+                self.entries.pop();
+                self.cursor = self.entries.len() - 1;
+            }
+        }
+    }
+
+    fn clamp_pages(&mut self, pages: u32) {
+        let max_page = pages.saturating_sub(1);
+        for entry in &mut self.entries {
+            entry.page = entry.page.min(max_page);
+        }
+        self.entries.dedup();
+        self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+    }
+
+    fn backward(&mut self, current: ViewPosition) -> Option<ViewPosition> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        if self.cursor + 1 == self.entries.len() && self.entries[self.cursor] != current {
+            if self.entries.len() == 100 {
+                self.entries.remove(0);
+                self.cursor = self.entries.len().saturating_sub(1);
+            }
+            let target = self.entries[self.cursor];
+            self.entries.push(current);
+            return Some(target);
+        }
+        if self.cursor == 0 {
+            return None;
+        }
+        self.cursor -= 1;
+        Some(self.entries[self.cursor])
+    }
+
+    fn forward(&mut self) -> Option<ViewPosition> {
+        if self.cursor + 1 >= self.entries.len() {
+            return None;
+        }
+        self.cursor += 1;
+        Some(self.entries[self.cursor])
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LinkDestination {
     page: u32,
@@ -918,7 +988,7 @@ impl App {
                     outline: Arc::new(outline),
                     cache: HashMap::new(),
                     search: SearchState::default(),
-                    link_history: Vec::new(),
+                    link_history: JumpList::default(),
                     pending_destination: None,
                     link_index: LinkIndexState::new(page_count),
                 }],
@@ -2419,13 +2489,14 @@ impl App {
         let rect = request.rect();
         self.pending_scale = None;
         self.select_tab(index, output)?;
+        let mut preview_origin = None;
         if let Some(state) = &mut self.link_picker {
             state.pending_preview = None;
-            state.preview_origin = None;
+            preview_origin = state.preview_origin.take();
         }
         if let Some(state) = &mut self.search_picker {
             state.pending_preview = None;
-            state.preview_origin = None;
+            preview_origin = preview_origin.or(state.preview_origin.take());
         }
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
@@ -2439,11 +2510,25 @@ impl App {
         }
         let tab = self.tab_mut();
         let document_id = tab.document_id;
+        let current = ViewPosition {
+            page: tab.page,
+            scroll_x: tab.scroll_x,
+            scroll_y: tab.scroll_y,
+        };
+        if let Some(origin) = preview_origin {
+            tab.link_history.push(origin);
+        }
+        tab.link_history.push(current);
         let page = request.page.saturating_sub(1).min(tab.page_count - 1);
         if page != tab.page {
             tab.page = page;
             tab.scroll_y = 0;
         }
+        tab.link_history.push(ViewPosition {
+            page: tab.page,
+            scroll_x: tab.scroll_x,
+            scroll_y: tab.scroll_y,
+        });
         self.navigation.flash = Some(PendingFlash {
             document_id,
             revision: request.revision,
@@ -2663,7 +2748,9 @@ impl App {
             && matches!(&target, LinkTarget::Internal { .. })
         {
             state.pending_preview = None;
-            state.preview_origin = None;
+            if let Some(origin) = state.preview_origin.take() {
+                self.tab_mut().link_history.push(origin);
+            }
         }
         if self.link_picker.is_some() && !self.persistent_link_picker {
             self.close_link_picker(output)?;
@@ -2685,14 +2772,16 @@ impl App {
                 };
                 let page = page.min(self.tab().page_count - 1);
                 let tab = self.tab_mut();
-                if tab.link_history.len() == 100 {
-                    tab.link_history.remove(0);
-                }
                 tab.link_history.push(current);
                 tab.page = page;
                 if top_ratio.is_some() {
                     tab.scroll_y = 0;
                 }
+                tab.link_history.push(ViewPosition {
+                    page: tab.page,
+                    scroll_x: tab.scroll_x,
+                    scroll_y: tab.scroll_y,
+                });
                 tab.pending_destination = Some(LinkDestination {
                     page,
                     top_ratio,
@@ -2713,7 +2802,12 @@ impl App {
     }
 
     fn follow_link_back(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let Some(previous) = self.tab_mut().link_history.pop() else {
+        let current = ViewPosition {
+            page: self.tab().page,
+            scroll_x: self.tab().scroll_x,
+            scroll_y: self.tab().scroll_y,
+        };
+        let Some(previous) = self.tab_mut().link_history.backward(current) else {
             self.draw_status(output, self.viewport()?, "no link history")?;
             return Ok(());
         };
@@ -2721,6 +2815,19 @@ impl App {
         tab.page = previous.page.min(tab.page_count - 1);
         tab.scroll_x = previous.scroll_x;
         tab.scroll_y = previous.scroll_y;
+        tab.pending_destination = None;
+        self.request_current(output)
+    }
+
+    fn follow_link_forward(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let Some(next) = self.tab_mut().link_history.forward() else {
+            self.draw_status(output, self.viewport()?, "no forward link history")?;
+            return Ok(());
+        };
+        let tab = self.tab_mut();
+        tab.page = next.page.min(tab.page_count - 1);
+        tab.scroll_x = next.scroll_x;
+        tab.scroll_y = next.scroll_y;
         tab.pending_destination = None;
         self.request_current(output)
     }
@@ -3079,12 +3186,24 @@ impl App {
             KeyCode::Char('q') if !filtering => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
+            KeyCode::Char('B') if !filtering && !control && !alt => {
+                self.follow_link_forward(output)?;
+                return Ok(());
+            }
+            KeyCode::Char('b') if !filtering && key.modifiers == KeyModifiers::SHIFT => {
+                self.follow_link_forward(output)?;
+                return Ok(());
+            }
             KeyCode::Char('b') if !filtering && !control && !alt => {
                 self.follow_link_back(output)?;
                 return Ok(());
             }
             KeyCode::Char('o') if control && !alt => {
                 self.follow_link_back(output)?;
+                return Ok(());
+            }
+            KeyCode::Char('i') if control && !alt => {
+                self.follow_link_forward(output)?;
                 return Ok(());
             }
             _ => {}
@@ -3188,7 +3307,9 @@ impl App {
             if matches!(&target, LinkTarget::Internal { .. }) {
                 let state = self.link_picker.as_mut().expect("link picker state");
                 state.pending_preview = None;
-                state.preview_origin = None;
+                if let Some(origin) = state.preview_origin.take() {
+                    self.tab_mut().link_history.push(origin);
+                }
             }
             if !self.persistent_link_picker {
                 self.close_link_picker(output)?;
@@ -3325,8 +3446,15 @@ impl App {
             KeyCode::Char('b') if control => {
                 self.move_view(Axis::Vertical, false, true, true, output)?
             }
+            KeyCode::Char('B')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.follow_link_forward(output)?
+            }
+            KeyCode::Char('b') if shift => self.follow_link_forward(output)?,
             KeyCode::Char('b') => self.follow_link_back(output)?,
             KeyCode::Char('o') if control => self.follow_link_back(output)?,
+            KeyCode::Char('i') if control => self.follow_link_forward(output)?,
             KeyCode::Enter => self.open_link_picker(output)?,
             KeyCode::Esc if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Esc if self.clear_search(output)? => {}
@@ -4088,12 +4216,28 @@ impl App {
             {
                 self.pending_vertical_scroll = target;
             } else {
-                self.tab_mut().scroll_y = target.max(0) as u32;
+                let tab = self.tab_mut();
+                tab.scroll_y = target.max(0) as u32;
+                let updated = ViewPosition {
+                    page: tab.page,
+                    scroll_x: tab.scroll_x,
+                    scroll_y: tab.scroll_y,
+                };
+                tab.link_history.update_tip(updated);
             }
         }
 
         if key.document_id == self.tab().document_id && self.pending_vertical_scroll != 0 {
             if self.apply_vertical_scroll(self.viewport()?)? {
+                if flash_scroll.is_some() {
+                    let tab = self.tab_mut();
+                    let updated = ViewPosition {
+                        page: tab.page,
+                        scroll_x: tab.scroll_x,
+                        scroll_y: tab.scroll_y,
+                    };
+                    tab.link_history.update_tip(updated);
+                }
                 let rest = self.smooth_scroll_remaining;
                 self.request_current(output)?;
                 self.smooth_scroll_remaining = rest;
@@ -4115,6 +4259,15 @@ impl App {
             let current_key = self.render_key(viewport);
             if current_key == key {
                 self.draw_frame(&frame, viewport, output)?;
+                if flash_scroll.is_some() {
+                    let tab = self.tab_mut();
+                    let updated = ViewPosition {
+                        page: tab.page,
+                        scroll_x: tab.scroll_x,
+                        scroll_y: tab.scroll_y,
+                    };
+                    tab.link_history.update_tip(updated);
+                }
                 self.prefetch_neighbors(key);
                 self.open_pending_link_picker(output)?;
             }
@@ -4213,9 +4366,14 @@ impl App {
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        let mut resolved_destination = false;
         if let Some(destination) = self.tab_mut().pending_destination.take()
             && destination.page == frame.key.page
         {
+            resolved_destination = self
+                .link_picker
+                .as_ref()
+                .is_none_or(|state| state.preview_origin.is_none());
             if let Some(left_ratio) = destination.left_ratio {
                 let target_x = left_ratio * frame.width as f32;
                 self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
@@ -4234,13 +4392,32 @@ impl App {
             && self.link_picker.is_none()
             && self.search_picker.is_none()
         {
-            return self.draw_continuous(frame, viewport, output);
+            let result = self.draw_continuous(frame, viewport, output);
+            if resolved_destination {
+                let tab = self.tab_mut();
+                let updated = ViewPosition {
+                    page: tab.page,
+                    scroll_x: tab.scroll_x,
+                    scroll_y: tab.scroll_y,
+                };
+                tab.link_history.update_tip(updated);
+            }
+            return result;
         }
         self.retain_primary_image(output)?;
         let tab = self.tab();
         let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
         self.tab_mut().scroll_x = placement.scroll_x;
         self.tab_mut().scroll_y = placement.scroll_y;
+        if resolved_destination {
+            let tab = self.tab_mut();
+            let updated = ViewPosition {
+                page: tab.page,
+                scroll_x: tab.scroll_x,
+                scroll_y: tab.scroll_y,
+            };
+            tab.link_history.update_tip(updated);
+        }
         let retained_id = self
             .visible_page
             .as_ref()
@@ -7291,7 +7468,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("y", "copy page text"),
         ("L", "link mode + browser"),
         ("s / a", "cycle / auto layout"),
-        ("b / Ctrl-o", "back from link"),
+        ("b / B / ^o / ^i", "jump back / forward"),
         ("f", "open PDF in new tab"),
         ("D", "duplicate tab at current view"),
         ("R", "reload config"),
@@ -10348,18 +10525,104 @@ mod tests {
         }
         assert_eq!(app.tab().page, 2);
 
-        // Ctrl-o pops link history like 'b'
-        app.tab_mut().link_history.push(super::ViewPosition {
-            page: 7,
-            scroll_x: 0,
-            scroll_y: 0,
-        });
+        // Jump list (b / Ctrl-o / Ctrl-i) across links, SyncTeX forward search, and manual scroll
+        app.tab_mut().scroll_y = 0;
+        app.follow_link(
+            LinkTarget::Internal {
+                page: 7,
+                top_ratio: Some(0.0),
+                left_ratio: None,
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 7);
+        app.follow_link(
+            LinkTarget::Internal {
+                page: 11,
+                top_ratio: Some(0.0),
+                left_ratio: None,
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 11);
+
+        let _ = app.apply_forward_request(
+            &crate::synctex::ForwardRequest {
+                pdf: file.path().to_owned(),
+                revision: revision.pdf,
+                page: 5,
+                h: 10.0,
+                v: 20.0,
+                width: 10.0,
+                height: 10.0,
+                word: None,
+                inverse_search: None,
+                source_snapshot: None,
+                best_guess: false,
+                warning: None,
+            },
+            0,
+            &mut output,
+        );
+        let forward_key = app.page_key(4, viewport);
+        app.tab_mut()
+            .cache
+            .insert(forward_key, continuous_frame(forward_key, revision, false));
+        assert_eq!(app.tab().page, 4);
+
+        // b / Ctrl-o walk backward: 4 -> 11 -> 7 -> 2
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 11);
         app.handle_key(
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             &mut output,
         )
         .unwrap();
         assert_eq!(app.tab().page, 7);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 2);
+
+        // B / Ctrl-i walk forward: 2 -> 7 -> 11 -> 4
+        for (key, expected) in [
+            (KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE), 7),
+            (KeyEvent::new(KeyCode::Char('b'), KeyModifiers::SHIFT), 11),
+            (KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL), 4),
+        ] {
+            app.handle_key(key, &mut output).unwrap();
+            assert_eq!(app.tab().page, expected);
+        }
+
+        // Manual scroll from tip (4 -> 5), then Ctrl-o returns to 4 first, and Ctrl-i returns to 5
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 5);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 4);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(app.tab().page, 5);
+        app.tab_mut().link_history.clamp_pages(10);
+        assert!(app.tab().link_history.entries.iter().all(|entry| entry.page < 10));
 
         // d / u and Ctrl-d / Ctrl-u / Ctrl-f / Ctrl-b page viewport
         app.viewer.continuous_scroll = false;
