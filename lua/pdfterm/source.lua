@@ -333,25 +333,22 @@ local function attach(source, buffer)
   vim.api.nvim_buf_clear_namespace(buffer, source.namespace, 0, -1)
   source.by_id, source.by_offset, source.retired = {}, {}, {}
   local checkpoint = source.checkpoint
-  if checkpoint then
-    local unchanged = same_lines(checkpoint.lines, current)
-    local align = not unchanged and row_alignment(checkpoint.lines, current) or nil
-    if align then
-      source.inferred = warning(source.inferred, 'buffer reloaded with changed text; using inferred source anchors')
-    end
+  source.checkpoint = nil
+  if checkpoint and same_lines(checkpoint.lines, current) then
     for _, mark in ipairs(checkpoint.marks) do
-      local row, column = clamp_position(current, align and align(mark[2]) or mark[2], mark[3])
-      local end_row, end_column = clamp_position(current, align and align(mark[4]) or mark[4], mark[5])
+      local row, column = clamp_position(current, mark[2], mark[3])
+      local end_row, end_column = clamp_position(current, mark[4], mark[5])
       if end_row < row or end_row == row and end_column < column then end_row, end_column = row, column end
       put_anchor(source, buffer, mark[1], row, column, end_row, end_column, mark[6])
     end
-    source.checkpoint = nil
   else
     local unchanged = same_lines(original, current)
+    local reloaded = checkpoint ~= nil or source.buffer ~= nil
     local align = not unchanged and row_alignment(original, current) or function(row) return row end
-    if not unchanged then
-      source.inferred = 'source buffer differs from captured text; using inferred source anchors'
-    end
+    source.inferred = not unchanged and (
+      reloaded and warning(source.inferred, 'buffer reloaded with changed text; using inferred source anchors')
+      or 'source buffer differs from captured text; using inferred source anchors'
+    ) or nil
     -- One native range per compiled line. Interior edits deliberately lose
     -- precision; comparing the entire surviving span proves byte correspondence.
     for row, line in ipairs(original) do
@@ -437,7 +434,11 @@ function M.setup(group)
       local state = buffers[event.buf]
       if not state then return end
       for source in pairs(state.sources) do
-        freeze(source)
+        if event.event == 'BufReadPre' then
+          if source.loaded then source.checkpoint, source.loaded = nil, false end
+        else
+          freeze(source)
+        end
         if event.event == 'BufWipeout' then
           source.buffer = nil
           if source.warm and not source.document then

@@ -306,6 +306,27 @@ local ok, failure = xpcall(function()
   warned(source.forward(document, buffer, 2, 6))
   warned(source.inverse(location(document, p.main, 2, 6)))
   assert(cached_text(document, p.main) == 'Header\nAlpha needle Omega\nFooter\n')
+  vim.fn.writefile({ 'Header', 'Alpha needle Omega', 'Footer' }, p.main)
+  vim.cmd('edit!')
+  precise(source.forward(document, buffer, 1, 6), 2, 7)
+
+  -- A stale buffer reloaded via checktime (BufReadPre without BufUnload) must realign
+  -- from the compiled snapshot, not from Neovim's pre-wiped single-line buffer.
+  local stale = { main = directory .. '/stale-reload.tex',
+    pdf = directory .. '/stale-reload.pdf', cwd = directory }
+  vim.fn.writefile({ 'Header', 'Short' }, stale.main)
+  pdf_fixture(stale.pdf)
+  vim.cmd.edit(vim.fn.fnameescape(stale.main))
+  local stale_buffer = api.nvim_get_current_buf()
+  vim.fn.writefile({ 'Header', 'Inserted one', 'Inserted two', 'Alpha needle Omega' }, stale.main)
+  local stale_doc = finish(stale, source.capture(stale, { stale.main }))
+  warned(source.forward(stale_doc, stale_buffer, 1, 0))
+  vim.cmd.checktime()
+  precise(source.forward(stale_doc, stale_buffer, 1, 9), 2, 10)
+  precise(source.forward(stale_doc, stale_buffer, 2, 9), 3, 10)
+  precise(source.forward(stale_doc, stale_buffer, 3, 13), 4, 14)
+  inverse = source.inverse(location(stale_doc, stale.main, 3, 9))
+  assert(inverse.buffer == stale_buffer and inverse.line == 3 and inverse.byte_column == 9 and not inverse.warning)
 
   local untracked_file = directory .. '/not-compiled.tex'
   vim.fn.writefile({ 'Only in this live source', 'Detached word is not part of the PDF' }, untracked_file)
