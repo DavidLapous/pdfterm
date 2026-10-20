@@ -2160,3 +2160,178 @@ fn real_fragile_macro_title_and_footer_do_not_refine_to_duplicate_body() {
         }
     }
 }
+
+#[test]
+fn cli_source_info_and_snapshot_preserve_relative_input_identity_across_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let client = root.join("client");
+    let build = root.join("build");
+    fs::create_dir(&client).unwrap();
+    fs::create_dir(&build).unwrap();
+
+    let build_source = build.join("main.tex");
+    let build_contents =
+        "\\documentclass{article}\n\\begin{document}\nAlpha Copper Omega\n\\end{document}\n";
+    fs::write(&build_source, build_contents).unwrap();
+    let compile = process::output(
+        Command::new("pdflatex")
+            .current_dir(&build)
+            .args([
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-synctex=-1",
+                "main.tex",
+            ]),
+        &Operation::new(Duration::from_secs(30)),
+    )
+    .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stdout)
+    );
+    let sidecar = build.join("main.synctex");
+    let raw_synctex = fs::read_to_string(&sidecar).unwrap();
+    fs::write(
+        &sidecar,
+        raw_synctex.replace(&format!("{}/", build.display()), ""),
+    )
+    .unwrap();
+    let pdf = build.join("main.pdf");
+    let (point, _) = painted_word_points(&pdf, "Copper");
+
+    let metadata = process::output(
+        Command::new(env!("CARGO_BIN_EXE_pdfterm"))
+            .current_dir(&client)
+            .arg(&pdf)
+            .arg("--synctex-source-info"),
+        &Operation::default(),
+    )
+    .unwrap();
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let info: SourceInfo = serde_json::from_slice(&metadata.stdout).unwrap();
+    assert_eq!(info.cwd, client);
+    assert_eq!(info.main.as_deref(), Some(build_source.as_path()));
+    assert_eq!(info.inputs, vec![build_source.clone()]);
+
+    let cache = root.join("compiled-source");
+    fs::create_dir(&cache).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(cache.join("1.txt"), build_contents).unwrap();
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(build_contents.as_bytes()) {
+        write!(&mut digest, "{byte:02x}").unwrap();
+    }
+    let manifest = cache.join("manifest.json");
+    let key = build_source.to_str().unwrap();
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "pdf": info.pdf,
+            "revision": info.revision,
+            "cwd": info.cwd,
+            "main": info.main,
+            "files": { key: "1.txt" },
+            "digests": { key: digest },
+            "warnings": {},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let forward = process::output(
+        Command::new(env!("CARGO_BIN_EXE_pdfterm"))
+            .current_dir(&client)
+            .arg(&pdf)
+            .arg("--synctex-view")
+            .arg(&build_source)
+            .args(["--line", "3", "--column", "7", "--source-snapshot"])
+            .arg(&manifest),
+        &Operation::default(),
+    )
+    .unwrap();
+    assert!(
+        forward.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forward.stderr)
+    );
+    let forward_json: serde_json::Value = serde_json::from_slice(&forward.stdout).unwrap();
+    assert_eq!(forward_json["page"], 1);
+
+    let click_line = format!(
+        "{}\n",
+        serde_json::json!({
+            "page": point.page,
+            "x": point.x,
+            "y": point.y_from_top,
+        })
+    );
+    let run_batch = |snapshot: Option<&Path>| -> serde_json::Value {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pdfterm"));
+        cmd.current_dir(&client)
+            .arg(&pdf)
+            .arg("--synctex-edit-batch")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(snapshot) = snapshot {
+            cmd.arg("--source-snapshot").arg(snapshot);
+        }
+        let mut child = cmd.spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), click_line.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let inverse_json = run_batch(Some(&manifest));
+    assert_eq!(inverse_json["ok"], true, "{inverse_json}");
+    assert_eq!(
+        inverse_json["location"]["file"],
+        build_source.to_str().unwrap()
+    );
+    assert_eq!(inverse_json["location"]["line"], 3);
+    assert_eq!(inverse_json["location"]["precise"], true);
+
+    fs::remove_file(cache.join("1.txt")).unwrap();
+    let missing_cache = run_batch(Some(&manifest));
+    assert_eq!(
+        missing_cache["ok"], false,
+        "deleting required cached source must fail inverse search: {missing_cache}"
+    );
+
+    let client_source = client.join("main.tex");
+    fs::write(&client_source, build_contents).unwrap();
+    let both_info: SourceInfo = serde_json::from_slice(
+        &process::output(
+            Command::new(env!("CARGO_BIN_EXE_pdfterm"))
+                .current_dir(&client)
+                .arg(&pdf)
+                .arg("--synctex-source-info"),
+            &Operation::default(),
+        )
+        .unwrap()
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(both_info.main.as_deref(), Some(client_source.as_path()));
+    assert_eq!(both_info.inputs, vec![client_source.clone()]);
+
+    let both_inverse = run_batch(None);
+    assert_eq!(both_inverse["ok"], true, "{both_inverse}");
+    assert_eq!(
+        both_inverse["location"]["file"],
+        client_source.to_str().unwrap()
+    );
+    assert_eq!(both_inverse["location"]["precise"], true);
+}
