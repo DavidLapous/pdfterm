@@ -495,13 +495,7 @@ struct SearchHighlights {
     pages: HashMap<u32, Vec<SearchRect>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SearchRect {
-    pub bottom: f32,
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-}
+pub use synctex_parser::SearchRect;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PixelRect {

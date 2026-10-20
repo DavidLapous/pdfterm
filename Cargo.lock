@@ -1110,7 +1110,6 @@ dependencies = [
  "fontdb",
  "fontdue",
  "getrandom 0.4.3",
- "latex2mathml",
  "libc",
  "nucleo-matcher",
  "pdfium-render",
@@ -1119,6 +1118,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "synctex-parser",
  "tar",
  "tempfile",
  "thiserror",
@@ -1652,6 +1652,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "synctex-parser"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "latex2mathml",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]
