@@ -2024,6 +2024,7 @@ pub fn synctex_edit_batch(
         .map_err(|error| format!("could not open {}: {error}", pdf.display()))?;
     let mut cached_page: Option<(u32, PdfPage<'_>)> = None;
     let mut cached_snapshot: Option<crate::source_snapshot::SourceSnapshot> = None;
+    let mut cached_synctex = crate::synctex::SyncTeXCache::default();
     for (line_number, line) in input.lines().enumerate() {
         let input_line = line.as_ref().ok().cloned();
         let result = (|| -> Result<serde_json::Value, String> {
@@ -2063,7 +2064,7 @@ pub fn synctex_edit_batch(
                         .map_err(|error| error.to_string())?,
                 );
             }
-            let resolution = crate::synctex::resolve_inverse_with_snapshot(
+            let resolution = crate::synctex::resolve_inverse_with_cache(
                 pdf,
                 coordinates.inverse_point(point.page, pdf_x, pdf_y)?,
                 settings.word_precision.then_some((&context, offset)),
@@ -2071,6 +2072,7 @@ pub fn synctex_edit_batch(
                 &crate::process::Operation::new(std::time::Duration::from_secs(30)),
                 cached_snapshot.as_ref(),
                 best_guess,
+                Some(&mut cached_synctex),
             )
             .map_err(|error| error.to_string())?;
             let tokens = words(&context);

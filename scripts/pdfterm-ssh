@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import runpy
 import selectors
 import shlex
 import signal
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 import secrets
+from pathlib import Path
 
 
 def kill_group(child):
@@ -304,6 +306,55 @@ def capture_terminal():
     raise RuntimeError('start pdfterm-ssh in Kitty, WezTerm, or Ghostty on macOS (without tmux)')
 
 
+class StdioForward:
+    """Keep the remote socket owned by the login user, including under Tailscale."""
+
+    def __init__(self, ssh, remote_socket, local_socket):
+        helper = Path(__file__).with_name('pdfterm-relay.py')
+        source = helper.read_text()
+        self.relay = runpy.run_path(str(helper))['relay']
+        self.error = None
+        self.thread = None
+        command = shlex.join(['python3', '-u', '-c', source, 'listen', remote_socket])
+        command = 'exec "$SHELL" -lc ' + shlex.quote(command)
+        self.child = subprocess.Popen([*ssh, command], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, start_new_session=True)
+        try:
+            with selectors.DefaultSelector() as pending:
+                pending.register(self.child.stdout, selectors.EVENT_READ)
+                deadline = time.monotonic() + 10
+                greeting = bytearray()
+                while b'\n' not in greeting and len(greeting) < 32:
+                    if not pending.select(max(0, deadline - time.monotonic())):
+                        break
+                    chunk = os.read(self.child.stdout.fileno(), 32 - len(greeting))
+                    if not chunk:
+                        break
+                    greeting.extend(chunk)
+                if greeting != b'READY\n':
+                    raise RuntimeError('private SSH relay did not start; remote Python 3 is required')
+            self.thread = threading.Thread(target=self.serve, args=(local_socket,))
+            self.thread.start()
+        except BaseException:
+            self.close()
+            raise
+
+    def serve(self, local_socket):
+        try:
+            self.relay('connect', local_socket, self.child.stdout, self.child.stdin)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.error = error
+
+    def close(self):
+        kill_group(self.child)
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        self.child.stdin.close()
+        self.child.stdout.close()
+        if self.error is not None:
+            raise RuntimeError('private SSH relay: ' + str(self.error))
+
+
 class Bridge:
     def __init__(self, path, ssh, windows, token):
         self.ssh, self.windows, self.owned = ssh, windows, set()
@@ -504,6 +555,8 @@ def main():
         remote_token = None
         forward_port = None
         bridge = None
+        stdio_forward = None
+        remote_socket = None
         child = None
         master = None
         try:
@@ -543,39 +596,43 @@ def main():
             run([*ssh, secure_token], timeout=30, input_data=token.encode())
             local_socket = directory + '/launch.sock'
             bridge = Bridge(local_socket, ssh, windows, token)
-            forward_spec = '127.0.0.1:0:' + local_socket
-            forward = run(forwarding_control_args(ssh, 'forward', forward_spec), timeout=15)
-            forward_active = True
-            forward_port = allocated_forward_port(forward)
             remote_platform = run([*ssh, 'uname -s'], timeout=5)
-            if remote_platform == 'Linux':
+            if remote_platform == 'Darwin':
+                # macOS can return empty unprivileged netstat output. Tailscale's
+                # reverse Unix sockets may also be root-owned and unreadable by
+                # the login user. An SSH stdio relay owns its socket as that user.
+                remote_socket = remote_directory + '/launch.sock'
+                stdio_forward = StdioForward(ssh, remote_socket, local_socket)
+            elif remote_platform == 'Linux':
+                forward_spec = '127.0.0.1:0:' + local_socket
+                forward = run(forwarding_control_args(ssh, 'forward', forward_spec), timeout=15)
+                forward_active = True
+                forward_port = allocated_forward_port(forward)
                 inspect = shlex.join(
                     ['ss', '-H', '-n', '-l', '-t', 'sport = :' + str(forward_port)]
                 )
                 required = 'ss'
-            elif remote_platform == 'Darwin':
-                inspect = shlex.join(['/usr/sbin/netstat', '-an', '-p', 'tcp'])
-                required = '/usr/sbin/netstat'
             else:
                 raise RuntimeError(
                     'cannot verify reverse-forward bind on remote platform ' + remote_platform
                 )
-            try:
-                bindings = run([*ssh, inspect], timeout=5)
-            except (RuntimeError, subprocess.TimeoutExpired) as error:
-                raise RuntimeError(
-                    'cannot verify SSH reverse-forward bind address; remote '
-                    + required + ' is required: ' + str(error)
-                ) from error
-            addresses, loopback = forwarding_bind_addresses(
-                remote_platform, bindings, forward_port
-            )
-            if addresses != [loopback]:
-                raise RuntimeError(
-                    'SSH reverse forward is not bound exclusively to 127.0.0.1; '
-                    'refusing insecure session'
+            if remote_platform == 'Linux':
+                try:
+                    bindings = run([*ssh, inspect], timeout=5)
+                except (RuntimeError, subprocess.TimeoutExpired) as error:
+                    raise RuntimeError(
+                        'cannot verify SSH reverse-forward bind address; remote '
+                        + required + ' is required: ' + str(error)
+                    ) from error
+                addresses, loopback = forwarding_bind_addresses(
+                    remote_platform, bindings, forward_port
                 )
-            remote_socket = 'tcp://127.0.0.1:' + str(forward_port)
+                if addresses != [loopback]:
+                    raise RuntimeError(
+                        'SSH reverse forward is not bound exclusively to 127.0.0.1; '
+                        'refusing insecure session'
+                    )
+                remote_socket = 'tcp://127.0.0.1:' + str(forward_port)
             environment = ['PDFTERM_LAUNCH_SOCKET=' + remote_socket,
                            'PDFTERM_LAUNCH_TOKEN_FILE=' + remote_token]
             if args.files:
@@ -608,6 +665,11 @@ def main():
                     run(forwarding_control_args(ssh, 'cancel', forward_spec), timeout=15)
                 except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                     print(f'pdfterm-ssh: reverse-forward cleanup: {error}', file=sys.stderr)
+            if stdio_forward is not None:
+                try:
+                    stdio_forward.close()
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    print(f'pdfterm-ssh: relay cleanup: {error}', file=sys.stderr)
             if bridge is not None:
                 try:
                     bridge.close()
@@ -615,7 +677,10 @@ def main():
                     print(f'pdfterm-ssh: cleanup: {error}', file=sys.stderr)
             if remote_directory is not None and remote_token is not None:
                 try:
-                    run([*ssh, shlex.join(['rm', '-f', remote_token])
+                    files = [remote_token]
+                    if remote_socket and remote_socket.startswith(remote_directory + '/'):
+                        files.append(remote_socket)
+                    run([*ssh, shlex.join(['rm', '-f', *files])
                          + ' && ' + shlex.join(['rmdir', remote_directory])], timeout=15)
                 except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                     print(f'pdfterm-ssh: remote cleanup: {error}', file=sys.stderr)

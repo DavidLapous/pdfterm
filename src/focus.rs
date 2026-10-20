@@ -70,6 +70,39 @@ fn in_ssh() -> bool {
         || env::var_os("SSH_TTY").is_some()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Endpoint<'a> {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(&'a str),
+}
+
+enum Transport {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl AsRawFd for Transport {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Tcp(stream) => stream.as_raw_fd(),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
 fn focus_ssh(operation: &crate::process::Operation) -> io::Result<()> {
     let endpoint = env::var("PDFTERM_LAUNCH_SOCKET").map_err(|_| {
         io::Error::new(
@@ -83,8 +116,16 @@ fn focus_ssh(operation: &crate::process::Operation) -> io::Result<()> {
             "SSH viewer focus requires PDFTERM_LAUNCH_SOCKET and PDFTERM_LAUNCH_TOKEN_FILE",
         )
     })?;
-    let address = parse_endpoint(&endpoint)?;
-    let token = read_token(&token_path)?;
+    focus_ssh_with(operation, &endpoint, &token_path)
+}
+
+fn focus_ssh_with(
+    operation: &crate::process::Operation,
+    endpoint: &str,
+    token_path: &str,
+) -> io::Result<()> {
+    let endpoint = parse_endpoint(endpoint)?;
+    let token = read_token(token_path)?;
     let request = serde_json::json!({"action":"focus", "id":"source", "token":token});
     let mut bytes = serde_json::to_vec(&request).map_err(invalid_data)?;
     bytes.push(b'\n');
@@ -98,18 +139,31 @@ fn focus_ssh(operation: &crate::process::Operation) -> io::Result<()> {
             }
         })
     };
-    let mut stream =
-        TcpStream::connect_timeout(&address, remaining()?.max(Duration::from_millis(1)))
-            .map_err(|e| bridge_error("connect", e))?;
-    stream
-        .set_write_timeout(Some(remaining()?.max(Duration::from_millis(1))))
-        .map_err(|e| bridge_error("write timeout", e))?;
-    stream
-        .write_all(&bytes)
-        .map_err(|e| bridge_error("write", e))?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|e| bridge_error("shutdown", e))?;
+    let mut stream = match endpoint {
+        Endpoint::Tcp(address) => {
+            let mut stream =
+                TcpStream::connect_timeout(&address, remaining()?.max(Duration::from_millis(1)))
+                    .map_err(|e| bridge_error("connect", e))?;
+            stream
+                .set_write_timeout(Some(remaining()?.max(Duration::from_millis(1))))
+                .map_err(|e| bridge_error("write timeout", e))?;
+            stream
+                .write_all(&bytes)
+                .map_err(|e| bridge_error("write", e))?;
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .map_err(|e| bridge_error("shutdown", e))?;
+            Transport::Tcp(stream)
+        }
+        #[cfg(unix)]
+        Endpoint::Unix(path) => {
+            let mut stream = crate::ipc::connect(path, operation)
+                .map_err(|e| bridge_operation_error("connect", e))?;
+            crate::ipc::send(&mut stream, &bytes, operation)
+                .map_err(|e| bridge_operation_error("write", e))?;
+            Transport::Unix(stream)
+        }
+    };
     operation.check()?;
     let mut response = Vec::with_capacity(256);
     let mut chunk = [0_u8; 512];
@@ -131,9 +185,16 @@ fn focus_ssh(operation: &crate::process::Operation) -> io::Result<()> {
             }
             return Err(bridge_error("poll", error));
         }
-        let count = stream
-            .read(&mut chunk)
-            .map_err(|e| bridge_error("read", e))?;
+        let count = match stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(error) => return Err(bridge_error("read", error)),
+        };
         if count == 0 {
             break;
         }
@@ -153,10 +214,20 @@ fn focus_ssh(operation: &crate::process::Operation) -> io::Result<()> {
     }
 }
 
-fn parse_endpoint(endpoint: &str) -> io::Result<SocketAddr> {
-    let authority = endpoint
-        .strip_prefix("tcp://")
-        .ok_or_else(|| invalid("SSH focus endpoint must use tcp://127.0.0.1:<port>"))?;
+fn parse_endpoint(endpoint: &str) -> io::Result<Endpoint<'_>> {
+    #[cfg(unix)]
+    if endpoint.starts_with('/') {
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if endpoint.as_bytes().contains(&0) || endpoint.len() >= address.sun_path.len() {
+            return Err(invalid("SSH focus Unix socket path is invalid"));
+        }
+        return Ok(Endpoint::Unix(endpoint));
+    }
+    let authority = endpoint.strip_prefix("tcp://").ok_or_else(|| {
+        invalid(
+            "SSH focus endpoint must use tcp://127.0.0.1:<port> or an absolute Unix socket path",
+        )
+    })?;
     let (host, port) = authority
         .rsplit_once(':')
         .ok_or_else(|| invalid("SSH focus endpoint must use tcp://127.0.0.1:<port>"))?;
@@ -171,7 +242,10 @@ fn parse_endpoint(endpoint: &str) -> io::Result<SocketAddr> {
     if port == 0 {
         return Err(invalid("SSH focus endpoint port is invalid"));
     }
-    Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+    Ok(Endpoint::Tcp(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+    )))
 }
 
 fn read_token(path: &str) -> io::Result<String> {
@@ -261,26 +335,105 @@ fn bridge_error(stage: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("SSH focus bridge {stage}: {error}"))
 }
 
+fn bridge_operation_error(stage: &str, error: io::Error) -> io::Error {
+    match error.kind() {
+        io::ErrorKind::TimedOut => {
+            io::Error::new(io::ErrorKind::TimedOut, "SSH focus bridge timed out")
+        }
+        io::ErrorKind::Interrupted => error,
+        _ => bridge_error(stage, error),
+    }
+}
+
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_endpoint, read_token, valid_uuid};
+    use super::{Endpoint, FOCUS_TIMEOUT, focus_ssh_with, parse_endpoint, read_token, valid_uuid};
 
     #[test]
-    fn bridge_endpoint_is_loopback_only() {
-        assert_eq!(parse_endpoint("tcp://127.0.0.1:1234").unwrap().port(), 1234);
+    fn bridge_endpoint_accepts_loopback_tcp_and_unix_paths() {
+        match parse_endpoint("tcp://127.0.0.1:1234").unwrap() {
+            Endpoint::Tcp(addr) => assert_eq!(addr.port(), 1234),
+            #[cfg(unix)]
+            Endpoint::Unix(_) => panic!("expected TCP endpoint"),
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            parse_endpoint("/tmp/pdfterm-abc123/launch.sock").unwrap(),
+            Endpoint::Unix("/tmp/pdfterm-abc123/launch.sock")
+        );
         for endpoint in [
             "tcp://localhost:1234",
             "tcp://127.0.0.2:1234",
             "tcp://[::1]:1234",
             "tcp://127.0.0.1:0",
             "tcp://127.0.0.1:65536",
+            "relative/launch.sock",
+            "",
         ] {
             assert!(parse_endpoint(endpoint).is_err(), "{endpoint}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_ssh_focus_validates_token_and_completes_roundtrip() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        let dir = PathBuf::from(format!(
+            "/tmp/pdfterm-focus-unix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("launch.sock");
+        let token_path = dir.join("launch.token");
+        let hex = "fedcba9876543210".repeat(4);
+        std::fs::write(&token_path, format!("{hex}\n")).unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let expected_token = hex.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["action"], "focus");
+            assert_eq!(req["id"], "source");
+            assert_eq!(req["token"], expected_token);
+            stream.write_all(b"{\"ok\":true}\n").unwrap();
+        });
+
+        let op = crate::process::Operation::new(FOCUS_TIMEOUT);
+        focus_ssh_with(
+            &op,
+            sock_path.to_str().unwrap(),
+            token_path.to_str().unwrap(),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let expired_op = crate::process::Operation::new(Duration::ZERO);
+        let err = focus_ssh_with(
+            &expired_op,
+            sock_path.to_str().unwrap(),
+            token_path.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

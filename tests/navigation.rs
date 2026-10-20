@@ -251,6 +251,7 @@ The final literal sentence closes the caption.
             snapshot: Some(&manifest),
             best_guess: true,
             anchor_only: true,
+            ..ForwardSource::default()
         },
     ] {
         if context.snapshot.is_some() {
@@ -1262,6 +1263,7 @@ fn real_compiled_source_snapshot_survives_overwrite_and_warns_on_coarse_navigati
             snapshot: Some(&unverified_manifest),
             best_guess: true,
             anchor_only: false,
+            ..ForwardSource::default()
         },
     )
     .unwrap();
@@ -1298,6 +1300,7 @@ fn real_compiled_source_snapshot_survives_overwrite_and_warns_on_coarse_navigati
             snapshot: None,
             best_guess: true,
             anchor_only: true,
+            ..ForwardSource::default()
         },
     )
     .unwrap();
@@ -1415,6 +1418,7 @@ fn real_compiled_source_snapshot_survives_overwrite_and_warns_on_coarse_navigati
                 snapshot: Some(&unverified_manifest),
                 best_guess: true,
                 anchor_only: true,
+                ..ForwardSource::default()
             },
         )
         .unwrap_err();
@@ -1447,6 +1451,7 @@ fn real_compiled_source_snapshot_survives_overwrite_and_warns_on_coarse_navigati
             snapshot: Some(&missing_root_manifest),
             best_guess: true,
             anchor_only: true,
+            ..ForwardSource::default()
         },
     )
     .unwrap_err();
@@ -1506,6 +1511,7 @@ fn real_compiled_source_snapshot_survives_overwrite_and_warns_on_coarse_navigati
         snapshot: Some(&no_map_manifest),
         best_guess: true,
         anchor_only: true,
+        ..ForwardSource::default()
     };
     let published = SourceSnapshot::load(&no_map_manifest, &no_map_pdf).unwrap();
     assert_eq!(published.read(&main_source).unwrap(), main);

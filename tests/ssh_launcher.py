@@ -15,6 +15,8 @@ import time
 import threading
 import selectors
 import unittest
+import stat
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 launcher = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/pdfterm-ssh'))
@@ -138,7 +140,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertTrue(reply.get('confirmed'), reply)
             return reply
 
-    def nvim(self, code):
+    def nvim(self, code, socket_path=None):
         script = Path(self.directory.name) / 'client.lua'
         root = str(Path(launcher['__file__']).resolve().parent.parent)
         script.write_text('vim.opt.runtimepath:prepend(' + json.dumps(root) + ')\n' + code)
@@ -146,12 +148,49 @@ class LauncherTests(unittest.TestCase):
             ['nvim', '--headless', '-u', 'NONE', '-l', str(script)],
             env={
                 **os.environ,
-                'PDFTERM_LAUNCH_SOCKET': f'tcp://127.0.0.1:{self.forward_listener.getsockname()[1]}',
+                'PDFTERM_LAUNCH_SOCKET': socket_path or f'tcp://127.0.0.1:{self.forward_listener.getsockname()[1]}',
                 'PDFTERM_LAUNCH_TOKEN_FILE': str(self.token_path),
             },
             capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, '', result.stderr)
+
+    def test_real_lua_client_launches_focuses_and_closes_through_stdio_relay(self):
+        helper = Path(__file__).resolve().parents[1] / 'scripts/pdfterm-relay.py'
+        remote_socket = self.directory.name + '/remote.sock'
+        with subprocess.Popen([sys.executable, str(helper), 'listen', remote_socket],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as remote:
+            self.assertEqual(remote.stdout.readline(), b'READY\n')
+            with subprocess.Popen([sys.executable, str(helper), 'connect', self.path],
+                                  stdin=remote.stdout, stdout=remote.stdin) as local:
+                remote.stdin.close()
+                remote.stdout.close()
+                try:
+                    self.nvim("""
+local terminal = require('pdfterm.terminal')
+local source = {kind='ssh', id='source'}
+local owned
+terminal.launch_split(source, 'pdfterm', 'paper.pdf', function(result, split)
+  assert(result.code == 0, result.stderr)
+  owned = assert(split)
+end):wait()
+assert(owned)
+local focused
+terminal.focus(owned, function(result)
+  assert(result.code == 0, result.stderr)
+  focused = true
+end):wait()
+assert(focused)
+terminal.close(owned)
+vim.cmd('qa!')
+""", socket_path=remote_socket)
+                finally:
+                    local.terminate()
+                    local.wait(timeout=3)
+                    remote.wait(timeout=3)
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+        self.assertFalse(self.bridge.owned)
 
     def test_slow_launch_transfers_ownership_to_real_lua_client(self):
         existing, launch = self.windows.existing, self.windows.launch
@@ -687,6 +726,111 @@ class ShellHookTests(unittest.TestCase):
                                env=env, check=True, timeout=5)
                 last = json.loads((root / 'calls').read_text().splitlines()[-1])
                 self.assertEqual(Path(last[0]).name, 'ssh')
+
+
+class StdioRelayTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix='pdfterm-relay-', dir='/tmp')
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        root.chmod(0o700)
+        self.remote = str(root / 'remote.sock')
+        target = str(root / 'target.sock')
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(target)
+        self.listener.listen(4)
+        self.listener.settimeout(0.1)
+        self.stopping = threading.Event()
+        self.addCleanup(self.stop_echo)
+        threading.Thread(target=self.echo_server, daemon=True).start()
+        helper = Path(__file__).resolve().parents[1] / 'scripts/pdfterm-relay.py'
+        self.remote_process = subprocess.Popen(
+            [sys.executable, str(helper), 'listen', self.remote],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.stop_processes)
+        with selectors.DefaultSelector() as pending:
+            pending.register(self.remote_process.stdout, selectors.EVENT_READ)
+            self.assertTrue(pending.select(3), 'relay did not start')
+        self.assertEqual(self.remote_process.stdout.readline(), b'READY\n')
+        self.local_process = subprocess.Popen(
+            [sys.executable, str(helper), 'connect', target],
+            stdin=self.remote_process.stdout, stdout=self.remote_process.stdin,
+            stderr=subprocess.PIPE)
+        self.remote_process.stdin.close()
+        self.remote_process.stdout.close()
+
+    def stop_processes(self):
+        if hasattr(self, 'local_process'):
+            self.local_process.terminate()
+            self.local_process.wait(timeout=3)
+            self.local_process.stderr.close()
+        self.remote_process.wait(timeout=3)
+        self.remote_process.stdin.close()
+        self.remote_process.stdout.close()
+        self.remote_process.stderr.close()
+
+    def stop_echo(self):
+        self.stopping.set()
+        self.listener.close()
+
+    def echo_server(self):
+        while not self.stopping.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self.echo, args=(client,), daemon=True).start()
+
+    @staticmethod
+    def echo(client):
+        with client:
+            while data := client.recv(65536):
+                client.sendall(data)
+
+    def exchange(self, payload, receipt=False):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(3)
+            client.connect(self.remote)
+            if receipt:
+                client.sendall(payload)
+                self.assertEqual(client.recv(len(payload)), payload)
+                client.sendall(b'\x06')
+                self.assertEqual(client.recv(1), b'\x06')
+            else:
+                def send():
+                    client.sendall(payload)
+                    client.shutdown(socket.SHUT_WR)
+                sender = threading.Thread(target=send)
+                sender.start()
+                response = bytearray()
+                while data := client.recv(65536):
+                    response.extend(data)
+                self.assertEqual(response, payload)
+                sender.join(timeout=3)
+                self.assertFalse(sender.is_alive())
+
+    def test_large_binary_payload_and_half_close(self):
+        self.exchange(bytes(range(256)) * 1000)
+
+    def test_ownership_receipt_can_follow_reply_on_same_connection(self):
+        self.exchange(b'launch request\n', receipt=True)
+
+    def test_concurrent_clients_do_not_mix_frames(self):
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            list(workers.map(self.exchange, [bytes([n]) * 20000 for n in range(4)]))
+
+    def test_socket_is_private_current_user_owned_and_removed_on_disconnect(self):
+        identity = os.stat(self.remote)
+        self.assertTrue(stat.S_ISSOCK(identity.st_mode))
+        self.assertEqual(stat.S_IMODE(identity.st_mode), 0o600)
+        self.assertEqual(identity.st_uid, os.getuid())
+        self.local_process.terminate()
+        self.local_process.wait(timeout=3)
+        self.remote_process.wait(timeout=3)
+        self.assertEqual(self.remote_process.returncode, 0)
+        self.assertFalse(Path(self.remote).exists())
 
 
 if __name__ == '__main__':

@@ -115,7 +115,7 @@ pub(crate) struct InverseReply {
     pub result: io::Result<InverseResolution>,
 }
 impl InverseTask {
-    fn resolve(&self) -> io::Result<InverseResolution> {
+    fn resolve(&self, cache: Option<&mut synctex::SyncTeXCache>) -> io::Result<InverseResolution> {
         self.operation.check()?;
         self.revision.check(&self.path)?;
         let word = if self.word_precision {
@@ -150,14 +150,19 @@ impl InverseTask {
         let mut result = if let Some(endpoint) = &self.inverse_search {
             crate::typst::resolve_inverse(endpoint, self.revision.pdf, point, &self.operation)?
         } else {
-            synctex::resolve_inverse(
-                &self.path,
+            let pdf = std::path::absolute(&self.path)?;
+            let snapshot = source_snapshot
+                .map(|path| crate::source_snapshot::SourceSnapshot::load(path, &pdf))
+                .transpose()?;
+            synctex::resolve_inverse_with_cache(
+                &pdf,
                 point,
                 word,
                 self.radius,
                 &self.operation,
-                source_snapshot,
+                snapshot.as_ref(),
                 self.best_guess,
+                cache,
             )?
         };
         if self.inverse_search.is_none()
@@ -208,10 +213,11 @@ impl NavigationWorker {
         let (sender, replies) = bounded(1);
         let queued = receiver.clone();
         let thread = thread::spawn(move || {
+            let mut cache = synctex::SyncTeXCache::default();
             while let Ok(task) = receiver.recv() {
                 let reply = InverseReply {
                     request_id: task.request_id,
-                    result: task.resolve(),
+                    result: task.resolve(Some(&mut cache)),
                 };
                 if sender.send(reply).is_err() {
                     break;
@@ -563,7 +569,8 @@ mod tests {
             best_guess: false,
             operation: Operation::default(),
         };
-        let resolution = task.resolve().unwrap();
+        let mut synctex_cache = synctex::SyncTeXCache::default();
+        let resolution = task.resolve(Some(&mut synctex_cache)).unwrap();
         assert_eq!(resolution.location.line, 6);
         assert!(!resolution.location.precise);
         assert!(
@@ -573,9 +580,9 @@ mod tests {
                 .contains("PDF text refinement unavailable")
         );
         fs::write(&source, "\\relax\n").unwrap();
-        assert!(matches!(task.resolve(), Err(error) if error.to_string().contains("out of range")));
+        assert!(matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("out of range")));
         task.best_guess = true;
-        let approximate = task.resolve().unwrap();
+        let approximate = task.resolve(Some(&mut synctex_cache)).unwrap();
         assert_eq!(approximate.location.line, 6);
         assert!(!approximate.location.precise);
         assert!(
@@ -611,19 +618,19 @@ mod tests {
         .unwrap();
         task.source_snapshot = Some(manifest);
         task.best_guess = false;
-        let captured = task.resolve().unwrap();
+        let captured = task.resolve(Some(&mut synctex_cache)).unwrap();
         assert_eq!(captured.location.line, 6);
         assert!(!captured.warning.unwrap().contains("best-guess navigation"));
         // Explicit opt-in must not downgrade required captured-text failures.
         task.best_guess = true;
         fs::write(cache.join("1.txt"), "changed cached source\n").unwrap();
         assert!(
-            matches!(task.resolve(), Err(error) if error.to_string().contains("cached source changed"))
+            matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("cached source changed"))
         );
         // A changed companion must reject before any source refinement/delivery.
         fs::remove_file(task.path.with_extension("synctex.gz")).unwrap();
-        assert!(matches!(task.resolve(), Err(error) if error.to_string().contains("revision")));
+        assert!(matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("revision")));
         task.operation.cancel();
-        assert!(matches!(task.resolve(), Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        assert!(matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.kind() == io::ErrorKind::Interrupted));
     }
 }

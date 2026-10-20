@@ -14,9 +14,17 @@ struct Cli {
     #[arg(long)]
     pdfium_library: Option<PathBuf>,
 
-    /// One-based page number to show first.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    page: u32,
+    /// One-based page number to show first (or forward-search page hint).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    page: Option<u32>,
+
+    /// One-based page hint for --forward-search or --synctex-view.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    page_hint: Option<u32>,
+
+    /// Directory containing SyncTeX files when separate from the PDF directory.
+    #[arg(short = 'd', long = "build-directory")]
+    build_directory: Option<PathBuf>,
 
     /// Print the shared configuration as JSON (also creates the default file).
     #[arg(long)]
@@ -76,6 +84,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    pdfterm::synctex::set_build_directory(cli.build_directory.clone());
     if cli.third_party_licenses {
         return match std::io::Write::write_all(
             &mut std::io::stdout().lock(),
@@ -189,6 +198,8 @@ fn main() -> ExitCode {
                     snapshot: cli.source_snapshot.as_deref(),
                     best_guess: cli.synctex_best_guess,
                     anchor_only: cli.synctex_anchor,
+                    page_hint: cli.page_hint.or(cli.page),
+                    build_directory: cli.build_directory.as_deref(),
                 },
             )?;
             if cli.synctex_view.is_some() {
@@ -222,7 +233,7 @@ fn main() -> ExitCode {
     match pdfterm::app::run(
         cli.path,
         cli.pdfium_library,
-        cli.page - 1,
+        cli.page.unwrap_or(1) - 1,
         &config,
         cli.focus_token,
         cli.source_snapshot,
