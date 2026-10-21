@@ -621,11 +621,14 @@ mod tests {
 
         let (client, server) = UnixStream::pair().unwrap();
         let reply = ForwardReply::new(server);
-        // Shut down the socket before dropping so concurrent test threads that
-        // fork() during the non-atomic socketpair()+FIOCLEX window on macOS
-        // cannot hold the peer open and delay POLLHUP.
         let _ = client.shutdown(Shutdown::Both);
         drop(client);
+        // Concurrent test threads spawning subprocesses during the non-atomic
+        // socketpair()+FIOCLEX window on macOS can briefly inherit the fd until execve.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !reply.disconnected().unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(reply.disconnected().unwrap());
     }
 

@@ -431,6 +431,19 @@ local ok, failure = xpcall(function()
   assert(project.describe({ main = graph_other }, graph_child).main == graph_other, 'explicit main lost to a root directive')
   vim.fn.writefile({ '% !TEX root = child.tex' }, graph_child)
   assert(project.describe(nil, graph_child).main == graph_child, 'self-root lost to automatic ownership')
+  local unsaved_sub = graph_directory .. '/sub'
+  vim.fn.mkdir(unsaved_sub)
+  local unsaved_standalone = unsaved_sub .. '/unsaved.tex'
+  vim.fn.writefile({ '\\documentclass{article}', '\\input{sub/unsaved}' }, graph_main)
+  assert(
+    project.describe(nil, unsaved_standalone, '\\documentclass{article}\n\\begin{document}\nstandalone\n\\end{document}\n').main
+      == unsaved_standalone,
+    'unsaved standalone document was misrouted to parent root'
+  )
+  assert(
+    project.describe(nil, unsaved_standalone, 'Included unsaved section.\n').main == graph_main,
+    'unsaved child fragment did not route to parent root'
+  )
 
   vim.fn.writefile(
     { 'forward_socket="forward.sock"', '[editor]', 'transport="socket"', 'path="editor.sock"' },
@@ -681,6 +694,26 @@ local ok, failure = xpcall(function()
     return vim.api.nvim_win_get_cursor(0)[1] == 4
   end)
   assert(vim.api.nvim_win_get_cursor(0)[2] == 6)
+  local exact_source = directory .. '/exact.tex'
+  local backup_source = directory .. '/exact.tex.bak'
+  vim.fn.writefile({ 'line one', 'line two' }, exact_source)
+  vim.fn.writefile({ 'backup one', 'backup two' }, backup_source)
+  local backup_buf = vim.fn.bufadd(backup_source)
+  vim.fn.bufload(backup_buf)
+  local exact_inverse = assert(vim.uv.new_pipe(false))
+  exact_inverse:connect(config.editor.path, function(error)
+    assert(not error, error)
+    exact_inverse:write(vim.json.encode({ file = exact_source, line = 2, byte_column = 5 }), function()
+      exact_inverse:shutdown(function()
+        exact_inverse:close()
+      end)
+    end)
+  end)
+  wait(function()
+    return vim.api.nvim_buf_get_name(0) == exact_source and vim.api.nvim_win_get_cursor(0)[1] == 2
+  end)
+  assert(vim.api.nvim_win_get_cursor(0)[2] == 5, 'inverse search opened a partial-match backup buffer')
+  vim.cmd.edit(vim.fn.fnameescape(source))
   -- The terminal selected before a slow resolver owns launch/inverse focus.
   vim.env.SSH_CONNECTION = nil
   local foreground, focused = 'A', nil

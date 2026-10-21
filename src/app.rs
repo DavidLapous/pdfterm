@@ -392,6 +392,7 @@ struct App {
     synctex_enabled: bool,
     editor: crate::editor::Editor,
     forward_socket: Option<String>,
+    session_name: Option<String>,
     forward_listener: Option<crate::ipc::ForwardListener>,
     focus_token: Option<String>,
     focus_task: Option<FocusTask>,
@@ -443,6 +444,7 @@ struct AppDefaults {
     synctex_enabled: bool,
     editor: crate::editor::Editor,
     forward_socket: Option<String>,
+    session: Option<String>,
     focus_token: Option<String>,
     viewer: ViewerSettings,
 }
@@ -475,6 +477,7 @@ impl AppDefaults {
             synctex_enabled: config.synctex_enabled(),
             editor: config.editor.clone(),
             forward_socket: config.forward_socket().map(str::to_owned),
+            session: config.session().map(str::to_owned),
             focus_token,
             viewer: config.viewer.clone(),
             theme,
@@ -495,10 +498,12 @@ struct ViewPosition {
 struct JumpList {
     entries: Vec<ViewPosition>,
     cursor: usize,
+    pending_origin: Option<ViewPosition>,
 }
 
 impl JumpList {
     fn push(&mut self, position: ViewPosition) {
+        self.pending_origin = None;
         if !self.entries.is_empty() {
             self.entries.truncate(self.cursor + 1);
         }
@@ -511,7 +516,22 @@ impl JumpList {
         self.cursor = self.entries.len().saturating_sub(1);
     }
 
+    fn jump(&mut self, origin: ViewPosition, provisional: ViewPosition) {
+        self.push(origin);
+        if provisional == origin {
+            self.pending_origin = Some(origin);
+        } else {
+            self.push(provisional);
+        }
+    }
+
     fn update_tip(&mut self, position: ViewPosition) {
+        if let Some(origin) = self.pending_origin.take() {
+            if self.cursor + 1 == self.entries.len() && self.entries.last() == Some(&origin) {
+                self.push(position);
+            }
+            return;
+        }
         if self.cursor + 1 == self.entries.len()
             && let Some(last) = self.entries.last_mut()
         {
@@ -524,15 +544,27 @@ impl JumpList {
     }
 
     fn clamp_pages(&mut self, pages: u32) {
+        self.pending_origin = None;
         let max_page = pages.saturating_sub(1);
         for entry in &mut self.entries {
             entry.page = entry.page.min(max_page);
         }
-        self.entries.dedup();
+        let cursor = self.cursor;
+        let mut write = 0usize;
+        for read in 0..self.entries.len() {
+            if write == 0 || self.entries[read] != self.entries[write - 1] {
+                self.entries[write] = self.entries[read];
+                write += 1;
+            } else if read <= cursor {
+                self.cursor = self.cursor.saturating_sub(1);
+            }
+        }
+        self.entries.truncate(write);
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
     }
 
     fn backward(&mut self, current: ViewPosition) -> Option<ViewPosition> {
+        self.pending_origin = None;
         if self.entries.is_empty() {
             return None;
         }
@@ -553,6 +585,7 @@ impl JumpList {
     }
 
     fn forward(&mut self) -> Option<ViewPosition> {
+        self.pending_origin = None;
         if self.cursor + 1 >= self.entries.len() {
             return None;
         }
@@ -1025,6 +1058,7 @@ impl App {
             synctex_enabled: defaults.synctex_enabled,
             editor: defaults.editor,
             forward_socket: defaults.forward_socket,
+            session_name: defaults.session,
             forward_listener: None,
             focus_token: defaults.focus_token,
             focus_task: None,
@@ -2518,17 +2552,19 @@ impl App {
         if let Some(origin) = preview_origin {
             tab.link_history.push(origin);
         }
-        tab.link_history.push(current);
         let page = request.page.saturating_sub(1).min(tab.page_count - 1);
         if page != tab.page {
             tab.page = page;
             tab.scroll_y = 0;
         }
-        tab.link_history.push(ViewPosition {
-            page: tab.page,
-            scroll_x: tab.scroll_x,
-            scroll_y: tab.scroll_y,
-        });
+        tab.link_history.jump(
+            current,
+            ViewPosition {
+                page: tab.page,
+                scroll_x: tab.scroll_x,
+                scroll_y: tab.scroll_y,
+            },
+        );
         self.navigation.flash = Some(PendingFlash {
             document_id,
             revision: request.revision,
@@ -2772,16 +2808,18 @@ impl App {
                 };
                 let page = page.min(self.tab().page_count - 1);
                 let tab = self.tab_mut();
-                tab.link_history.push(current);
                 tab.page = page;
                 if top_ratio.is_some() {
                     tab.scroll_y = 0;
                 }
-                tab.link_history.push(ViewPosition {
-                    page: tab.page,
-                    scroll_x: tab.scroll_x,
-                    scroll_y: tab.scroll_y,
-                });
+                tab.link_history.jump(
+                    current,
+                    ViewPosition {
+                        page: tab.page,
+                        scroll_x: tab.scroll_x,
+                        scroll_y: tab.scroll_y,
+                    },
+                );
                 tab.pending_destination = Some(LinkDestination {
                     page,
                     top_ratio,
@@ -3986,7 +4024,12 @@ impl App {
     }
 
     fn reload_config(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let config = match Config::load() {
+        let config = match Config::load().and_then(|mut config| {
+            if let Some(session) = self.session_name.as_deref() {
+                config.select_session(Some(session))?;
+            }
+            Ok(config)
+        }) {
             Ok(config) => config,
             Err(error) => {
                 let viewport = self.viewport()?;
@@ -4004,7 +4047,16 @@ impl App {
     }
 
     fn apply_config(&mut self, config: &Config) {
-        let defaults = AppDefaults::from_config(config, self.focus_token.clone());
+        let mut defaults = AppDefaults::from_config(config, self.focus_token.clone());
+        if config.session().is_none()
+            && let Some(session) = self.session_name.as_deref()
+        {
+            let mut selected = Config::default();
+            selected.editor = defaults.editor.clone();
+            if selected.select_session(Some(session)).is_ok() {
+                defaults.editor = selected.editor;
+            }
+        }
         let fit_changed = self.default_fit != defaults.fit;
         let invert_changed = self.default_invert != defaults.invert;
         self.default_fit = defaults.fit;
@@ -4020,11 +4072,7 @@ impl App {
             }
         }
         self.synctex_enabled = defaults.synctex_enabled;
-        if self.forward_socket.is_none()
-            || !matches!(defaults.editor, crate::editor::Editor::Socket { .. })
-        {
-            self.editor = defaults.editor;
-        }
+        self.editor = defaults.editor;
         self.viewer = defaults.viewer;
         if !self.viewer.set_window_title {
             self.title_document = None;
@@ -10846,6 +10894,158 @@ mod tests {
             app.poll_smooth_scroll(&mut output).unwrap();
             app.move_view(super::Axis::Vertical, false, false, true, &mut output)
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn same_page_jump_and_clamped_history_preserve_return_positions() {
+        use super::{JumpList, ViewPosition};
+
+        let origin = ViewPosition {
+            page: 0,
+            scroll_x: 0,
+            scroll_y: 0,
+        };
+        let destination = ViewPosition {
+            page: 0,
+            scroll_x: 0,
+            scroll_y: 120,
+        };
+        let mut history = JumpList::default();
+        history.jump(origin, origin);
+        history.update_tip(destination);
+        assert_eq!(history.backward(destination), Some(origin));
+        assert_eq!(history.forward(), Some(destination));
+
+        // Clamping pages that collapse duplicate entries before the cursor must keep the cursor on
+        // the same active entry rather than shifting it forward.
+        let mut clamped = JumpList::default();
+        let p5 = ViewPosition {
+            page: 5,
+            scroll_x: 0,
+            scroll_y: 0,
+        };
+        let p4 = ViewPosition {
+            page: 4,
+            scroll_x: 0,
+            scroll_y: 0,
+        };
+        let p1 = ViewPosition {
+            page: 1,
+            scroll_x: 0,
+            scroll_y: 0,
+        };
+        let p0 = ViewPosition {
+            page: 0,
+            scroll_x: 0,
+            scroll_y: 0,
+        };
+        clamped.push(p5);
+        clamped.push(p4);
+        clamped.push(p1);
+        clamped.push(p0);
+        assert_eq!(clamped.backward(p0), Some(p1));
+        clamped.clamp_pages(3);
+        assert_eq!(
+            clamped.backward(p1),
+            Some(ViewPosition {
+                page: 2,
+                scroll_x: 0,
+                scroll_y: 0,
+            })
+        );
+
+        let mut multi_run = JumpList::default();
+        for page in [0, 4, 5, 6, 3] {
+            multi_run.push(ViewPosition {
+                page,
+                scroll_x: 0,
+                scroll_y: 0,
+            });
+        }
+        assert_eq!(
+            multi_run.backward(ViewPosition {
+                page: 3,
+                scroll_x: 0,
+                scroll_y: 0,
+            }),
+            Some(ViewPosition {
+                page: 6,
+                scroll_x: 0,
+                scroll_y: 0,
+            })
+        );
+        multi_run.clamp_pages(5);
+        assert_eq!(
+            multi_run.forward(),
+            Some(ViewPosition {
+                page: 3,
+                scroll_x: 0,
+                scroll_y: 0,
+            })
+        );
+        assert_eq!(
+            multi_run.backward(ViewPosition {
+                page: 3,
+                scroll_x: 0,
+                scroll_y: 0,
+            }),
+            Some(ViewPosition {
+                page: 4,
+                scroll_x: 0,
+                scroll_y: 0,
+            })
+        );
+        assert_eq!(
+            multi_run.backward(ViewPosition {
+                page: 4,
+                scroll_x: 0,
+                scroll_y: 0,
+            }),
+            Some(ViewPosition {
+                page: 0,
+                scroll_x: 0,
+                scroll_y: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn config_reload_retains_session_prefix_on_editor_socket() {
+        use super::AppDefaults;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "forward_socket = \"forward.sock\"\n[editor]\ntransport = \"none\"\n",
+        )
+        .unwrap();
+        let mut initial = crate::config::Config::load_path(&config_path).unwrap();
+        initial.select_session(Some("work")).unwrap();
+
+        let (mut app, _viewport, _file) = continuous_app();
+        let defaults = AppDefaults::from_config(&initial, None);
+        app.editor = defaults.editor;
+        app.forward_socket = defaults.forward_socket;
+        app.session_name = defaults.session;
+
+        std::fs::write(
+            &config_path,
+            "forward_socket = \"forward.sock\"\n[editor]\ntransport = \"socket\"\npath = \"editor.sock\"\n",
+        )
+        .unwrap();
+        let reloaded = crate::config::Config::load_path(&config_path).unwrap();
+        app.apply_config(&reloaded);
+
+        match &app.editor {
+            crate::editor::Editor::Socket { path } => {
+                assert!(
+                    path.ends_with("/work-editor.sock"),
+                    "expected session-prefixed editor socket, got {path}"
+                );
+            }
+            other => panic!("expected socket editor after reload, got {other:?}"),
         }
     }
 }

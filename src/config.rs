@@ -22,6 +22,8 @@ pub struct Config {
     synctex_enabled: Option<bool>,
     pub editor: crate::editor::Editor,
     forward_socket: Option<String>,
+    #[serde(skip)]
+    session: Option<String>,
     pub viewer: ViewerSettings,
     pub nvim: NvimSettings,
 }
@@ -123,6 +125,7 @@ impl Config {
     /// Select named endpoints, or disable viewer control without changing the editor.
     pub fn select_session(&mut self, name: Option<&str>) -> io::Result<()> {
         let Some(name) = name else {
+            self.session = None;
             if let Some(socket) = self.forward_socket.as_mut() {
                 socket.clear();
             }
@@ -164,6 +167,7 @@ impl Config {
                 .into_string()
                 .map_err(|_| io::Error::other("socket path is not UTF-8"))?;
         }
+        self.session = Some(name.to_owned());
         Ok(())
     }
 
@@ -210,6 +214,10 @@ impl Config {
             .as_deref()
             .filter(|value| !value.is_empty())
     }
+
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -243,6 +251,7 @@ impl Default for Config {
                 path: "editor.sock".into(),
             },
             forward_socket: Some("forward.sock".into()),
+            session: None,
             viewer: ViewerSettings::default(),
             nvim: NvimSettings::default(),
         }

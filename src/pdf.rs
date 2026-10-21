@@ -13,7 +13,9 @@ use pdfium_render::prelude::{
     PdfPageTextRenderMode, PdfPoints, PdfRect, PdfRenderConfig, Pdfium, PdfiumError,
 };
 
-use crate::synctex::{DocumentRevision, ForwardCandidate, ForwardWord, PdfRevision, words};
+use crate::synctex::{
+    DocumentRevision, ForwardCandidate, ForwardWord, PdfRevision, is_spacing_diacritic, words,
+};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
@@ -2686,10 +2688,14 @@ fn push_normalized_character(
 }
 
 fn same_forward_word(a: &str, b: &str) -> bool {
-    a.nfkd()
+    a.chars()
+        .filter(|character| !is_spacing_diacritic(*character))
+        .nfkd()
         .filter(|character| !is_combining_mark(*character))
         .flat_map(char::to_lowercase)
         .eq(b
+            .chars()
+            .filter(|character| !is_spacing_diacritic(*character))
             .nfkd()
             .filter(|character| !is_combining_mark(*character))
             .flat_map(char::to_lowercase))

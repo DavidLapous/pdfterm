@@ -226,8 +226,7 @@ local function inverse(location)
   if location.document_revision and not location.file:match('%.typ$') then
     mapped = anchors.inverse(location)
   end
-  local buffer = mapped.buffer or vim.fn.bufnr(mapped.file)
-  if buffer < 0 then buffer = vim.fn.bufadd(mapped.file) end
+  local buffer = mapped.buffer or vim.fn.bufadd(mapped.file)
   local window = vim.fn.win_findbuf(buffer)[1]
   if window then
     vim.api.nvim_set_current_win(window)

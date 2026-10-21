@@ -269,7 +269,7 @@ local function automatic_root(source, configured_cwd, current_source)
   home = home and (vim.uv.fs_realpath(home) or home)
   local parsed, directories = {}, {}
   local function scan(path)
-    local identity = vim.uv.fs_realpath(path)
+    local identity = vim.uv.fs_realpath(path) or (unsaved and path == target and target or nil)
     if not identity then
       return nil
     end
@@ -335,6 +335,12 @@ local function automatic_root(source, configured_cwd, current_source)
             end
           end
         end
+      end
+    end
+    if unsaved and directory == vim.fs.dirname(source) and not seen[target] then
+      seen[target] = true
+      if owns(target) then
+        owners[#owners + 1] = target
       end
     end
     if #owners > 0 then
