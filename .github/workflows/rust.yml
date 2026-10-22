@@ -26,7 +26,7 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install -y texlive-latex-base texlive-latex-recommended texlive-pictures
+        sudo apt-get install -y latexmk texlive-latex-base texlive-latex-recommended texlive-pictures
         curl --fail --location https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz | tar xz
         echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
     - name: Install macOS integration dependencies
