@@ -210,6 +210,7 @@ pub enum ViewerRequest {
     Forward(ForwardRequest),
     Screenshot(PathBuf),
     Focus(String),
+    Quit,
 }
 
 #[derive(Deserialize)]
@@ -514,6 +515,16 @@ impl ForwardListener {
                             Ok(ViewerRequest::Screenshot(path))
                         }
                         Some("focus") => parse_focus_request(&payload).map(ViewerRequest::Focus),
+                        Some("quit") => {
+                            if value.as_object().is_none_or(|object| object.len() != 1) {
+                                Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "invalid quit request",
+                                ))
+                            } else {
+                                Ok(ViewerRequest::Quit)
+                            }
+                        }
                         _ => parse_forward_request(&payload).map(ViewerRequest::Forward),
                     }
                 });
@@ -606,6 +617,34 @@ mod tests {
         assert!(response.ok);
         assert!(response.error.is_none());
         assert!(response._viewer_token.is_none());
+    }
+
+    #[test]
+    fn quit_request_is_strict_and_replies_without_a_viewer_token() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private/quit.sock");
+        let mut listener = ForwardListener::bind(&path).unwrap();
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(br#"{"type":"quit"}"#).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let (request, mut reply) = listener.poll().unwrap().into_iter().next().unwrap();
+        assert!(matches!(request.unwrap(), ViewerRequest::Quit));
+        reply.finish(None);
+        let mut payload = String::new();
+        client.read_to_string(&mut payload).unwrap();
+        let response: Reply = serde_json::from_str(&payload).unwrap();
+        assert!(response.ok);
+        assert!(response.error.is_none());
+        assert!(response._viewer_token.is_none());
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .write_all(br#"{"type":"quit","extra":true}"#)
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let (request, _reply) = listener.poll().unwrap().into_iter().next().unwrap();
+        assert_eq!(request.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

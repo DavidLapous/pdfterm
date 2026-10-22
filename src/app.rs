@@ -2249,6 +2249,10 @@ impl App {
                         }
                     }
                 }
+                Ok(crate::ipc::ViewerRequest::Quit) => {
+                    reply.finish_with_token(None, self.focus_token.as_deref());
+                    return Err(AppError::Quit);
+                }
                 Err(error) => {
                     reply.finish(Some(error.to_string()));
                     self.draw_status(
@@ -3115,14 +3119,18 @@ impl App {
             }
             return self.redraw_search_picker(output);
         }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc => return self.close_search_picker(output),
-            KeyCode::Char('/') => {
+            KeyCode::Char('/') if !control && !alt => {
                 self.close_search_picker(output)?;
                 return self.begin_search(output);
             }
-            KeyCode::Char('s') => return self.cycle_link_picker_layout(output),
-            KeyCode::Char('a') => {
+            KeyCode::Char('s') if !control && !alt => {
+                return self.cycle_link_picker_layout(output);
+            }
+            KeyCode::Char('a') if !control && !alt => {
                 return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
             }
             _ => {}
@@ -3195,7 +3203,7 @@ impl App {
             return self.redraw_link_picker(output);
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') if self.link_mode => {
+            KeyCode::Esc if self.link_mode => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
             KeyCode::Esc if filtering || has_filter => {
@@ -3214,14 +3222,16 @@ impl App {
                 state.number_input.clear();
                 return self.redraw_link_picker(output);
             }
-            KeyCode::Char('s') if !filtering => return self.cycle_link_picker_layout(output),
-            KeyCode::Char('a') if !filtering => {
+            KeyCode::Char('s') if !filtering && !control && !alt => {
+                return self.cycle_link_picker_layout(output);
+            }
+            KeyCode::Char('a') if !filtering && !control && !alt => {
                 return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
             }
-            KeyCode::Char('L') if !filtering => {
+            KeyCode::Char('L') if !filtering && !control && !alt => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
-            KeyCode::Char('q') if !filtering => {
+            KeyCode::Char('q') if !control && !alt && (self.link_mode || !filtering) => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
             KeyCode::Char('B') if !filtering && !control && !alt => {
@@ -3327,7 +3337,7 @@ impl App {
                     }
                     redraw = true;
                 }
-                KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                KeyCode::Char(digit) if !control && !alt && digit.is_ascii_digit() => {
                     if let Some(index) =
                         update_link_number_selection(&mut state.number_input, digit, filtered.len())
                     {
@@ -3367,7 +3377,16 @@ impl App {
         key: KeyEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let KeyCode::Char(ch) = key.code
+            && !match key.modifiers {
+                KeyModifiers::CONTROL => matches!(ch, 'd' | 'u' | 'f' | 'b'),
+                KeyModifiers::NONE | KeyModifiers::SHIFT => !matches!(ch, 'f' | 'b'),
+                _ => false,
+            }
+        {
+            return Ok(());
+        }
+        let control = key.modifiers == KeyModifiers::CONTROL;
         let shift = key.modifiers == KeyModifiers::SHIFT;
         if matches!(
             key.code,
@@ -3410,14 +3429,10 @@ impl App {
             KeyCode::PageUp | KeyCode::Backspace => {
                 self.move_view(Axis::Vertical, false, true, true, output)?
             }
-            KeyCode::Char('d')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('d') if !shift => {
                 self.move_view(Axis::Vertical, true, true, true, output)?
             }
-            KeyCode::Char('u')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('u') if !shift => {
                 self.move_view(Axis::Vertical, false, true, true, output)?
             }
             KeyCode::Char('f') if control => {
@@ -3464,9 +3479,22 @@ impl App {
             self.select_tab(index, output)?;
             return Ok(false);
         }
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers == KeyModifiers::SHIFT;
         match key.code {
+            KeyCode::Char('b' | 'u') if key.modifiers == KeyModifiers::CONTROL => {
+                self.move_view(Axis::Vertical, false, true, true, output)?
+            }
+            KeyCode::Char('f' | 'd') if key.modifiers == KeyModifiers::CONTROL => {
+                self.move_view(Axis::Vertical, true, true, true, output)?
+            }
+            KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
+                self.follow_link_back(output)?
+            }
+            KeyCode::Char('i') if key.modifiers == KeyModifiers::CONTROL => {
+                self.follow_link_forward(output)?
+            }
+            KeyCode::Char(_)
+                if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {}
             KeyCode::Char('x') if self.session.pending_open.is_none() && !self.link_mode => {
                 self.begin_label_mode(output)?
             }
@@ -3474,47 +3502,25 @@ impl App {
             KeyCode::Char('q') if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Char('q') => return self.close_current(output),
             KeyCode::Char(':') => self.begin_goto(String::new(), output)?,
-            KeyCode::Char(digit @ '1'..='9') if key.modifiers == KeyModifiers::NONE => {
+            KeyCode::Char(digit @ '1'..='9') if !shift => {
                 self.begin_goto(digit.to_string(), output)?
             }
             KeyCode::Char('/') => self.begin_search(output)?,
             KeyCode::Char('n') => self.navigate_search(true, output)?,
             KeyCode::Char('N') => self.navigate_search(false, output)?,
             KeyCode::Char('L') => self.toggle_link_mode(output)?,
-            KeyCode::Char('b') if control => {
-                self.move_view(Axis::Vertical, false, true, true, output)?
-            }
-            KeyCode::Char('B')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
-            {
-                self.follow_link_forward(output)?
-            }
+            KeyCode::Char('B') => self.follow_link_forward(output)?,
             KeyCode::Char('b') if shift => self.follow_link_forward(output)?,
             KeyCode::Char('b') => self.follow_link_back(output)?,
-            KeyCode::Char('o') if control => self.follow_link_back(output)?,
-            KeyCode::Char('i') if control => self.follow_link_forward(output)?,
             KeyCode::Enter => self.open_link_picker(output)?,
             KeyCode::Esc if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Esc if self.clear_search(output)? => {}
             KeyCode::Esc => return Ok(true),
-            KeyCode::Char('f') if control => {
-                self.move_view(Axis::Vertical, true, true, true, output)?
-            }
             KeyCode::Char('f') => self.open_picker(output)?,
-            KeyCode::Char('D')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
-            {
-                self.duplicate_tab(output)?
-            }
+            KeyCode::Char('D') => self.duplicate_tab(output)?,
             KeyCode::Char('d') if shift => self.duplicate_tab(output)?,
-            KeyCode::Char('d')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
-            {
-                self.move_view(Axis::Vertical, true, true, true, output)?
-            }
-            KeyCode::Char('u')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('d') => self.move_view(Axis::Vertical, true, true, true, output)?,
+            KeyCode::Char('u') if !shift => {
                 self.move_view(Axis::Vertical, false, true, true, output)?
             }
             KeyCode::Tab => self.switch_tab(1, output)?,
@@ -3550,21 +3556,13 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(output)?,
             KeyCode::Char('0') => self.reset_zoom(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
-            KeyCode::Char('S')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
-            {
-                self.toggle_smooth_scroll(output)?
-            }
+            KeyCode::Char('S') => self.toggle_smooth_scroll(output)?,
             KeyCode::Char('s') if shift => self.toggle_smooth_scroll(output)?,
             KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
             KeyCode::Char('T') => self.open_theme_picker(output)?,
             KeyCode::Char('y') => self.request_copy(output)?,
-            KeyCode::Char('R')
-                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
-            {
-                self.reload_config(output)?
-            }
+            KeyCode::Char('R') => self.reload_config(output)?,
             KeyCode::Char('r') if shift => self.reload_config(output)?,
             _ => {}
         }
@@ -5988,9 +5986,12 @@ fn link_picker_focus_for_key(
     if layout == LinkPickerLayout::Floating {
         return None;
     }
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match key.code {
-        KeyCode::Char('h') => Some(LinkPickerFocus::Document),
-        KeyCode::Char('l') => Some(LinkPickerFocus::Links),
+        KeyCode::Char('h') if plain => Some(LinkPickerFocus::Document),
+        KeyCode::Char('l') if plain => Some(LinkPickerFocus::Links),
         KeyCode::Tab | KeyCode::BackTab => Some(match current {
             LinkPickerFocus::Document => LinkPickerFocus::Links,
             LinkPickerFocus::Links => LinkPickerFocus::Document,
@@ -6128,8 +6129,12 @@ fn link_picker_navigation_index(
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        KeyCode::Down | KeyCode::Char('j') => Some((selected + 1) % link_count),
-        KeyCode::Up | KeyCode::Char('k') => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
+        KeyCode::Down => Some((selected + 1) % link_count),
+        KeyCode::Up => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
+        KeyCode::Char('j') if !control && !alt => Some((selected + 1) % link_count),
+        KeyCode::Char('k') if !control && !alt => {
+            Some(selected.checked_sub(1).unwrap_or(link_count - 1))
+        }
         KeyCode::Char('f' | 'd') if control => {
             Some((selected + visible_height).min(link_count - 1))
         }
@@ -11059,5 +11064,45 @@ mod tests {
             }
             other => panic!("expected socket editor after reload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn modified_char_shortcuts_are_ignored_and_forward_quit_stops_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _viewport, _file) = continuous_app();
+        let initial_scroll_y = app.tab().scroll_y;
+        let mut output = Vec::new();
+        for key in [
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+        ] {
+            assert!(!app.handle_key(key, &mut output).unwrap());
+        }
+        app.link_picker = Some(LinkPickerState::new(0));
+        app.link_picker.as_mut().unwrap().focus = LinkPickerFocus::Document;
+        for key in [
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        ] {
+            assert!(!app.handle_key(key, &mut output).unwrap());
+        }
+        assert!(app.link_picker.is_some());
+        assert_eq!(app.tab().scroll_y, initial_scroll_y);
+        assert_eq!(app.smooth_scroll_remaining, 0);
+
+        let socket_path = dir.path().join("private/quit.sock");
+        app.forward_socket = Some(socket_path.to_str().unwrap().to_owned());
+        app.poll_forward_socket(&mut output).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+        client.write_all(br#"{"type":"quit"}"#).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(matches!(
+            app.poll_forward_socket(&mut output),
+            Err(super::AppError::Quit)
+        ));
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut client, &mut reply).unwrap();
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
     }
 }

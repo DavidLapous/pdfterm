@@ -5,7 +5,7 @@ local project = require('pdfterm.project')
 local terminal = require('pdfterm.terminal')
 local anchors = require('pdfterm.source')
 local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h')
-local options, main_file, initialized, exiting
+local options, main_file, initialized, exiting, paired
 local cancel_forward, cancel_focus, cancel_resolution, close_listener
 local owned_splits, launch_waiters = {}, nil
 local viewer_handle, viewer_token
@@ -348,6 +348,9 @@ local function ready(callback, listen)
       end
       close_listener = result
     end
+    if listen then
+      paired = true
+    end
     local ok, error = pcall(callback)
     if not ok then
       notify(error)
@@ -367,7 +370,7 @@ local function viewer_command(pdf, source_snapshot)
   return table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' ')
 end
 
-local function launch(id, source, source_error, callback)
+local function launch(source, source_error, callback)
   if remote_session() or options.attach_only then
     callback(
       'viewer unavailable; run on this machine in another terminal: '
@@ -392,9 +395,7 @@ local function launch(id, source, source_error, callback)
     complete(source_error or 'source terminal unavailable')
     return
   end
-  if options.focus_on_forward then
-    focus_token = vim.fn.sha256(assert(vim.uv.random(16))):sub(1, 32)
-  end
+  focus_token = vim.fn.sha256(assert(vim.uv.random(16))):sub(1, 32)
   local ok, process = pcall(
     terminal.launch_split,
     source,
@@ -403,7 +404,12 @@ local function launch(id, source, source_error, callback)
     function(result, split)
       launch_process = nil
       if split then
-        owned_splits[#owned_splits + 1] = split
+        owned_splits[#owned_splits + 1] = {
+          handle = split,
+          token = focus_token,
+          unclosed = result.unclosed == true,
+          ready = false,
+        }
       end
       vim.schedule(function()
         if exiting then
@@ -458,6 +464,11 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch, foc
             and launched_token
             and reply.viewer_token == launched_token
           if matching_launch then
+            for _, split in ipairs(owned_splits) do
+              if split.handle == launched_viewer then
+                split.ready = true
+              end
+            end
             viewer_handle, viewer_token = launched_viewer, launched_token
           end
           if focus_forward and options.focus_on_forward then
@@ -515,7 +526,7 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch, foc
           launched = true
           M._launch_pdf = pdf
           M._launch_snapshot = vim.json.decode(payload).source_snapshot
-          launch(id, source, source_error, function(launch_error, split, token)
+          launch(source, source_error, function(launch_error, split, token)
             if not alive(id) then
               return
             end
@@ -846,7 +857,7 @@ function M.setup(opts)
         )
         :sub(1, 12)
     )
-  initialized, exiting = true, false
+  initialized, exiting, paired = true, false, false
   local function map(key, callback, extra)
     if key and key ~= '' then
       vim.keymap.set('n', key, callback, extra)
@@ -933,10 +944,36 @@ function M.setup(opts)
           notify('waiting for terminal launch: ' .. tostring(error))
         end
       end
+      local quit_ok, quit_absent, quit_token = false, false, nil
+      if (paired or #owned_splits > 0) and options and (options.forward_socket or '') ~= '' then
+        local done = false
+        local cancel_quit = socket.request(
+          options.forward_socket,
+          vim.json.encode({ type = 'quit' }),
+          function(error, connection_error, reply)
+            if not error then
+              quit_ok = true
+              quit_token = type(reply) == 'table' and reply.viewer_token or nil
+            elseif connection_error and (error:match('ENOENT') or error:match('ECONNREFUSED')) then
+              quit_absent = true
+            else
+              notify(error)
+            end
+            done = true
+          end,
+          200
+        )
+        if not vim.wait(250, function() return done end, 1) and cancel_quit then
+          cancel_quit()
+        end
+      end
       for _, split in ipairs(owned_splits) do
-        local ok, error = pcall(terminal.close, split)
-        if not ok then
-          notify(error)
+        local matched_quit = quit_ok and split.token and quit_token == split.token
+        if split.unclosed or not (matched_quit or (split.ready and quit_absent)) then
+          local ok, error = pcall(terminal.close, split.handle)
+          if not ok then
+            notify(error)
+          end
         end
       end
     end,

@@ -532,7 +532,7 @@ local ok, failure = xpcall(function()
     not vim.uv.fs_lstat(config.editor.path),
     'setup opened an inverse listener before first use'
   )
-  local requests, focus_requests, viewer_reply_token = {}, {}, nil
+  local requests, focus_requests, quit_requests, viewer_reply_token = {}, {}, {}, nil
   local function receive()
     server = assert(vim.uv.new_pipe(false))
     assert(server:bind(config.forward_socket))
@@ -549,6 +549,8 @@ local ok, failure = xpcall(function()
           local request = vim.json.decode(table.concat(chunks))
           if request.type == 'focus' then
             focus_requests[#focus_requests + 1] = request
+          elseif request.type == 'quit' then
+            quit_requests[#quit_requests + 1] = request
           else
             requests[#requests + 1] = request
           end
@@ -831,9 +833,10 @@ local ok, failure = xpcall(function()
   assert(focused == 'new', 'superseded capture changed inverse focus')
   -- Ordinary forward only attaches; explicit split launches and then delivers.
   server:close()
-  local launches, notices, closed_splits = 0, {}, {}
+  local launches, notices, closed_splits, viewer_token = 0, {}, {}, nil
   terminal.launch_split = function(_, _, _, callback, _, token)
     launches = launches + 1
+    viewer_token = token
     viewer_reply_token = token
     receive()
     vim.schedule(function()
@@ -939,6 +942,7 @@ local ok, failure = xpcall(function()
     return false
   end)
   assert(#requests == delivered, 'failed split was reported as usable')
+  viewer_reply_token = viewer_token
   receive()
 
   -- Reinitialize through the plugin's cleanup path: setup itself is intentionally idempotent.
@@ -991,7 +995,10 @@ local ok, failure = xpcall(function()
   for _, output_folder in ipairs({ '.', 'output' }) do
     vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
     if output_folder == '.' then
+      assert(closed_splits.viewer == nil, 'ready viewer split was closed through terminal control after IPC quit')
+      assert(closed_splits.viewer2 == 1, 'unconfirmed racing split was not closed on exit')
       assert(closed_splits.viewer3 == 1, 'failed rollback lost its owned viewer')
+      assert(#quit_requests == 1, 'VimLeavePre did not send quit over forward_socket')
     end
     wait(function()
       return not vim.uv.fs_lstat(config.editor.path)
