@@ -2176,14 +2176,12 @@ fn cli_source_info_and_snapshot_preserve_relative_input_identity_across_director
         "\\documentclass{article}\n\\begin{document}\nAlpha Copper Omega\n\\end{document}\n";
     fs::write(&build_source, build_contents).unwrap();
     let compile = process::output(
-        Command::new("pdflatex")
-            .current_dir(&build)
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-synctex=-1",
-                "main.tex",
-            ]),
+        Command::new("pdflatex").current_dir(&build).args([
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-synctex=-1",
+            "main.tex",
+        ]),
         &Operation::new(Duration::from_secs(30)),
     )
     .unwrap();

@@ -6130,7 +6130,9 @@ fn link_picker_navigation_index(
     match key.code {
         KeyCode::Down | KeyCode::Char('j') => Some((selected + 1) % link_count),
         KeyCode::Up | KeyCode::Char('k') => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
-        KeyCode::Char('f' | 'd') if control => Some((selected + visible_height).min(link_count - 1)),
+        KeyCode::Char('f' | 'd') if control => {
+            Some((selected + visible_height).min(link_count - 1))
+        }
         KeyCode::Char('b' | 'u') if control => Some(selected.saturating_sub(visible_height)),
         KeyCode::Char('g') if !control && !alt => Some(0),
         KeyCode::Char('G') if !control && !alt => Some(link_count - 1),
@@ -10670,7 +10672,13 @@ mod tests {
         .unwrap();
         assert_eq!(app.tab().page, 5);
         app.tab_mut().link_history.clamp_pages(10);
-        assert!(app.tab().link_history.entries.iter().all(|entry| entry.page < 10));
+        assert!(
+            app.tab()
+                .link_history
+                .entries
+                .iter()
+                .all(|entry| entry.page < 10)
+        );
 
         // d / u and Ctrl-d / Ctrl-u / Ctrl-f / Ctrl-b page viewport
         app.viewer.continuous_scroll = false;
@@ -10754,7 +10762,11 @@ mod tests {
             "[editor]\ntransport = \"socket\"\npath = \"editor.sock\"",
             "[editor]\ntransport = \"command\"\nargv = [\"nvim\", \"+{line}\", \"{file}\"]",
         ];
-        let forward_sockets = ["", "forward_socket = \"\"", "forward_socket = \"forward.sock\""];
+        let forward_sockets = [
+            "",
+            "forward_socket = \"\"",
+            "forward_socket = \"forward.sock\"",
+        ];
         let prefetch_values = [0u64, 1, 3, u32::MAX as u64];
         let step_percents = [1u64, 5, 100];
         let page_percents = [1u64, 85, 100];
@@ -11049,4 +11061,3 @@ mod tests {
         }
     }
 }
-

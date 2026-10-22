@@ -368,7 +368,7 @@ error('editor did not exit during launch')
                     if body.startswith('focus terminal id'):
                         self.assertEqual(arguments, ('ghostty-source',))
                         raise RuntimeError('Ghostty source refocus failed')
-                    if body.startswith('repeat 15 times'):
+                    if body.startswith('repeat 50 times'):
                         self.assertEqual(arguments, ('ghostty-child',), 'only the exact child may be closed')
                         if cleanup['fail']:
                             raise RuntimeError('Ghostty child cleanup unavailable')

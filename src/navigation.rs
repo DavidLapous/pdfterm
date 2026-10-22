@@ -580,7 +580,9 @@ mod tests {
                 .contains("PDF text refinement unavailable")
         );
         fs::write(&source, "\\relax\n").unwrap();
-        assert!(matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("out of range")));
+        assert!(
+            matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("out of range"))
+        );
         task.best_guess = true;
         let approximate = task.resolve(Some(&mut synctex_cache)).unwrap();
         assert_eq!(approximate.location.line, 6);
@@ -629,8 +631,12 @@ mod tests {
         );
         // A changed companion must reject before any source refinement/delivery.
         fs::remove_file(task.path.with_extension("synctex.gz")).unwrap();
-        assert!(matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("revision")));
+        assert!(
+            matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("revision"))
+        );
         task.operation.cancel();
-        assert!(matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        assert!(
+            matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.kind() == io::ErrorKind::Interrupted)
+        );
     }
 }
