@@ -1657,6 +1657,8 @@ dependencies = [
 [[package]]
 name = "synctex-parser"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a71c3b8f951f6a6021dff3e9be7543273bdc15e47686c5e535f1999a81800f2f"
 dependencies = [
  "flate2",
  "latex2mathml",
