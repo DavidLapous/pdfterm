@@ -82,15 +82,30 @@ Kitty splits require `allow_remote_control yes`; detached Neovim also needs a pr
 
 For automatic local viewer splits over SSH, run `scripts/pdfterm-ssh HOST` from the client terminal. The remote needs Neovim, pdfterm, and its Neovim adapter. macOS remotes also need Python 3: their control connection uses a private, current-user-owned Unix socket relayed over SSH, without `netstat` or privileged port inspection. Linux remotes use a verified loopback reverse forward and require `ss`.
 
-## SyncTeX
+## SyncTeX (`synctex-parser`)
 
-LaTeX navigation requires `synctex` on `PATH` and a matching PDF/`.synctex.gz` build:
+LaTeX navigation uses the built-in pure-Rust `synctex-parser` engine (no external `synctex` binary required on `PATH`) with a matching PDF/`.synctex(.gz)` build:
 
 ```console
 latexmk -pdf -synctex=1 main.tex
 ```
 
 Forward search uses the source cursor; `Alt`/`Option` + click or `x` navigates from PDF text back to its source. Neither direction changes terminal focus by default.
+
+### Engine Specs
+- **Companion discovery & caching**: Searches beside the PDF and in an optional `--build-directory` (`SYNCTEX_BUILD_DIRECTORY`), auto-detects gzip via `0x1f 0x8b` magic bytes regardless of extension, and caches parsed pages/structural maps per `DocumentRevision`.
+- **Coordinates**: Emits top-down PDF bounding boxes (`SearchRect`) for forward jumps (with optional `--page-hint` tie-breaking) and returns 1-based `line`, 0-based UTF-8 `byte_column`, 1-based UTF-16 `column`, and 1-based Unicode scalar `column_char` for inverse hits.
+- **Collected-body & macro heuristics**: Resolves deferred TeX anchors inside Beamer `frame` (including fragile `.vrb` remapping), `tabularx`, and multi-line `\caption{...}` blocks, plus preamble metadata (`\title`, `\author`, `\frametitle`, etc.), and refines inverse hits across prose (including TeX accents and OT1 spacing diacritics) and inline/display math.
+- **Resource & safety bounds**: Opens companions and snapshots with nonblocking regular-file checks (rejecting FIFOs/symlinks), enforces a 128 MiB decoded stream cap and 512 box-depth limit, validates `i64` geometry bounds, and honors per-operation cancellation deadlines.
+
+| Area | Baseline `synctex` (`libsynctex` CLI) | `synctex-parser` |
+| --- | --- | --- |
+| **Runtime & caching** | External C binary; re-reads and decompresses `.synctex.gz` on every call | Pure-Rust in-process library; `SyncTeXCache` reuses decompressed bytes and parsed page trees per `DocumentRevision` |
+| **Granularity & units** | Line-level anchors (raw or missing column offsets) | Token- and math-refined positions with validated UTF-8 (`byte_column`), UTF-16 (`column`), and scalar (`column_char`) columns |
+| **Collected bodies (`frame`, `tabularx`, `\caption`)** | Emits anchors only on the closing line (`\end{frame}`, `\end{tabularx}`, closing `}`) | Read-ahead resolves interior lines on forward search and remaps closing-line hits back to the interior source token on inverse search |
+| **Beamer `.vrb` & metadata** | Inverse clicks open generated `.vrb` files or land on `\maketitle` / `\end{frame}` | Remaps `.vrb` hits back to the originating `.tex` frame and resolves `\title`, `\author`, `\frametitle`, etc. |
+| **Source drift & ambiguity** | Silently picks the first candidate; assumes disk files match the PDF | Verifies revision-bound `SourceSnapshot` SHA-256 digests and distinguishes strict errors from warned `best_guess` results |
+| **Malformed input & I/O safety** | Can block on FIFOs, ignore bad postambles, or overflow on extreme integers | `O_NONBLOCK` regular-file check, 128 MiB stream cap, 512 box-depth cap, `i64::MIN` rejection, and `Operation` deadlines |
 
 The Neovim adapter tracks plugin builds with immutable source snapshots and native line-range anchors. Unchanged captured text follows insertions, deletions, undo, reload, and known buffer renames; changed or deleted targets use warned live boundaries. A successful plugin build captures saved inputs when compilation starts. Inverse clicks look up that build's matching PDF/SyncTeX revision before refinement, including after viewer reloads without a forward request. When no captured build exists, inverse navigation makes the usual saved-source word guess and explicitly warns that it assumes the source has not changed since compilation. It does not manufacture source history from current files. Build and forward commands use edited root directives without losing pre-save anchors. Restart Neovim and existing viewers after updating the plugin and executable together.
 
