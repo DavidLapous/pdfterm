@@ -35,7 +35,7 @@ jobs:
         brew install neovim
         brew install --cask basictex
         sudo /Library/TeX/texbin/tlmgr update --self
-        sudo /Library/TeX/texbin/tlmgr install beamer etoolbox
+        sudo /Library/TeX/texbin/tlmgr install beamer etoolbox latexmk
         echo "/Library/TeX/texbin" >> "$GITHUB_PATH"
     - name: Check formatting and lint
       run: cargo fmt --check && cargo clippy --all-targets -- -D warnings
