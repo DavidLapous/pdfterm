@@ -77,32 +77,6 @@ enum Endpoint<'a> {
     Unix(&'a str),
 }
 
-enum Transport {
-    Tcp(TcpStream),
-    #[cfg(unix)]
-    Unix(std::os::unix::net::UnixStream),
-}
-
-impl Read for Transport {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Tcp(stream) => stream.read(buf),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.read(buf),
-        }
-    }
-}
-
-impl AsRawFd for Transport {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        match self {
-            Self::Tcp(stream) => stream.as_raw_fd(),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.as_raw_fd(),
-        }
-    }
-}
-
 fn focus_ssh(operation: &crate::process::Operation) -> io::Result<()> {
     let endpoint = env::var("PDFTERM_LAUNCH_SOCKET").map_err(|_| {
         io::Error::new(
@@ -139,7 +113,10 @@ fn focus_ssh_with(
             }
         })
     };
-    let mut stream = match endpoint {
+    let reply: BridgeReply = match endpoint {
+        #[cfg(unix)]
+        Endpoint::Unix(path) => crate::ipc::exchange(path, &bytes, "SSH focus bridge", operation)
+            .map_err(|e| bridge_operation_error("request", e))?,
         Endpoint::Tcp(address) => {
             let mut stream =
                 TcpStream::connect_timeout(&address, remaining()?.max(Duration::from_millis(1)))
@@ -153,58 +130,50 @@ fn focus_ssh_with(
             stream
                 .shutdown(std::net::Shutdown::Write)
                 .map_err(|e| bridge_error("shutdown", e))?;
-            Transport::Tcp(stream)
-        }
-        #[cfg(unix)]
-        Endpoint::Unix(path) => {
-            let mut stream = crate::ipc::connect(path, operation)
-                .map_err(|e| bridge_operation_error("connect", e))?;
-            crate::ipc::send(&mut stream, &bytes, operation)
-                .map_err(|e| bridge_operation_error("write", e))?;
-            Transport::Unix(stream)
+            operation.check()?;
+            let mut response = Vec::with_capacity(256);
+            let mut chunk = [0_u8; 512];
+            loop {
+                let timeout = remaining()?.min(Duration::from_millis(50));
+                let mut descriptor = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready =
+                    unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis().max(1) as i32) };
+                if ready == 0 {
+                    continue;
+                }
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(bridge_error("poll", error));
+                }
+                let count = match stream.read(&mut chunk) {
+                    Ok(count) => count,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(bridge_error("read", error)),
+                };
+                if count == 0 {
+                    break;
+                }
+                if response.len() + count > REPLY_LIMIT {
+                    return Err(invalid_data("SSH focus bridge reply exceeds 4096 bytes"));
+                }
+                response.extend_from_slice(&chunk[..count]);
+            }
+            operation.check()?;
+            serde_json::from_slice(&response).map_err(invalid_data)?
         }
     };
-    operation.check()?;
-    let mut response = Vec::with_capacity(256);
-    let mut chunk = [0_u8; 512];
-    loop {
-        let timeout = remaining()?.min(Duration::from_millis(50));
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis().max(1) as i32) };
-        if ready == 0 {
-            continue;
-        }
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(bridge_error("poll", error));
-        }
-        let count = match stream.read(&mut chunk) {
-            Ok(count) => count,
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::Interrupted =>
-            {
-                continue;
-            }
-            Err(error) => return Err(bridge_error("read", error)),
-        };
-        if count == 0 {
-            break;
-        }
-        if response.len() + count > REPLY_LIMIT {
-            return Err(invalid_data("SSH focus bridge reply exceeds 4096 bytes"));
-        }
-        response.extend_from_slice(&chunk[..count]);
-    }
-    operation.check()?;
-    let reply: BridgeReply = serde_json::from_slice(&response).map_err(invalid_data)?;
     if reply.ok {
         Ok(())
     } else {
@@ -217,8 +186,7 @@ fn focus_ssh_with(
 fn parse_endpoint(endpoint: &str) -> io::Result<Endpoint<'_>> {
     #[cfg(unix)]
     if endpoint.starts_with('/') {
-        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        if endpoint.as_bytes().contains(&0) || endpoint.len() >= address.sun_path.len() {
+        if !crate::ipc::valid_socket_path(endpoint) {
             return Err(invalid("SSH focus Unix socket path is invalid"));
         }
         return Ok(Endpoint::Unix(endpoint));

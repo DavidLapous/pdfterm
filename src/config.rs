@@ -11,7 +11,7 @@ use crate::pdf::FitMode;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    fit_mode: FitModeSetting,
+    fit_mode: FitMode,
     #[serde(alias = "invert")]
     dark_mode: bool,
     theme: Option<String>,
@@ -26,15 +26,6 @@ pub struct Config {
     session: Option<String>,
     pub viewer: ViewerSettings,
     pub nvim: NvimSettings,
-}
-
-#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum FitModeSetting {
-    #[default]
-    Page,
-    Width,
-    Height,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
@@ -172,11 +163,7 @@ impl Config {
     }
 
     pub fn fit_mode(&self) -> FitMode {
-        match self.fit_mode {
-            FitModeSetting::Page => FitMode::Page,
-            FitModeSetting::Width => FitMode::Width,
-            FitModeSetting::Height => FitMode::Height,
-        }
+        self.fit_mode
     }
 
     pub fn dark_mode(&self) -> bool {
@@ -239,7 +226,7 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            fit_mode: FitModeSetting::default(),
+            fit_mode: FitMode::default(),
             dark_mode: false,
             theme: None,
             theme_catalog: None,

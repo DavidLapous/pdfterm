@@ -1003,28 +1003,20 @@ impl App {
             worker,
             session: Session {
                 pending_open: None,
-                tabs: vec![Tab {
-                    document_id: INITIAL_DOCUMENT_ID,
+                tabs: vec![Tab::new(
+                    INITIAL_DOCUMENT_ID,
                     path,
                     revision,
                     watcher,
                     page_count,
                     page,
-                    fit: default_fit,
-                    zoom: ZOOM_DEFAULT,
-                    invert: default_invert,
-                    dark_mode_style: defaults.dark_mode_style,
-                    search_highlight: defaults.search_highlight,
-                    link_highlight: defaults.link_highlight,
-                    scroll_x: 0,
-                    scroll_y: 0,
-                    outline: Arc::new(outline),
-                    cache: HashMap::new(),
-                    search: SearchState::default(),
-                    link_history: JumpList::default(),
-                    pending_destination: None,
-                    link_index: LinkIndexState::new(page_count),
-                }],
+                    default_fit,
+                    default_invert,
+                    defaults.dark_mode_style,
+                    defaults.search_highlight,
+                    defaults.link_highlight,
+                    outline,
+                )],
                 active_tab: 0,
                 next_document_id: INITIAL_DOCUMENT_ID + 1,
             },
@@ -1414,42 +1406,19 @@ impl App {
         };
         let viewport = self.viewport()?;
         let document_id = self.tab().document_id;
-        let current_key = self.render_key(viewport);
-        let continuous = self.viewer.continuous_scroll
-            && self.link_picker.is_none()
-            && self.search_picker.is_none();
-        let visible = if continuous {
-            self.visible_pages
-                .iter()
-                .filter(|page| same_render_view(page.frame.key, current_key))
-                .map(|page| {
-                    (
-                        page.frame.key,
-                        page.frame.revision,
-                        page.frame.width,
-                        page.frame.height,
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else {
-            self.tab()
-                .cache
-                .get(&current_key)
-                .map(|frame| vec![(current_key, frame.revision, frame.width, frame.height)])
-                .unwrap_or_default()
-        };
-        let Some((_, revision, _, _)) = visible.first().copied() else {
+        let visible = self.visible_view_frames(viewport);
+        let Some((_, revision, _, _, _, _)) = visible.first().copied() else {
             return Ok(());
         };
         if visible
             .iter()
-            .any(|(_, candidate_revision, _, _)| *candidate_revision != revision)
+            .any(|(_, candidate_revision, _, _, _, _)| *candidate_revision != revision)
         {
             return Ok(());
         }
         let keys = visible
             .into_iter()
-            .map(|(key, _, width, height)| (key, width, height))
+            .map(|(key, _, _, _, width, height)| (key, width, height))
             .collect::<Vec<_>>();
         self.worker
             .find_visible(document_id, request_id, revision, query, keys)
@@ -1457,26 +1426,22 @@ impl App {
         self.draw_label_status(output)
     }
 
-    fn receive_visible_matches(
-        &mut self,
-        document_id: DocumentId,
-        request_id: u64,
-        revision: crate::synctex::DocumentRevision,
-        mut matches: Vec<VisibleMatch>,
-        output: &mut impl Write,
-    ) -> Result<(), AppError> {
-        if self.label_query.is_none()
-            || document_id != self.tab().document_id
-            || request_id != self.label_request_id.wrapping_sub(1).max(1)
-        {
-            return Ok(());
-        }
-        let viewport = self.viewport()?;
+    fn visible_view_frames(
+        &self,
+        viewport: Viewport,
+    ) -> Vec<(
+        RenderKey,
+        crate::synctex::DocumentRevision,
+        ImagePlacement,
+        u16,
+        u32,
+        u32,
+    )> {
         let current_key = self.render_key(viewport);
-        let continuous = self.viewer.continuous_scroll
+        if self.viewer.continuous_scroll
             && self.link_picker.is_none()
-            && self.search_picker.is_none();
-        let visible = if continuous {
+            && self.search_picker.is_none()
+        {
             self.visible_pages
                 .iter()
                 .filter(|page| same_render_view(page.frame.key, current_key))
@@ -1490,7 +1455,7 @@ impl App {
                         page.frame.height,
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect()
         } else {
             self.tab()
                 .cache
@@ -1511,7 +1476,25 @@ impl App {
                     )]
                 })
                 .unwrap_or_default()
-        };
+        }
+    }
+
+    fn receive_visible_matches(
+        &mut self,
+        document_id: DocumentId,
+        request_id: u64,
+        revision: crate::synctex::DocumentRevision,
+        mut matches: Vec<VisibleMatch>,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if self.label_query.is_none()
+            || document_id != self.tab().document_id
+            || request_id != self.label_request_id.wrapping_sub(1).max(1)
+        {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let visible = self.visible_view_frames(viewport);
         if visible.is_empty()
             || visible
                 .iter()
@@ -1624,25 +1607,11 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let current_key = self.render_key(viewport);
-        let visible_revisions = if self.viewer.continuous_scroll
-            && self.link_picker.is_none()
-            && self.search_picker.is_none()
-        {
-            self.visible_pages
+        let visible = self.visible_view_frames(viewport);
+        if visible.is_empty()
+            || visible
                 .iter()
-                .filter(|page| same_render_view(page.frame.key, current_key))
-                .map(|page| page.frame.revision)
-                .collect::<Vec<_>>()
-        } else {
-            self.tab()
-                .cache
-                .get(&current_key)
-                .map(|frame| vec![frame.revision])
-                .unwrap_or_default()
-        };
-        if visible_revisions.is_empty()
-            || visible_revisions.iter().any(|current| *current != revision)
+                .any(|(_, current, _, _, _, _)| *current != revision)
         {
             return Ok(());
         }
@@ -2539,12 +2508,7 @@ impl App {
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
         if let Some(previous) = self.navigation.flash.take() {
-            self.worker.clear_flash(previous.document_id);
-            if let Some(index) = self.tab_index(previous.document_id) {
-                self.session.tabs[index]
-                    .cache
-                    .retain(|key, _| key.page != previous.page);
-            }
+            self.clear_flash_state(&previous);
         }
         let tab = self.tab_mut();
         let document_id = tab.document_id;
@@ -2597,6 +2561,15 @@ impl App {
         Ok(source_state)
     }
 
+    fn clear_flash_state(&mut self, flash: &PendingFlash) {
+        self.worker.clear_flash(flash.document_id);
+        if let Some(index) = self.tab_index(flash.document_id) {
+            self.session.tabs[index]
+                .cache
+                .retain(|key, _| key.page != flash.page);
+        }
+    }
+
     fn clear_document_flash(&mut self, document_id: DocumentId) {
         if self
             .navigation
@@ -2605,12 +2578,7 @@ impl App {
             .is_some_and(|flash| flash.document_id == document_id)
         {
             let flash = self.navigation.flash.take().unwrap();
-            self.worker.clear_flash(document_id);
-            if let Some(index) = self.tab_index(document_id) {
-                self.session.tabs[index]
-                    .cache
-                    .retain(|key, _| key.page != flash.page);
-            }
+            self.clear_flash_state(&flash);
         }
     }
 
@@ -2623,12 +2591,7 @@ impl App {
             return Ok(());
         }
         let flash = self.navigation.flash.take().unwrap();
-        self.worker.clear_flash(flash.document_id);
-        if let Some(index) = self.tab_index(flash.document_id) {
-            self.session.tabs[index]
-                .cache
-                .retain(|key, _| key.page != flash.page);
-        }
+        self.clear_flash_state(&flash);
         // Clearing an overlay must not cancel an unrelated in-flight page render.
         if self.tab().document_id == flash.document_id
             && self.tab().revision == flash.revision
@@ -3002,11 +2965,12 @@ impl App {
         }
     }
 
-    fn close_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let Some(state) = self.link_picker.take() else {
-            return Ok(());
-        };
-        if let Some(origin) = state.preview_origin {
+    fn restore_preview_origin(
+        &mut self,
+        origin: Option<ViewPosition>,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if let Some(origin) = origin {
             let tab = self.tab_mut();
             tab.page = origin.page.min(tab.page_count - 1);
             tab.scroll_x = origin.scroll_x;
@@ -3014,10 +2978,15 @@ impl App {
             tab.pending_destination = None;
             self.clear_viewer(output)?;
             self.reset_render_state();
-            self.request_current(output)?;
-            return Ok(());
         }
         self.request_current(output)
+    }
+
+    fn close_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let Some(state) = self.link_picker.take() else {
+            return Ok(());
+        };
+        self.restore_preview_origin(state.preview_origin, output)
     }
 
     fn close_link_picker_and_exit_link_mode(
@@ -3081,18 +3050,7 @@ impl App {
         let Some(state) = self.search_picker.take() else {
             return Ok(());
         };
-        if let Some(origin) = state.preview_origin {
-            let tab = self.tab_mut();
-            tab.page = origin.page.min(tab.page_count - 1);
-            tab.scroll_x = origin.scroll_x;
-            tab.scroll_y = origin.scroll_y;
-            tab.pending_destination = None;
-            self.clear_viewer(output)?;
-            self.reset_render_state();
-            self.request_current(output)?;
-            return Ok(());
-        }
-        self.request_current(output)
+        self.restore_preview_origin(state.preview_origin, output)
     }
 
     fn handle_search_picker_key(

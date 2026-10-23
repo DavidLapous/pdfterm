@@ -16,6 +16,7 @@ use pdfium_render::prelude::{
 use crate::synctex::{
     DocumentRevision, ForwardCandidate, ForwardWord, PdfRevision, is_spacing_diacritic, words,
 };
+use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
@@ -53,7 +54,8 @@ pub struct SearchPageMatch {
 }
 
 /// How a page is scaled to the terminal viewport.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FitMode {
     /// Fit the whole page within the viewport (no scrolling).
     #[default]
@@ -418,54 +420,7 @@ enum WorkerCommand {
 }
 
 enum WorkerTask {
-    Open {
-        document_id: DocumentId,
-        path: PathBuf,
-    },
-    Close(DocumentId),
-    ExtractText {
-        document_id: DocumentId,
-        page: u32,
-    },
-    PagePoint {
-        document_id: DocumentId,
-        page: u32,
-        request_id: u64,
-        x: u32,
-        y: u32,
-        key: RenderKey,
-        revision: DocumentRevision,
-    },
-    StartSearch {
-        document_id: DocumentId,
-        request_id: u64,
-        query: String,
-    },
-    VisibleMatches {
-        document_id: DocumentId,
-        request_id: u64,
-        revision: DocumentRevision,
-        query: String,
-        keys: Vec<(RenderKey, u32, u32)>,
-        generation: u64,
-    },
-    CancelSearch {
-        document_id: DocumentId,
-        request_id: u64,
-    },
-    StartLinkIndex {
-        document_id: DocumentId,
-        request_id: u64,
-    },
-    Flash {
-        document_id: DocumentId,
-        page: u32,
-        rect: SearchRect,
-        word: Option<ForwardWord>,
-    },
-    ClearFlash {
-        document_id: DocumentId,
-    },
+    Command(WorkerCommand),
     IndexLinkPage(LinkIndexJob),
     SearchPage(SearchJob),
     Render(RenderRequest),
@@ -499,13 +454,7 @@ struct SearchHighlights {
 
 pub use synctex_parser::SearchRect;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PixelRect {
-    pub left: u32,
-    pub top: u32,
-    pub right: u32,
-    pub bottom: u32,
-}
+pub type PixelRect = PageLinkRect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisibleMatch {
@@ -770,7 +719,7 @@ fn run_worker(
 
         loop {
             let task = match command_rx.try_recv() {
-                Ok(command) => command.into(),
+                Ok(command) => WorkerTask::Command(command),
                 Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
                     match priority_rx.try_recv() {
                         Ok(request) => WorkerTask::Render(request),
@@ -786,7 +735,7 @@ fn run_worker(
                                     Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
                                         select_biased! {
                                             recv(command_rx) -> command => match command {
-                                                Ok(command) => command.into(),
+                                                Ok(command) => WorkerTask::Command(command),
                                                 Err(_) => break,
                                             },
                                             recv(priority_rx) -> request => match request {
@@ -807,10 +756,10 @@ fn run_worker(
             };
 
             let request = match task {
-                WorkerTask::Open {
+                WorkerTask::Command(WorkerCommand::Open {
                     document_id,
                     path: new_path,
-                } => {
+                }) => {
                     let opened = (|| {
                         let revision =
                             DocumentRevision::read(&new_path).map_err(|error| error.to_string())?;
@@ -868,7 +817,7 @@ fn run_worker(
                     }
                     continue;
                 }
-                WorkerTask::Close(document_id) => {
+                WorkerTask::Command(WorkerCommand::Close(document_id)) => {
                     documents.remove(&document_id);
                     revisions.remove(&document_id);
                     text_cache.remove(&document_id);
@@ -878,7 +827,7 @@ fn run_worker(
                     flash_highlights.remove(&document_id);
                     continue;
                 }
-                WorkerTask::ExtractText { document_id, page } => {
+                WorkerTask::Command(WorkerCommand::ExtractText { document_id, page }) => {
                     if let (Some(document), Some(cache)) = (
                         documents.get(&document_id),
                         text_cache.get_mut(&document_id),
@@ -895,14 +844,14 @@ fn run_worker(
                     }
                     continue;
                 }
-                WorkerTask::VisibleMatches {
+                WorkerTask::Command(WorkerCommand::VisibleMatches {
                     document_id,
                     request_id,
                     revision,
                     query,
                     keys,
                     generation,
-                } => {
+                }) => {
                     if generation != visible_generation.load(Ordering::Acquire) {
                         continue;
                     }
@@ -960,7 +909,7 @@ fn run_worker(
                     }
                     continue;
                 }
-                WorkerTask::PagePoint {
+                WorkerTask::Command(WorkerCommand::PagePoint {
                     document_id,
                     page,
                     request_id,
@@ -968,7 +917,7 @@ fn run_worker(
                     y,
                     key,
                     revision,
-                } => {
+                }) => {
                     let result =
                         (|| -> Result<ResolvedClick, String> {
                             if revisions.get(&document_id) != Some(&revision) {
@@ -1020,12 +969,12 @@ fn run_worker(
                         .map_err(|_| "viewer stopped".to_string())?;
                     continue;
                 }
-                WorkerTask::Flash {
+                WorkerTask::Command(WorkerCommand::Flash {
                     document_id,
                     page,
                     rect,
                     word,
-                } => {
+                }) => {
                     // Forward-search flash state: the app re-issues the render
                     // (and the clear) around this store, so nothing else to do.
                     // Translate original source coordinates before PDF-space text
@@ -1072,15 +1021,15 @@ fn run_worker(
                     );
                     continue;
                 }
-                WorkerTask::ClearFlash { document_id } => {
+                WorkerTask::Command(WorkerCommand::ClearFlash { document_id }) => {
                     flash_highlights.remove(&document_id);
                     continue;
                 }
-                WorkerTask::StartSearch {
+                WorkerTask::Command(WorkerCommand::Search {
                     document_id,
                     request_id,
                     query,
-                } => {
+                }) => {
                     search_jobs.retain(|job| job.document_id != document_id);
                     search_highlights.remove(&document_id);
                     let needle = normalize_search_text(&query);
@@ -1112,10 +1061,10 @@ fn run_worker(
                     }
                     continue;
                 }
-                WorkerTask::CancelSearch {
+                WorkerTask::Command(WorkerCommand::CancelSearch {
                     document_id,
                     request_id,
-                } => {
+                }) => {
                     search_jobs.retain(|job| {
                         job.document_id != document_id || job.request_id != request_id
                     });
@@ -1127,10 +1076,10 @@ fn run_worker(
                     }
                     continue;
                 }
-                WorkerTask::StartLinkIndex {
+                WorkerTask::Command(WorkerCommand::IndexLinks {
                     document_id,
                     request_id,
-                } => {
+                }) => {
                     link_index_jobs.retain(|job| job.document_id != document_id);
                     let Some(document) = documents.get(&document_id) else {
                         continue;
@@ -1878,85 +1827,6 @@ fn blend_channel(transformed: u8, original: u8, mask_ratio: f32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-impl From<WorkerCommand> for WorkerTask {
-    fn from(command: WorkerCommand) -> Self {
-        match command {
-            WorkerCommand::Open { document_id, path } => Self::Open { document_id, path },
-            WorkerCommand::Close(document_id) => Self::Close(document_id),
-            WorkerCommand::ExtractText { document_id, page } => {
-                Self::ExtractText { document_id, page }
-            }
-            WorkerCommand::VisibleMatches {
-                document_id,
-                request_id,
-                revision,
-                query,
-                keys,
-                generation,
-            } => Self::VisibleMatches {
-                document_id,
-                request_id,
-                revision,
-                query,
-                keys,
-                generation,
-            },
-            WorkerCommand::Search {
-                document_id,
-                request_id,
-                query,
-            } => Self::StartSearch {
-                document_id,
-                request_id,
-                query,
-            },
-            WorkerCommand::CancelSearch {
-                document_id,
-                request_id,
-            } => Self::CancelSearch {
-                document_id,
-                request_id,
-            },
-            WorkerCommand::PagePoint {
-                document_id,
-                page,
-                request_id,
-                x,
-                y,
-                key,
-                revision,
-            } => Self::PagePoint {
-                document_id,
-                page,
-                request_id,
-                x,
-                y,
-                key,
-                revision,
-            },
-            WorkerCommand::IndexLinks {
-                document_id,
-                request_id,
-            } => Self::StartLinkIndex {
-                document_id,
-                request_id,
-            },
-            WorkerCommand::Flash {
-                document_id,
-                page,
-                rect,
-                word,
-            } => Self::Flash {
-                document_id,
-                page,
-                rect,
-                word,
-            },
-            WorkerCommand::ClearFlash { document_id } => Self::ClearFlash { document_id },
-        }
-    }
-}
-
 /// Keep a small text neighborhood around the clicked glyph, not the entire page.
 fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)>, String> {
     let text = page.text().map_err(|error| error.to_string())?;
@@ -2470,7 +2340,7 @@ fn cached_visible_page_text<'a>(
                     )
                 });
                 if visible {
-                    visible_characters.push((index, end, value));
+                    visible_characters.push(((index, end), value));
                 }
                 index = end;
                 continue;
@@ -2503,14 +2373,14 @@ fn cached_visible_page_text<'a>(
                 }
             }
             if has_visible_glyph {
-                visible_characters.push((index, end, value));
+                visible_characters.push(((index, end), value));
             }
             index = end;
         }
         if generation != latest_generation.load(Ordering::Acquire) {
             return None;
         }
-        slot.visible = Some(normalize_visible_search_characters(visible_characters));
+        slot.visible = Some(normalize_search_characters(visible_characters));
     }
     Some(slot)
 }
@@ -2582,9 +2452,9 @@ fn count_search_matches(haystack: &str, needle: &str) -> u32 {
     u32::try_from(haystack.match_indices(needle).count()).unwrap_or(u32::MAX)
 }
 
-fn normalize_search_characters(
-    characters: impl IntoIterator<Item = (usize, char)>,
-) -> (String, Vec<usize>) {
+fn normalize_search_characters<T: Copy>(
+    characters: impl IntoIterator<Item = (T, char)>,
+) -> (String, Vec<T>) {
     let mut normalized = String::new();
     let mut source_index_by_byte = Vec::new();
     let mut pending_whitespace = None;
@@ -2614,38 +2484,6 @@ fn normalize_search_characters(
     }
     (normalized, source_index_by_byte)
 }
-fn normalize_visible_search_characters(
-    characters: impl IntoIterator<Item = (usize, usize, char)>,
-) -> (String, Vec<(usize, usize)>) {
-    let mut normalized = String::new();
-    let mut source_ranges = Vec::new();
-    let mut pending_whitespace = None;
-    for (source_start, source_end, character) in characters {
-        if character.is_whitespace() {
-            pending_whitespace.get_or_insert((source_start, source_end));
-            continue;
-        }
-        if let Some(whitespace_range) = pending_whitespace.take()
-            && !normalized.is_empty()
-        {
-            push_visible_normalized_character(
-                &mut normalized,
-                &mut source_ranges,
-                whitespace_range,
-                ' ',
-            );
-        }
-        for character in character.to_lowercase() {
-            push_visible_normalized_character(
-                &mut normalized,
-                &mut source_ranges,
-                (source_start, source_end),
-                character,
-            );
-        }
-    }
-    (normalized, source_ranges)
-}
 
 fn source_range_char(
     start: usize,
@@ -2667,20 +2505,10 @@ fn source_range_char(
     char::from_u32(scalar)
 }
 
-fn push_visible_normalized_character(
+fn push_normalized_character<T: Copy>(
     normalized: &mut String,
-    source_ranges: &mut Vec<(usize, usize)>,
-    source_range: (usize, usize),
-    character: char,
-) {
-    normalized.push(character);
-    source_ranges.extend(std::iter::repeat_n(source_range, character.len_utf8()));
-}
-
-fn push_normalized_character(
-    normalized: &mut String,
-    source_index_by_byte: &mut Vec<usize>,
-    source_index: usize,
+    source_index_by_byte: &mut Vec<T>,
+    source_index: T,
     character: char,
 ) {
     normalized.push(character);
@@ -3177,12 +3005,7 @@ fn extract_page_links(
                 .filter(|label| !label.is_empty())
                 .unwrap_or_else(|| link_target_label(&target));
             Some(PageLink {
-                rect: PageLinkRect {
-                    left: rect.left,
-                    top: rect.top,
-                    right: rect.right,
-                    bottom: rect.bottom,
-                },
+                rect,
                 label,
                 target,
             })
@@ -3202,13 +3025,7 @@ fn extract_page_link_rectangles(
         .iter()
         .filter_map(|link| {
             let bounds = link.rect().ok()?;
-            let rect = page_rect_to_pixels(page, config, width, height, bounds)?;
-            Some(PageLinkRect {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-            })
+            page_rect_to_pixels(page, config, width, height, bounds)
         })
         .collect()
 }
@@ -3664,12 +3481,7 @@ fn apply_link_highlights(
     dark_mode: bool,
 ) {
     for link in links {
-        let rect = PixelRect {
-            left: link.rect.left,
-            top: link.rect.top,
-            right: link.rect.right,
-            bottom: link.rect.bottom,
-        };
+        let rect = link.rect;
         if dark_mode {
             blend_rectangle(
                 rgba,
@@ -3684,27 +3496,7 @@ fn apply_link_highlights(
             );
         } else {
             blend_rectangle(rgba, width, height, rect, color, LINK_HIGHLIGHT_ALPHA);
-            let border = 2;
-            for edge in [
-                PixelRect {
-                    bottom: rect.top.saturating_add(border),
-                    ..rect
-                },
-                PixelRect {
-                    top: rect.bottom.saturating_sub(border),
-                    ..rect
-                },
-                PixelRect {
-                    right: rect.left.saturating_add(border),
-                    ..rect
-                },
-                PixelRect {
-                    left: rect.right.saturating_sub(border),
-                    ..rect
-                },
-            ] {
-                blend_rectangle(rgba, width, height, edge, color, LINK_BORDER_ALPHA);
-            }
+            blend_rectangle_border(rgba, width, height, rect, 2, color, LINK_BORDER_ALPHA);
         }
     }
 }
@@ -3716,13 +3508,7 @@ fn apply_selected_link_highlights(
     rectangles: &[PageLinkRect],
     color: [u8; 3],
 ) {
-    for rectangle in rectangles {
-        let rect = PixelRect {
-            left: rectangle.left,
-            top: rectangle.top,
-            right: rectangle.right,
-            bottom: rectangle.bottom,
-        };
+    for &rect in rectangles {
         blend_rectangle(
             rgba,
             width,
@@ -3731,27 +3517,46 @@ fn apply_selected_link_highlights(
             color,
             SELECTED_LINK_HIGHLIGHT_ALPHA,
         );
-        let border = 3;
-        for edge in [
-            PixelRect {
-                bottom: rect.top.saturating_add(border),
-                ..rect
-            },
-            PixelRect {
-                top: rect.bottom.saturating_sub(border),
-                ..rect
-            },
-            PixelRect {
-                right: rect.left.saturating_add(border),
-                ..rect
-            },
-            PixelRect {
-                left: rect.right.saturating_sub(border),
-                ..rect
-            },
-        ] {
-            blend_rectangle(rgba, width, height, edge, color, SELECTED_LINK_BORDER_ALPHA);
-        }
+        blend_rectangle_border(
+            rgba,
+            width,
+            height,
+            rect,
+            3,
+            color,
+            SELECTED_LINK_BORDER_ALPHA,
+        );
+    }
+}
+
+fn blend_rectangle_border(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    rect: PixelRect,
+    border: u32,
+    color: [u8; 3],
+    alpha: u16,
+) {
+    for edge in [
+        PixelRect {
+            bottom: rect.top.saturating_add(border).min(rect.bottom),
+            ..rect
+        },
+        PixelRect {
+            top: rect.bottom.saturating_sub(border).max(rect.top),
+            ..rect
+        },
+        PixelRect {
+            right: rect.left.saturating_add(border).min(rect.right),
+            ..rect
+        },
+        PixelRect {
+            left: rect.right.saturating_sub(border).max(rect.left),
+            ..rect
+        },
+    ] {
+        blend_rectangle(rgba, width, height, edge, color, alpha);
     }
 }
 

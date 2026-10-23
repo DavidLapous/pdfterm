@@ -104,16 +104,18 @@ local function intent()
   end
   return id
 end
-local function with_source(id, source, callback)
+local function with_source(id, source, callback, force)
   local config = options or setup_options or {}
-  local attach_focus = config.attach_only and config.focus_on_inverse and not remote_session()
+  local attach_focus = not force and config.attach_only and config.focus_on_inverse and not remote_session()
+  local done = false
   local function captured(error, handle)
-    if alive(id) then
+    if not done and alive(id) then
+      done = true
       callback(handle or (attach_focus and M._source_terminal or nil), error)
     end
   end
-  if source or remote_session() or (config.attach_only and not attach_focus) then
-    captured(nil, source)
+  if source or remote_session() or (not force and config.attach_only and not attach_focus) then
+    captured(not source and remote_session() and 'plain SSH has no terminal focus bridge' or nil, source)
     return
   end
   local ok, error = pcall(terminal.capture_source, captured)
@@ -579,15 +581,7 @@ local function open_pdf(pdf, id, source, source_error, allow_launch, focus_forwa
     with_document(p, id, function(document)
       local payload = vim.json.encode({
         pdf = path,
-        revision = {
-          device = stat.dev,
-          inode = stat.ino,
-          length = stat.size,
-          modified_seconds = stat.mtime.sec,
-          modified_nanoseconds = stat.mtime.nsec,
-          changed_seconds = stat.ctime.sec,
-          changed_nanoseconds = stat.ctime.nsec,
-        },
+        revision = anchors.saved_revision(stat),
         page = 1, h = 0, v = 0, width = 0, height = 0,
         source_snapshot = document and document.source_snapshot or nil,
         best_guess = true,
@@ -631,53 +625,33 @@ function M.viewer_command(pdf)
   local id = intent()
   local source = vim.api.nvim_buf_get_name(0)
   M._source_terminal = nil
-  local captured_source, source_error, capture_done, configured = nil, nil, false, false
-  local published = false
-  local function publish()
-    if published or not configured or not capture_done or not alive(id) then
-      return
-    end
-    published = true
-    M._source_terminal = captured_source
-    local p = pdf and {
-      pdf = vim.fn.fnamemodify(pdf, ':p'), executable = options.executable,
-      cwd = options.project and options.project.cwd or vim.fn.getcwd(),
-    } or describe(source)
-    local function publish_command(document)
-      local shell_command = viewer_command(p.pdf, document and document.source_snapshot)
-      vim.fn.setreg('+', shell_command)
-      vim.notify(shell_command)
-      if options.focus_on_inverse and not captured_source then
-        notify('source terminal focus unavailable: ' .. (source_error or 'source terminal unavailable'))
+  with_source(id, nil, function(captured_source, source_error)
+    ready(function()
+      if not alive(id) then
+        return
       end
-    end
-    local stat, stat_error, stat_code = vim.uv.fs_stat(p.pdf)
-    if stat then
-      with_document(p, id, publish_command)
-    elseif stat_code == 'ENOENT' then
-      publish_command()
-    else
-      notify(stat_error)
-    end
-  end
-  local function capture(error, handle)
-    if not alive(id) or capture_done then
-      return
-    end
-    captured_source, source_error, capture_done = handle, error, true
-    publish()
-  end
-  if remote_session() then
-    capture('plain SSH has no terminal focus bridge')
-  else
-    local ok, error = pcall(terminal.capture_source, capture)
-    if not ok then
-      capture(tostring(error))
-    end
-  end
-  ready(function()
-    configured = true
-    publish()
+      M._source_terminal = captured_source
+      local p = pdf and {
+        pdf = vim.fn.fnamemodify(pdf, ':p'), executable = options.executable,
+        cwd = options.project and options.project.cwd or vim.fn.getcwd(),
+      } or describe(source)
+      local function publish_command(document)
+        local shell_command = viewer_command(p.pdf, document and document.source_snapshot)
+        vim.fn.setreg('+', shell_command)
+        vim.notify(shell_command)
+        if options.focus_on_inverse and not captured_source then
+          notify('source terminal focus unavailable: ' .. (source_error or 'source terminal unavailable'))
+        end
+      end
+      local stat, stat_error, stat_code = vim.uv.fs_stat(p.pdf)
+      if stat then
+        with_document(p, id, publish_command)
+      elseif stat_code == 'ENOENT' then
+        publish_command()
+      else
+        notify(stat_error)
+      end
+    end, true)
   end, true)
 end
 function M.build()

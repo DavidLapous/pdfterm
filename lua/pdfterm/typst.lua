@@ -1,5 +1,6 @@
 -- Tinymist's preview uses Typst source spans, not PDF text matching. Its LSP
 -- scrollPreview command delivers document positions over the local data plane.
+local source = require('pdfterm.source')
 local M = {}
 local active = {}
 local retained = {}
@@ -97,12 +98,7 @@ local function compile_args(project)
 end
 
 local function revision(path)
-  local stat = assert(vim.uv.fs_stat(path), 'cannot stat Typst PDF: ' .. path)
-  return {
-    device = stat.dev, inode = stat.ino, length = stat.size,
-    modified_seconds = stat.mtime.sec, modified_nanoseconds = stat.mtime.nsec,
-    changed_seconds = stat.ctime.sec, changed_nanoseconds = stat.ctime.nsec,
-  }
+  return source.saved_revision(assert(vim.uv.fs_stat(path), 'cannot stat Typst PDF: ' .. path))
 end
 
 -- Track compiler-accessed files, not output directories, swap files, or other
@@ -128,16 +124,7 @@ local function unchanged(inputs)
   return true
 end
 
-local function saved_bytes(path)
-  local fd, error = vim.uv.fs_open(path, 'r', 0)
-  if not fd then return nil, error end
-  local stat = vim.uv.fs_fstat(fd)
-  local bytes, reason
-  if stat and stat.type == 'file' then bytes, reason = vim.uv.fs_read(fd, stat.size, 0)
-  else reason = 'not a regular file' end
-  vim.uv.fs_close(fd)
-  return bytes, reason
-end
+local saved_bytes = source.read_bytes
 
 -- Only a local Tinymist data-plane connection is accepted. Frames are drained
 -- incrementally, retaining at most 512 bytes: SVG updates can be very large.

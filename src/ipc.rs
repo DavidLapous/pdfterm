@@ -9,16 +9,21 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub(crate) fn valid_socket_path(path: &str) -> bool {
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    !path.as_bytes().contains(&0) && path.len() < address.sun_path.len()
+}
+
 /// Cancellable connection, including a saturated Unix listener backlog.
 pub(crate) fn connect(path: &str, operation: &crate::process::Operation) -> io::Result<UnixStream> {
     use std::os::fd::FromRawFd;
     operation.check()?;
+    if !valid_socket_path(path) {
+        return Err(io::Error::other("invalid Unix socket path"));
+    }
     // Zero initialization supplies the trailing NUL and optional platform fields.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     let bytes = path.as_bytes();
-    if bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
-        return Err(io::Error::other("invalid Unix socket path"));
-    }
     address.sun_family = libc::AF_UNIX as _;
     for (to, from) in address.sun_path.iter_mut().zip(bytes) {
         *to = *from as _;

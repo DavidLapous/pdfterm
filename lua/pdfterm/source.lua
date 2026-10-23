@@ -172,7 +172,7 @@ local function read_bytes(path, bound, no_follow)
   local stat = vim.uv.fs_fstat(fd)
   local bytes
   if not stat or stat.type ~= 'file' then reason = 'not a regular file'
-  elseif stat.size > bound then reason = 'source/cache file exceeds ' .. bound .. ' bytes'
+  elseif bound and stat.size > bound then reason = 'source/cache file exceeds ' .. bound .. ' bytes'
   else bytes, reason = vim.uv.fs_read(fd, stat.size, 0) end
   local after = vim.uv.fs_fstat(fd)
   local closed, close_error = vim.uv.fs_close(fd)
@@ -183,6 +183,9 @@ local function read_bytes(path, bound, no_follow)
   end
   return bytes, nil, saved_revision(stat)
 end
+
+M.saved_revision = saved_revision
+M.read_bytes = read_bytes
 
 local function source_bytes(path, no_follow)
   local bytes, reason, revision = read_bytes(path, MAX_SOURCE, no_follow)

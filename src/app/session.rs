@@ -31,6 +31,45 @@ pub(super) struct Tab {
 }
 
 impl Tab {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        document_id: DocumentId,
+        path: PathBuf,
+        revision: PdfRevision,
+        watcher: FileWatcher,
+        page_count: u32,
+        page: u32,
+        fit: FitMode,
+        invert: bool,
+        dark_mode_style: DarkModeStyle,
+        search_highlight: [u8; 3],
+        link_highlight: [u8; 3],
+        outline: Vec<OutlineItem>,
+    ) -> Self {
+        Self {
+            document_id,
+            path,
+            revision,
+            watcher,
+            page_count,
+            page,
+            fit,
+            zoom: ZOOM_DEFAULT,
+            invert,
+            dark_mode_style,
+            search_highlight,
+            link_highlight,
+            scroll_x: 0,
+            scroll_y: 0,
+            outline: Arc::new(outline),
+            cache: HashMap::new(),
+            search: SearchState::default(),
+            link_history: JumpList::default(),
+            pending_destination: None,
+            link_index: LinkIndexState::new(page_count),
+        }
+    }
+
     pub(super) fn render_key(
         &self,
         viewport: Viewport,
@@ -241,31 +280,23 @@ impl App {
             } if expected == document_id => {
                 crate::recent::record(&path);
                 let watcher = FileWatcher::new(&path)?;
-                self.session.tabs.push(Tab {
+                self.session.tabs.push(Tab::new(
                     document_id,
                     path,
                     revision,
                     watcher,
-                    page_count: pages,
-                    page: 0,
-                    fit: self.default_fit,
-                    zoom: ZOOM_DEFAULT,
-                    invert: self.default_invert,
-                    dark_mode_style: DarkModeStyle::new(
+                    pages,
+                    0,
+                    self.default_fit,
+                    self.default_invert,
+                    DarkModeStyle::new(
                         self.theme.document.background,
                         self.theme.document.foreground,
                     ),
-                    search_highlight: terminal_color_rgb(self.theme.yellow),
-                    link_highlight: terminal_color_rgb(self.theme.cyan),
-                    scroll_x: 0,
-                    scroll_y: 0,
-                    outline: Arc::new(outline),
-                    cache: HashMap::new(),
-                    search: SearchState::default(),
-                    link_history: JumpList::default(),
-                    pending_destination: None,
-                    link_index: LinkIndexState::new(pages),
-                });
+                    terminal_color_rgb(self.theme.yellow),
+                    terminal_color_rgb(self.theme.cyan),
+                    outline,
+                ));
                 if let Some(view) = view {
                     let tab = self.session.tabs.last_mut().expect("new tab");
                     tab.page = view.position.page.min(pages - 1);

@@ -5,13 +5,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{self, Read},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{FileTypeExt, MetadataExt},
-    },
+    io,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::Path,
-    time::Duration,
 };
 
 pub(crate) fn resolve_inverse(
@@ -42,48 +38,12 @@ pub(crate) fn resolve_inverse(
             "Typst source-map endpoint must be a private current-user-owned socket",
         ));
     }
-    let mut stream = crate::ipc::connect(endpoint, operation)?;
     #[derive(Serialize)]
     struct Request {
         revision: PdfRevision,
         page: u32,
         x: f32,
         y: f32,
-    }
-    let request = serde_json::to_vec(&Request {
-        revision,
-        page: point.page,
-        x: point.x,
-        y: point.y_from_top,
-    })?;
-    crate::ipc::send(&mut stream, &request, operation)?;
-    let mut response = Vec::new();
-    let mut buffer = [0; 4097];
-    loop {
-        operation.check()?;
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                if response.len() + count > 4096 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Typst source-map reply exceeds 4096 bytes",
-                    ));
-                }
-                response.extend_from_slice(&buffer[..count]);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                let timeout = operation.remaining()?.min(Duration::from_millis(20));
-                let mut descriptor = libc::pollfd {
-                    fd: stream.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis().max(1) as i32) };
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -92,7 +52,13 @@ pub(crate) fn resolve_inverse(
         location: Option<SourceLocation>,
         error: Option<String>,
     }
-    let reply: Reply = serde_json::from_slice(&response)?;
+    let request = serde_json::to_vec(&Request {
+        revision,
+        page: point.page,
+        x: point.x,
+        y: point.y_from_top,
+    })?;
+    let reply: Reply = crate::ipc::exchange(endpoint, &request, "Typst source-map", operation)?;
     if !reply.ok {
         return Err(io::Error::other(
             reply
@@ -127,6 +93,7 @@ pub(crate) fn resolve_inverse(
 mod tests {
     use super::*;
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    use std::time::Duration;
 
     fn point() -> InversePoint {
         InversePoint {
