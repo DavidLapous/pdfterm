@@ -10,11 +10,12 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded
 use pdfium_render::prelude::{
     PdfAction, PdfBookmark, PdfDestination, PdfDestinationViewSettings, PdfDocument, PdfLink,
     PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon, PdfPageObjectsCommon, PdfPageText,
-    PdfPageTextRenderMode, PdfPoints, PdfRect, PdfRenderConfig, Pdfium, PdfiumError,
+    PdfPageTextChar, PdfPageTextRenderMode, PdfPoints, PdfRect, PdfRenderConfig, Pdfium,
+    PdfiumError,
 };
 
 use crate::synctex::{
-    DocumentRevision, ForwardCandidate, ForwardWord, PdfRevision, is_spacing_diacritic, words,
+    DocumentRevision, ForwardCandidate, ForwardWord, is_spacing_diacritic, words,
 };
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -306,13 +307,13 @@ pub enum WorkerMessage {
     Ready {
         pages: u32,
         outline: Vec<OutlineItem>,
-        revision: PdfRevision,
+        revision: DocumentRevision,
     },
     Opened {
         document_id: DocumentId,
         pages: u32,
         outline: Vec<OutlineItem>,
-        revision: PdfRevision,
+        revision: DocumentRevision,
     },
     PagePoint {
         document_id: DocumentId,
@@ -525,7 +526,7 @@ impl RenderWorker {
         }
     }
 
-    pub fn wait_until_ready(&self) -> Result<(u32, Vec<OutlineItem>, PdfRevision), String> {
+    pub fn wait_until_ready(&self) -> Result<(u32, Vec<OutlineItem>, DocumentRevision), String> {
         match self.message_rx.recv() {
             Ok(WorkerMessage::Ready {
                 pages,
@@ -705,7 +706,7 @@ fn run_worker(
             .send(WorkerMessage::Ready {
                 pages,
                 outline,
-                revision: revision.pdf,
+                revision,
             })
             .map_err(|_| "viewer stopped".to_string())?;
         let mut documents = HashMap::from([(initial_document_id, document)]);
@@ -716,36 +717,41 @@ fn run_worker(
         let mut link_index_jobs = VecDeque::new();
         let mut search_highlights: HashMap<DocumentId, SearchHighlights> = HashMap::new();
         let mut flash_highlights: HashMap<DocumentId, (u32, ForwardHighlight)> = HashMap::new();
+        let mut deferred_render: Option<RenderRequest> = None;
 
         loop {
             let task = match command_rx.try_recv() {
                 Ok(command) => WorkerTask::Command(command),
                 Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
-                    match priority_rx.try_recv() {
-                        Ok(request) => WorkerTask::Render(request),
-                        Err(TryRecvError::Disconnected) => break,
-                        Err(TryRecvError::Empty) => {
-                            if let Some(job) = link_index_jobs.pop_front() {
-                                WorkerTask::IndexLinkPage(job)
-                            } else if let Some(job) = search_jobs.pop_front() {
-                                WorkerTask::SearchPage(job)
-                            } else {
-                                match prefetch_rx.try_recv() {
-                                    Ok(request) => WorkerTask::Render(request),
-                                    Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
-                                        select_biased! {
-                                            recv(command_rx) -> command => match command {
-                                                Ok(command) => WorkerTask::Command(command),
-                                                Err(_) => break,
-                                            },
-                                            recv(priority_rx) -> request => match request {
-                                                Ok(request) => WorkerTask::Render(request),
-                                                Err(_) => break,
-                                            },
-                                            recv(prefetch_rx) -> request => match request {
-                                                Ok(request) => WorkerTask::Render(request),
-                                                Err(_) => break,
-                                            },
+                    if let Some(request) = deferred_render.take() {
+                        WorkerTask::Render(request)
+                    } else {
+                        match priority_rx.try_recv() {
+                            Ok(request) => WorkerTask::Render(request),
+                            Err(TryRecvError::Disconnected) => break,
+                            Err(TryRecvError::Empty) => {
+                                if let Some(job) = link_index_jobs.pop_front() {
+                                    WorkerTask::IndexLinkPage(job)
+                                } else if let Some(job) = search_jobs.pop_front() {
+                                    WorkerTask::SearchPage(job)
+                                } else {
+                                    match prefetch_rx.try_recv() {
+                                        Ok(request) => WorkerTask::Render(request),
+                                        Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
+                                            select_biased! {
+                                                recv(command_rx) -> command => match command {
+                                                    Ok(command) => WorkerTask::Command(command),
+                                                    Err(_) => break,
+                                                },
+                                                recv(priority_rx) -> request => match request {
+                                                    Ok(request) => WorkerTask::Render(request),
+                                                    Err(_) => break,
+                                                },
+                                                recv(prefetch_rx) -> request => match request {
+                                                    Ok(request) => WorkerTask::Render(request),
+                                                    Err(_) => break,
+                                                },
+                                            }
                                         }
                                     }
                                 }
@@ -798,7 +804,7 @@ fn run_worker(
                                         document_id,
                                         pages,
                                         outline,
-                                        revision: revision.pdf,
+                                        revision,
                                     })
                                     .map_err(|_| "viewer stopped".to_string())?;
                             }
@@ -1198,7 +1204,13 @@ fn run_worker(
                     }
                     continue;
                 }
-                WorkerTask::Render(request) => request,
+                WorkerTask::Render(request) => {
+                    if !command_rx.is_empty() {
+                        deferred_render = Some(request);
+                        continue;
+                    }
+                    request
+                }
             };
 
             if request.generation != latest_generation.load(Ordering::Acquire) {
@@ -1827,6 +1839,341 @@ fn blend_channel(transformed: u8, original: u8, mask_ratio: f32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
+/// Type 1 TeX math fonts (`CMEX10`, `CMMI10`, `CMSY10`, `MSAM10`, `MSBM10`, `stmary10`, and
+/// their Latin Modern / TX / PX counterparts) have incomplete or missing `ToUnicode` CMaps in
+/// `pdfTeX`'s built-in `TeX-*-builtin-0` tables, so PDFium exposes raw 1-byte character codes
+/// (`0x00..=0x7F`) for unmapped slots.
+fn tex_math_font_unicode(font_name: &str, code: u32) -> Option<u32> {
+    let raw_base = font_name
+        .split_once('+')
+        .filter(|(prefix, _)| {
+            prefix.len() == 6
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+        .map_or(font_name, |(_, rest)| rest);
+    let mut lower_buf = [0u8; 64];
+    if raw_base.len() > lower_buf.len() || !raw_base.is_ascii() {
+        return None;
+    }
+    for (dst, src) in lower_buf[..raw_base.len()].iter_mut().zip(raw_base.bytes()) {
+        *dst = src.to_ascii_lowercase();
+    }
+    let base = std::str::from_utf8(&lower_buf[..raw_base.len()]).ok()?;
+    let is_omx = base.starts_with("cmex")
+        || base.starts_with("lcmex")
+        || base.starts_with("lmex")
+        || base.starts_with("mlmex")
+        || base.starts_with("vlmex")
+        || base.starts_with("yhcmex")
+        || matches!(base, "txex" | "txbex" | "txex-bar" | "pxex" | "pxbex")
+        || base.contains("mathextension")
+        || base.contains("math-extension")
+        || base.contains("-extension-")
+        || base.contains("-m-ex-");
+    if is_omx {
+        return match code {
+            0x04 | 0x16 | 0x24 | 0x6a => Some(0x230a), // \lfloor
+            0x05 | 0x17 | 0x25 | 0x6b => Some(0x230b), // \rfloor
+            0x06 | 0x18 | 0x26 | 0x6c => Some(0x2308), // \lceil
+            0x07 | 0x19 | 0x27 | 0x6d => Some(0x2309), // \rceil
+            0x0a | 0x1c | 0x2a | 0x44 => Some(0x27e8), // \langle
+            0x0b | 0x1d | 0x2b | 0x45 => Some(0x27e9), // \rangle
+            0x3a => Some(0x27ee),                      // \lgroup
+            0x3b => Some(0x27ef),                      // \rgroup
+            0x46 | 0x47 => Some(0x2294),               // \bigsqcup
+            0x48 | 0x49 => Some(0x222e),               // \oint
+            0x4a | 0x4b => Some(0x2299),               // \bigodot
+            0x4c | 0x4d => Some(0x2295),               // \bigoplus
+            0x4e | 0x4f => Some(0x2297),               // \bigotimes
+            0x50 | 0x58 => Some(0x2211),               // \sum
+            0x51 | 0x59 => Some(0x220f),               // \prod
+            0x52 | 0x5a => Some(0x222b),               // \int
+            0x53 | 0x5b => Some(0x222a),               // \bigcup
+            0x54 | 0x5c => Some(0x2229),               // \bigcap
+            0x55 | 0x5d => Some(0x228e),               // \biguplus
+            0x56 | 0x5e => Some(0x2227),               // \bigwedge
+            0x57 | 0x5f => Some(0x2228),               // \bigvee
+            0x60 | 0x61 => Some(0x2210),               // \coprod
+            0x70..=0x73 => Some(0x221a),               // \sqrt
+            _ => None,
+        };
+    }
+    let is_oml = base.starts_with("cmmi")
+        || base.starts_with("lcmmi")
+        || base.starts_with("lmmi")
+        || base.starts_with("mlmmi")
+        || base.starts_with("vlmmi")
+        || base.starts_with("rtxmi")
+        || base.starts_with("rtxbmi")
+        || base.starts_with("rpxmi")
+        || base.starts_with("rpxbmi")
+        || matches!(base, "txmi" | "txbmi" | "pxmi" | "pxbmi")
+        || base.contains("mathitalic")
+        || base.contains("math-italic");
+    if is_oml {
+        return match code {
+            0x28 => Some(0x21bc), // \leftharpoonup
+            0x29 => Some(0x21bd), // \leftharpoondown
+            0x2a => Some(0x21c0), // \rightharpoonup
+            0x2b => Some(0x21c1), // \rightharpoondown
+            0x2d => Some(0x297d), // \hookleftarrow right hook (\rhook)
+            _ => None,
+        };
+    }
+    let is_oms = base.starts_with("cmsy")
+        || base.starts_with("lcmsy")
+        || base.starts_with("lmsy")
+        || base.starts_with("mlmsy")
+        || base.starts_with("vlmsy")
+        || matches!(base, "txsy" | "txbsy" | "pxsy" | "pxbsy")
+        || base.contains("mathsymbols")
+        || base.contains("math-symbols");
+    if is_oms {
+        return match code {
+            0x34 => Some(0x25b3), // \triangle / \bigtriangleup
+            0x35 => Some(0x25bd), // \bigtriangledown
+            0x36 => Some(0x20d2), // \not (prefix negation)
+            0x37 => Some(0x237f), // \mapstochar
+            0x71 => Some(0x2a3f), // \amalg
+            _ => None,
+        };
+    }
+    if base.starts_with("msam")
+        || base.starts_with("txsya")
+        || base.starts_with("txbsya")
+        || base.starts_with("pxsya")
+        || base.starts_with("pxbsya")
+    {
+        return match code {
+            0x05 => Some(0x22c5), // \centerdot
+            0x38 => Some(0x25be), // \blacktriangledown
+            0x39 => Some(0x23af), // \dasharrow / \dashrightarrow / \dashleftarrow shaft
+            0x4b => Some(0x21e2), // \dashrightarrow head
+            0x4c => Some(0x21e0), // \dashleftarrow head
+            0x55 => Some(0x00a5), // \yen
+            0x70 => Some(0x231c), // \ulcorner
+            0x71 => Some(0x231d), // \urcorner
+            0x78 => Some(0x231e), // \llcorner
+            0x79 => Some(0x231f), // \lrcorner
+            _ => None,
+        };
+    }
+    if base.starts_with("msbm")
+        || base.starts_with("txsyb")
+        || base.starts_with("txbsyb")
+        || base.starts_with("pxsyb")
+        || base.starts_with("pxbsyb")
+    {
+        return match code {
+            0x12 => Some(0x22e6),   // \lnsim
+            0x13 => Some(0x22e7),   // \gnsim
+            0x26 => Some(0x2acb),   // \varsubsetneqq
+            0x27 => Some(0x2acc),   // \varsupsetneqq
+            0x2e => Some(0x2224),   // \nshortmid
+            0x2f => Some(0x2226),   // \nshortparallel
+            0x70 => Some(0x007c),   // \shortmid
+            0x71 => Some(0x2016),   // \shortparallel
+            0x7a => Some(0x03dd),   // \digamma
+            0xd875 => Some(0xd835), // \Bbbk broken high surrogate in TeX-msbm10-builtin-0
+            _ => None,
+        };
+    }
+    if base.starts_with("stmary") {
+        return match code {
+            0x00 => Some(0x2190),               // \shortleftarrow
+            0x01 => Some(0x2192),               // \shortrightarrow
+            0x02 => Some(0x2191),               // \shortuparrow
+            0x03 => Some(0x2193),               // \shortdownarrow
+            0x04 => Some(0x2144),               // \Yup
+            0x05 => Some(0x27d9),               // \Ydown
+            0x06 => Some(0x2919),               // \Yleft
+            0x07 => Some(0x291a),               // \Yright
+            0x08 | 0x62 | 0x6a => Some(0x22ce), // \varcurlyvee, \bigcurlyvee, \hugecurlyvee
+            0x09 | 0x63 | 0x6b => Some(0x22cf), // \varcurlywedge, \bigcurlywedge, \hugecurlywedge
+            0x0a | 0x17 => Some(0x2296),        // \minuso, \varominus
+            0x0b | 0x11 | 0x3a => Some(0x29b6), // \baro, \varobar, \obar
+            0x0c | 0x28 => Some(0x2afd),        // \sslash, \fatslash
+            0x0d | 0x29 => Some(0x29f5),        // \bbslash, \fatbslash
+            0x0e => Some(0xe00e),               // \moo
+            0x0f => Some(0x2297),               // \varotimes
+            0x10 => Some(0x229b),               // \varoast
+            0x12 => Some(0x2299),               // \varodot
+            0x13 => Some(0x2298),               // \varoslash
+            0x14 | 0x3b => Some(0x29b8),        // \varobslash, \obslash
+            0x15 => Some(0x229a),               // \varocircle
+            0x16 => Some(0x2295),               // \varoplus
+            0x18 => Some(0x29c6),               // \boxast
+            0x19 => Some(0x25eb),               // \boxbar
+            0x1a => Some(0x22a1),               // \boxdot
+            0x1b => Some(0x29c4),               // \boxslash
+            0x1c => Some(0x29c5),               // \boxbslash
+            0x1d => Some(0x29c7),               // \boxcircle
+            0x1e => Some(0x29c8),               // \boxbox
+            0x1f | 0x65 | 0x6d => Some(0x25a1), // \boxempty, \bigbox, \hugebox
+            0x20 => Some(0x21af),               // \lightning
+            0x21 => Some(0x2a07),               // \merge
+            0x22 => Some(0x00d7),               // \vartimes
+            0x23 => Some(0x2a1f),               // \fatsemi
+            0x24 => Some(0x2198),               // \ssearrow
+            0x26 => Some(0x2199),               // \sswarrow
+            0x2a | 0x48 => Some(0x27c5),        // \lbag, \Lbag
+            0x2b | 0x49 => Some(0x27c6),        // \rbag, \Rbag
+            0x2c => Some(0x25ef),               // \varbigcirc
+            0x2d => Some(0x2948),               // \leftrightarroweq
+            0x30 => Some(0x2196),               // \nnwarrow
+            0x31 => Some(0x2197),               // \nnearrow
+            0x32 => Some(0x2aa6),               // \leftslice
+            0x33 => Some(0x2aa7),               // \rightslice
+            0x34 | 0x3c => Some(0x29c0),        // \varolessthan, \olessthan
+            0x35 | 0x3d => Some(0x29c1),        // \varogreaterthan, \ogreaterthan
+            0x38 | 0x40 => Some(0x25af),        // \talloblong, \oblong
+            0x39 | 0x67 | 0x6f => Some(0x2af4), // \interleave, \biginterleave
+            0x41 => Some(0x2a2d),               // \inplus
+            0x42 => Some(0x2a2e),               // \niplus
+            0x43 | 0x70 | 0x78 => Some(0x228e), // \nplus, \bignplus, \Hugenplus
+            0x44 => Some(0x2abf),               // \subsetplus
+            0x45 => Some(0x2ac0),               // \supsetplus
+            0x46 => Some(0x2ac1),               // \subsetpluseq
+            0x47 => Some(0x2ac2),               // \supsetpluseq
+            0x4a | 0x71..=0x77 => Some(0x27e6), // \llbracket
+            0x4b | 0x79..=0x7f => Some(0x27e7), // \rrbracket
+            0x4c => Some(0x2985),               // \llparenthesis
+            0x4d => Some(0x2986),               // \rrparenthesis
+            0x4e => Some(0x0026),               // \binampersand
+            0x4f => Some(0x214b),               // \bindnasrepma
+            0x50 => Some(0x22b4),               // \trianglelefteqslant
+            0x51 => Some(0x22b5),               // \trianglerighteqslant
+            0x52 => Some(0x22ec),               // \ntrianglelefteqslant
+            0x53 => Some(0x22ed),               // \ntrianglerighteqslant
+            0x54 => Some(0x230a),               // \llfloor
+            0x55 => Some(0x230b),               // \rrfloor
+            0x56 => Some(0x2308),               // \llceil
+            0x57 => Some(0x2309),               // \rrceil
+            0x58 | 0x59 => Some(0x20d2),        // \arrownot, \Arrownot (prefix negation)
+            0x5a => Some(0x237f),               // \Mapstochar
+            0x5b | 0x5c => Some(0x23ae),        // \mapsfromchar, \Mapsfromchar
+            0x5d => Some(0x21ff),               // \leftrightarrowtriangle
+            0x5e => Some(0x21fd),               // \leftarrowtriangle
+            0x5f => Some(0x21fe),               // \rightarrowtriangle
+            0x60 | 0x68 => Some(0x25bd),        // \bigtriangledown
+            0x61 | 0x69 => Some(0x25b3),        // \bigtriangleup
+            0x64 | 0x6c => Some(0x2293),        // \bigsqcap
+            0x66 | 0x6e => Some(0x2016),        // \bigparallel
+            0x25 | 0x27 | 0x2e | 0x2f | 0x36 | 0x37 | 0x3e | 0x3f => Some(0xe000 + code),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn is_embedded_tex_type1_char(character: &PdfPageTextChar<'_>, font_name: &str, code: u32) -> bool {
+    let Ok(text_object) = character.text_object() else {
+        return false;
+    };
+    let font = text_object.font();
+    if !matches!(font.is_embedded(), Ok(true)) {
+        return false;
+    }
+    let Ok(data) = font.data() else {
+        return false;
+    };
+    let body = if data.starts_with(b"\x80\x01") && data.len() > 6 {
+        &data[6..]
+    } else {
+        &data[..]
+    };
+    if !(body.starts_with(b"%!PS-AdobeFont") || body.starts_with(b"%!FontType1")) {
+        return false;
+    }
+    let header_end = body
+        .windows(5)
+        .position(|w| w == b"eexec")
+        .unwrap_or(body.len());
+    let Ok(header) = std::str::from_utf8(&body[..header_end]) else {
+        return false;
+    };
+    if !header.contains("/Encoding 256 array") {
+        return false;
+    }
+    let base = font_name
+        .split_once('+')
+        .map_or(font_name, |(_, rest)| rest)
+        .to_ascii_lowercase();
+    if !(base.starts_with("lm") || base.starts_with("mlm") || base.starts_with("vlm")) {
+        let dup_space = format!("dup {code} /");
+        let dup_tight = format!("dup {code}/");
+        if !header.contains(&dup_space) && !header.contains(&dup_tight) {
+            return false;
+        }
+    }
+    true
+}
+
+fn pdf_char_unicode(character: &PdfPageTextChar<'_>) -> u32 {
+    let code = character.unicode_value();
+    if matches!(code, 0x00..=0x7f | 0xd875) && matches!(character.is_generated(), Ok(false)) {
+        let font_name = character.font_name();
+        if code == 0x2c
+            && tex_math_font_unicode(&font_name, 0x2d) == Some(0x297d)
+            && is_embedded_tex_type1_char(character, &font_name, code)
+            && let (Ok(bounds), Ok(origin_y)) = (character.tight_bounds(), character.origin_y())
+            && bounds.bottom().value > origin_y.value
+        {
+            return 0x297c; // \hookrightarrow left hook (\lhook, raised above baseline)
+        }
+        if let Some(mapped) = tex_math_font_unicode(&font_name, code) {
+            if code <= 0x7f && !is_embedded_tex_type1_char(character, &font_name, code) {
+                return code;
+            }
+            if matches!(mapped, 0x21bc..=0x21c1) {
+                let Ok(bounds) = character.tight_bounds() else {
+                    return code;
+                };
+                if bounds.width().value <= bounds.height().value * 2.0 {
+                    return code;
+                }
+            }
+            if mapped == 0x297d {
+                let (Ok(bounds), Ok(origin_y)) = (character.tight_bounds(), character.origin_y())
+                else {
+                    return code;
+                };
+                if bounds.bottom().value <= origin_y.value {
+                    return code;
+                }
+            }
+            if code == 0x26 && mapped == 0x2199 {
+                let Ok(bounds) = character.tight_bounds() else {
+                    return code;
+                };
+                if bounds.height().value <= bounds.width().value * 1.2 {
+                    return code;
+                }
+            }
+            // In CMEX10, ToUnicode-decoded '[', '\\', ']', '^' (0x5b..=0x5e) share codes
+            // with raw display-style operators (\bigcup, \bigcap, \biguplus, \bigwedge).
+            // In PDF page coordinates (y upward, top > bottom), display operators hang
+            // entirely below origin_y (B 56 -1400 1054 0) with wide aspect ratio.
+            if matches!(code, 0x5b..=0x5e) && matches!(mapped, 0x222a | 0x2229 | 0x228e | 0x2227) {
+                let (Ok(bounds), Ok(origin_y)) = (character.tight_bounds(), character.origin_y())
+                else {
+                    return code;
+                };
+                if bounds.bottom().value >= origin_y.value
+                    || bounds.top().value > origin_y.value + bounds.height().value * 0.05
+                    || bounds.width().value <= bounds.height().value * 0.5
+                {
+                    return code;
+                }
+            }
+            return mapped;
+        }
+    }
+    code
+}
+
 /// Keep a small text neighborhood around the clicked glyph, not the entire page.
 fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)>, String> {
     let text = page.text().map_err(|error| error.to_string())?;
@@ -1841,13 +2188,16 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
     // PDFium can choose a large mathematical glyph over a smaller word glyph
     // when their bounds overlap. Prefer the smallest alphabetic glyph actually
     // under the pointer, while retaining PDFium's nearest-hit fallback.
-    if !char::from_u32(character.unicode_value()).is_some_and(char::is_alphanumeric)
+    let is_word_code = |code: u32, check: fn(char) -> bool| {
+        matches!(code, 0xd800..=0xdfff) || char::from_u32(code).is_some_and(check)
+    };
+    if !is_word_code(pdf_char_unicode(&character), char::is_alphanumeric)
         && let Ok(bounds) = character.tight_bounds()
         && bounds.contains(x, y)
     {
         let mut area = bounds.width().value * bounds.height().value;
         for candidate in chars.iter() {
-            if !char::from_u32(candidate.unicode_value()).is_some_and(char::is_alphabetic) {
+            if !is_word_code(pdf_char_unicode(&candidate), char::is_alphabetic) {
                 continue;
             }
             if let Ok(bounds) = candidate.tight_bounds()
@@ -1862,10 +2212,63 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
         }
     }
     unicode_context(chars.len(), character.index(), |index| {
-        chars
-            .get(index)
-            .map(|character| character.unicode_value())
-            .map_err(|error| error.to_string())
+        let character = chars.get(index).map_err(|error| error.to_string())?;
+        let code = pdf_char_unicode(&character);
+        if code == 0x0338
+            && let Ok(b1) = character.tight_bounds()
+        {
+            let overlap = |neighbor: Option<usize>| {
+                neighbor
+                    .and_then(|i| chars.get(i).ok())
+                    .and_then(|other| other.tight_bounds().ok())
+                    .map_or(0.0, |b2| {
+                        (b1.right().value.min(b2.right().value)
+                            - b1.left().value.max(b2.left().value))
+                        .max(0.0)
+                    })
+            };
+            if overlap(index.checked_add(1)) > overlap(index.checked_sub(1)) {
+                return Ok(0x20d2);
+            }
+        }
+        if code == 0x297c
+            && !index
+                .checked_add(1)
+                .and_then(|i| chars.get(i).ok())
+                .is_some_and(|next| pdf_char_unicode(&next) == 0x2192)
+        {
+            return Ok(0x2c);
+        }
+        if matches!(code, 0x21bd | 0x21c0)
+            && let Ok(b1) = character.tight_bounds()
+        {
+            for neighbor in [index.checked_sub(1), index.checked_add(1)]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(other) = chars.get(neighbor)
+                    && pdf_char_unicode(&other) == (code ^ 0x21bd ^ 0x21c0)
+                    && let Ok(b2) = other.tight_bounds()
+                {
+                    let overlap = b1.right().value.min(b2.right().value)
+                        - b1.left().value.max(b2.left().value);
+                    let min_width = b1.width().value.min(b2.width().value);
+                    let dy = if code == 0x21c0 {
+                        b1.bottom().value - b2.bottom().value
+                    } else {
+                        b2.bottom().value - b1.bottom().value
+                    };
+                    if min_width > 0.0
+                        && overlap > min_width * 0.5
+                        && dy > min_width * 0.05
+                        && dy < min_width
+                    {
+                        return Ok(if code == 0x21c0 { 0x296a } else { 0x296b });
+                    }
+                }
+            }
+        }
+        Ok(code)
     })
     .map(Some)
 }
@@ -2144,7 +2547,7 @@ fn find_visible_matches(
                 if chars
                     .get(glyph_start)
                     .ok()
-                    .and_then(|character| char::from_u32(character.unicode_value()))
+                    .and_then(|character| char::from_u32(pdf_char_unicode(&character)))
                     .is_some_and(char::is_whitespace)
                 {
                     continue;
@@ -2157,7 +2560,8 @@ fn find_visible_matches(
                     let Ok(character) = chars.get(index) else {
                         continue;
                     };
-                    if char::from_u32(character.unicode_value()).is_some_and(char::is_whitespace) {
+                    if char::from_u32(pdf_char_unicode(&character)).is_some_and(char::is_whitespace)
+                    {
                         continue;
                     }
                     let Ok(render_mode) = character.render_mode() else {
@@ -2204,7 +2608,7 @@ fn find_visible_matches(
                         chars
                             .get(index)
                             .ok()
-                            .map(|character| character.unicode_value())
+                            .map(|character| pdf_char_unicode(&character))
                     })
                 })
                 .filter(|character| character.is_alphanumeric() || *character == '_');
@@ -2256,7 +2660,7 @@ fn cached_page_text<'a>(
                 if index < next_index {
                     return None;
                 }
-                let first = character.unicode_value();
+                let first = pdf_char_unicode(&character);
                 let end = index
                     + if (0xd800..=0xdbff).contains(&first) {
                         2
@@ -2270,7 +2674,7 @@ fn cached_page_text<'a>(
                         chars
                             .get(unit)
                             .ok()
-                            .map(|character| character.unicode_value())
+                            .map(|character| pdf_char_unicode(&character))
                     }
                 })?;
                 next_index = end;
@@ -2311,10 +2715,10 @@ fn cached_visible_page_text<'a>(
                 index += 1;
                 continue;
             };
-            let first = character.unicode_value();
+            let first = pdf_char_unicode(&character);
             let mut width = 1;
             let scalar = if (0xd800..=0xdbff).contains(&first) && index + 1 < chars.len() {
-                let second = chars.get(index + 1).ok()?.unicode_value();
+                let second = pdf_char_unicode(&chars.get(index + 1).ok()?);
                 if (0xdc00..=0xdfff).contains(&second) {
                     width = 2;
                     0x10000 + ((first - 0xd800) << 10) + second - 0xdc00
@@ -2584,7 +2988,7 @@ fn painted_forward_text(
         if index < next_index {
             return None;
         }
-        let first = character.unicode_value();
+        let first = pdf_char_unicode(&character);
         let end = index
             + if (0xd800..=0xdbff).contains(&first) {
                 2
@@ -2598,7 +3002,7 @@ fn painted_forward_text(
                 chars
                     .get(unit)
                     .ok()
-                    .map(|character| character.unicode_value())
+                    .map(|character| pdf_char_unicode(&character))
             }
         }) else {
             unicode_error.get_or_insert_with(|| {
@@ -2763,14 +3167,14 @@ fn forward_word_occurrence(
             return None;
         }
         if value as u32 > 0xffff
-            && (0xd800..=0xdbff).contains(&chars.get(next).ok()?.unicode_value())
+            && (0xd800..=0xdbff).contains(&pdf_char_unicode(&chars.get(next).ok()?))
         {
             let stop = next + 2;
             let decoded = source_range_char(next, stop, |index| {
                 chars
                     .get(index)
                     .ok()
-                    .map(|character| character.unicode_value())
+                    .map(|character| pdf_char_unicode(&character))
             })?;
             if !decoded.to_lowercase().eq(std::iter::once(value)) {
                 return None;
@@ -4694,6 +5098,7 @@ mod tests {
         blend_highlight_rectangle, context_around_label, contrast_ratio, count_search_matches,
         dark_mode_pixel, darken_rgba, dominant_rectangle_color, mask_quadrilateral,
         normalize_search_text, reference_context, selected_page_link_rectangles,
+        tex_math_font_unicode,
     };
 
     const NEUTRAL_DARK_MODE: DarkModeStyle = DarkModeStyle::new([30, 30, 30], [209, 209, 209]);
@@ -5820,5 +6225,107 @@ mod tests {
         );
 
         assert_eq!(pixels, [88, 68, 41, 123, 255, 255, 255, 45]);
+    }
+
+    #[test]
+    fn tex_math_font_fallbacks_map_to_unicode() {
+        for font in [
+            "CMEX10",
+            "ABCDEF+CMEX10",
+            "LMMathExtension10-Regular",
+            "XYZABC+LMMathExtension10-Regular",
+            "txex",
+            "pxex",
+            "Fourier-Math-Extension",
+        ] {
+            assert_eq!(tex_math_font_unicode(font, 0x04), Some(0x230a));
+            assert_eq!(tex_math_font_unicode(font, 0x0a), Some(0x27e8));
+            assert_eq!(tex_math_font_unicode(font, 0x28), None);
+            assert_eq!(tex_math_font_unicode(font, 0x29), None);
+            assert_eq!(tex_math_font_unicode(font, 0x2f), None);
+            assert_eq!(tex_math_font_unicode(font, 0x4c), Some(0x2295));
+            assert_eq!(tex_math_font_unicode(font, 0x4d), Some(0x2295));
+            assert_eq!(tex_math_font_unicode(font, 0x4e), Some(0x2297));
+            assert_eq!(tex_math_font_unicode(font, 0x50), Some(0x2211));
+            assert_eq!(tex_math_font_unicode(font, 0x58), Some(0x2211));
+            assert_eq!(tex_math_font_unicode(font, 0x52), Some(0x222b));
+            assert_eq!(tex_math_font_unicode(font, 0x5a), Some(0x222b));
+            assert_eq!(tex_math_font_unicode(font, 0x70), Some(0x221a));
+        }
+        assert_eq!(tex_math_font_unicode("ABCDEF+CMMI10", 0x2a), Some(0x21c0));
+        assert_eq!(tex_math_font_unicode("rtxmi", 0x2d), Some(0x297d));
+        assert_eq!(tex_math_font_unicode("Rpxmi", 0x28), Some(0x21bc));
+        assert_eq!(tex_math_font_unicode("txmia", 0x28), None);
+        assert_eq!(tex_math_font_unicode("CMMI10", 0x2e), None);
+        assert_eq!(tex_math_font_unicode("CMMI10", 0x2f), None);
+        assert_eq!(tex_math_font_unicode("CMMI10", 0x2c), None);
+        assert_eq!(tex_math_font_unicode("CMSY10", 0x37), Some(0x237f));
+        assert_eq!(tex_math_font_unicode("CMSY10", 0x71), Some(0x2a3f));
+        assert_eq!(tex_math_font_unicode("MSAM10", 0x05), Some(0x22c5));
+        assert_eq!(tex_math_font_unicode("MSAM10", 0x39), Some(0x23af));
+        assert_eq!(tex_math_font_unicode("MSAM10", 0x4b), Some(0x21e2));
+        assert_eq!(tex_math_font_unicode("MSAM10", 0x4c), Some(0x21e0));
+        assert_eq!(tex_math_font_unicode("CMEX10", 0x3a), Some(0x27ee));
+        assert_eq!(tex_math_font_unicode("CMEX10", 0x3b), Some(0x27ef));
+        assert_eq!(tex_math_font_unicode("CMEX10", 0x62), None);
+        assert_eq!(tex_math_font_unicode("MSBM10", 0x26), Some(0x2acb));
+        assert_eq!(tex_math_font_unicode("MSBM10", 0x5b), None);
+        assert_eq!(tex_math_font_unicode("MSBM10", 0x5e), None);
+        assert_eq!(tex_math_font_unicode("MSBM10", 0x7a), Some(0x03dd));
+        assert_eq!(tex_math_font_unicode("MSBM10", 0xd875), Some(0xd835));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x0c), Some(0x2afd));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x24), Some(0x2198));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x25), Some(0xe025));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x26), Some(0x2199));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x3e), Some(0xe03e));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x4a), Some(0x27e6));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x5a), Some(0x237f));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x5b), Some(0x23ae));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x74), Some(0x27e6));
+        assert_eq!(tex_math_font_unicode("CMR10", 0x4c), None);
+        assert_eq!(tex_math_font_unicode("LMRoman10-Regular", 0x4d), None);
+        assert_eq!(tex_math_font_unicode("CMEX10", 0x30), None);
+    }
+
+    #[test]
+    fn decoded_ascii_in_tex_named_font_is_preserved() {
+        let _native = super::pdfium_test_lock();
+        let pdfium = super::load_pdfium(None).unwrap();
+        let stream = b"BT /F1 12 Tf 72 72 Td (&) Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /stmary10 >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                stream.len(),
+                std::str::from_utf8(stream).unwrap()
+            ),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        let document = pdfium.load_pdf_from_byte_vec(pdf, None).unwrap();
+        let page = document.pages().get(0).unwrap();
+        let text = page.text().unwrap();
+        let ch = text.chars().get(0).unwrap();
+        assert_eq!(super::pdf_char_unicode(&ch), u32::from(b'&'));
     }
 }

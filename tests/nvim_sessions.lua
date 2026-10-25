@@ -1,7 +1,13 @@
 -- Run with PDFTERM_EXECUTABLE set, like tests/nvim.lua.
 local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root)
-local binary = assert(vim.env.PDFTERM_EXECUTABLE)
+local binary = assert(
+  vim.env.PDFTERM_EXECUTABLE
+    or (vim.fn.executable(root .. '/target/debug/pdfterm') == 1 and (root .. '/target/debug/pdfterm'))
+    or (vim.fn.executable(root .. '/target/release/pdfterm') == 1 and (root .. '/target/release/pdfterm'))
+    or (vim.fn.exepath('pdfterm') ~= '' and vim.fn.exepath('pdfterm')),
+  'set PDFTERM_EXECUTABLE to a built viewer'
+)
 local function wait(predicate)
   assert(vim.wait(10000, predicate, 2), 'session operation timed out')
 end

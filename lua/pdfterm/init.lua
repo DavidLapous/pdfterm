@@ -161,6 +161,41 @@ local function warning_text(...)
   if #values > 0 then return vim.fn.strcharpart(table.concat(values, '; '), 0, 1024) end
 end
 
+local routine_diagnostics = {
+  'best-guess navigation: compiled source history unavailable; assuming saved source is unchanged since compilation',
+  'best-guess navigation: compiled source history unavailable; using the compiler line anchor',
+  'best-guess navigation: no literal source position was qualified; using the compiler line anchor',
+  'line-only navigation: compiled TeX execution cannot be verified; using the SyncTeX line anchor',
+  'line-only navigation: using the SyncTeX line anchor',
+  'compiled source snapshot/identity is unavailable; using a clamped current position',
+  'Compiled source unavailable; using the requested compiler line if available.',
+}
+
+local function split_navigation_diagnostic(message)
+  if not message or message == '' then return nil, nil end
+  local remaining, info = message, {}
+  for _, pattern in ipairs(routine_diagnostics) do
+    local search_from = 1
+    while true do
+      local start, finish = remaining:find(pattern, search_from, true)
+      if not start then break end
+      local before_ok = start == 1 or remaining:sub(start - 2, start - 1) == '; '
+      local after_ok = finish == #remaining or remaining:sub(finish + 1, finish + 2) == '; '
+      if before_ok and after_ok then
+        info[#info + 1] = pattern
+        local before = remaining:sub(1, start - 1):gsub(';%s*$', '')
+        local after = remaining:sub(finish + 1):gsub('^;%s*', '')
+        remaining = (before ~= '' and after ~= '') and (before .. '; ' .. after) or (before .. after)
+        search_from = 1
+      else
+        search_from = finish + 1
+      end
+    end
+  end
+  remaining = vim.trim(remaining)
+  return (remaining ~= '' and remaining or nil), warning_text(unpack(info))
+end
+
 local function warnings(...)
   local message = warning_text(...)
   if message then
@@ -170,7 +205,9 @@ local function warnings(...)
 end
 local function save_buffer(buffer)
   if vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer) then
-    vim.api.nvim_buf_call(buffer, function() vim.cmd('write') end)
+    if vim.bo[buffer].modified or not vim.uv.fs_stat(vim.api.nvim_buf_get_name(buffer)) then
+      vim.api.nvim_buf_call(buffer, function() vim.cmd('write') end)
+    end
   else
     warnings('Source buffer unloaded during navigation; using saved inputs and a best-guess anchor.')
   end
@@ -225,7 +262,7 @@ local function inverse(location)
     return
   end
   local mapped = location
-  if location.document_revision and not location.file:match('%.typ$') then
+  if location.document_revision or location.file:match('%.typ$') then
     mapped = anchors.inverse(location)
   end
   local buffer = mapped.buffer or vim.fn.bufadd(mapped.file)
@@ -250,10 +287,13 @@ local function inverse(location)
     mapped.byte_column,
     tostring(location.precise == true)
   )
-  if warn_msg then
+  local warn_part, info_part = split_navigation_diagnostic(warn_msg)
+  if warn_part then
     warn(warn_msg, context)
+  elseif info_part then
+    log_entry('INFO', info_part, context)
   elseif location.precise == false then
-    log_entry('WARN', 'imprecise/coarse line positioning', context)
+    log_entry('INFO', 'imprecise/coarse line positioning', context)
   else
     log_entry('INFO', 'position matched', context)
   end
@@ -295,7 +335,10 @@ local function configure(callback)
     return
   end
   config_waiters = callback and { callback } or {}
-  local executable = setup_options.executable or root .. '/target/release/pdfterm'
+  local release = root .. '/target/release/pdfterm'
+  local on_path = vim.fn.exepath('pdfterm')
+  local executable = setup_options.executable
+    or (vim.fn.executable(release) == 1 and release or (on_path ~= '' and on_path or release))
   project.run(
     { executable, '--print-config', '--session', setup_options.session },
     nil,
@@ -713,10 +756,13 @@ local function forward(allow_launch)
             return
           end
           local payload = vim.json.decode(result.stdout)
-          if payload.warning and payload.warning ~= '' then
+          local page_info = payload.page and string.format(' (page %s)', payload.page) or ''
+          local warn_part, info_part = split_navigation_diagnostic(payload.warning)
+          if warn_part then
             warn(payload.warning, context)
+          elseif info_part then
+            log_entry('INFO', 'position resolved' .. page_info .. ' (' .. info_part .. ')', context)
           else
-            local page_info = payload.page and string.format(' (page %s)', payload.page) or ''
             log_entry('INFO', 'position resolved' .. page_info, context)
           end
           deliver(p.pdf, result.stdout, id, source, source_error, allow_launch, true)
@@ -943,7 +989,8 @@ function M.setup(opts)
       end
       for _, split in ipairs(owned_splits) do
         local matched_quit = quit_ok and split.token and quit_token == split.token
-        if split.unclosed or not (matched_quit or (split.ready and quit_absent)) then
+        -- Ghostty retains scripted command surfaces after the viewer acknowledges quit.
+        if split.handle.kind == 'ghostty' or split.unclosed or not (matched_quit or (split.ready and quit_absent)) then
           local ok, error = pcall(terminal.close, split.handle)
           if not ok then
             notify(error)

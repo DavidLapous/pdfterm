@@ -164,14 +164,14 @@ pub fn run(
     let worker = RenderWorker::spawn(INITIAL_DOCUMENT_ID, path.clone(), pdfium_library);
     let (page_count, outline, revision) = worker.wait_until_ready().map_err(AppError::Renderer)?;
     crate::recent::record(&path);
-    let watcher = FileWatcher::new(&path)?;
+    let watcher = FileWatcher::from_revision(revision);
     let mut app = App::new(
         worker,
         page_count,
         start_page.min(page_count - 1),
         path,
         watcher,
-        (outline, revision),
+        (outline, revision.pdf),
         defaults,
     );
     if let Some(snapshot) = source_snapshot {
@@ -808,6 +808,7 @@ struct SearchState {
     scanned: u32,
     total_pages: u32,
     searching: bool,
+    initial_navigation_pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1120,9 +1121,11 @@ impl App {
         })?;
         if let Some(page) = selection {
             let page = page.min(self.tab().page_count - 1);
-            self.tab_mut().page = page;
-            self.tab_mut().scroll_x = 0;
-            self.tab_mut().scroll_y = 0;
+            let tab = self.tab_mut();
+            tab.search.initial_navigation_pending = false;
+            tab.page = page;
+            tab.scroll_x = 0;
+            tab.scroll_y = 0;
         }
         self.reset_render_state();
         self.request_current(output)
@@ -1874,6 +1877,7 @@ impl App {
             scanned: 0,
             total_pages,
             searching: true,
+            initial_navigation_pending: true,
         };
         self.worker.search(document_id, request_id, query);
         self.search_picker = Some(SearchPickerState::new(self.tab().page));
@@ -1927,6 +1931,7 @@ impl App {
             .or_else(|| matches.first())
             .map(|result| result.page);
         let search = &mut self.session.tabs[index].search;
+        let should_jump = std::mem::take(&mut search.initial_navigation_pending);
         search.matches = matches;
         search.total_occurrences = total_occurrences;
         search.scanned = search.total_pages;
@@ -1938,10 +1943,14 @@ impl App {
         if let Some(state) = &mut self.search_picker {
             state.sync(current_page, &self.session.tabs[index].search.matches);
         }
-        if let Some(page) = target_page {
+        if should_jump && let Some(page) = target_page {
             self.session.tabs[index].page = page;
             self.session.tabs[index].scroll_x = 0;
             self.session.tabs[index].scroll_y = 0;
+            self.request_current(output)?;
+        } else if !self.session.tabs[index].search.matches.is_empty()
+            || self.search_picker.is_some()
+        {
             self.request_current(output)?;
         } else {
             self.draw_status(output, self.viewport()?, "")?;
@@ -2511,6 +2520,7 @@ impl App {
             self.clear_flash_state(&previous);
         }
         let tab = self.tab_mut();
+        tab.search.initial_navigation_pending = false;
         let document_id = tab.document_id;
         let current = ViewPosition {
             page: tab.page,
@@ -2775,6 +2785,7 @@ impl App {
                 };
                 let page = page.min(self.tab().page_count - 1);
                 let tab = self.tab_mut();
+                tab.search.initial_navigation_pending = false;
                 tab.page = page;
                 if top_ratio.is_some() {
                     tab.scroll_y = 0;
@@ -2817,6 +2828,7 @@ impl App {
             return Ok(());
         };
         let tab = self.tab_mut();
+        tab.search.initial_navigation_pending = false;
         tab.page = previous.page.min(tab.page_count - 1);
         tab.scroll_x = previous.scroll_x;
         tab.scroll_y = previous.scroll_y;
@@ -2830,6 +2842,7 @@ impl App {
             return Ok(());
         };
         let tab = self.tab_mut();
+        tab.search.initial_navigation_pending = false;
         tab.page = next.page.min(tab.page_count - 1);
         tab.scroll_x = next.scroll_x;
         tab.scroll_y = next.scroll_y;
@@ -3050,6 +3063,7 @@ impl App {
         let Some(state) = self.search_picker.take() else {
             return Ok(());
         };
+        self.tab_mut().search.initial_navigation_pending = false;
         self.restore_preview_origin(state.preview_origin, output)
     }
 
@@ -3111,6 +3125,7 @@ impl App {
         if let Some(next) =
             link_picker_navigation_index(selected, matches.len(), key, visible_height)
         {
+            self.tab_mut().search.initial_navigation_pending = false;
             let state = self.search_picker.as_mut().expect("search picker state");
             state.selected = next;
             state.selection_page = matches.get(next).map(|result| result.page);
@@ -3535,6 +3550,7 @@ impl App {
     fn set_page_vertically(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
         let page = page.min(self.tab().page_count - 1);
         let tab = self.tab_mut();
+        tab.search.initial_navigation_pending = false;
         tab.page = page;
         tab.scroll_y = 0;
         tab.pending_destination = None;
@@ -3550,6 +3566,7 @@ impl App {
         allow_page_step: bool,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        self.tab_mut().search.initial_navigation_pending = false;
         let viewport = self.viewport()?;
         if self.viewer.continuous_scroll
             && axis == Axis::Vertical
@@ -4076,7 +4093,7 @@ impl App {
             self.title_document = Some(self.tab().document_id);
         }
         let viewport = self.prepare_viewport(output)?;
-        self.draw_tab_bar(output)?;
+        self.draw_tab_bar(output, viewport.columns)?;
         let key = self.render_key(viewport);
         self.desired_key = Some(key);
         self.generation = self.generation.wrapping_add(1);
@@ -4884,12 +4901,12 @@ impl App {
         Ok(viewport)
     }
 
-    fn draw_tab_bar(&self, output: &mut impl Write) -> io::Result<()> {
+    fn draw_tab_bar(&self, output: &mut impl Write, columns: u16) -> io::Result<()> {
         if self.session.tabs.len() < 2 {
             return Ok(());
         }
         let theme = self.theme;
-        let columns = usize::from(crossterm::terminal::size()?.0);
+        let columns = usize::from(columns);
         execute!(
             output,
             MoveTo(0, 0),
@@ -5746,7 +5763,12 @@ fn draw_link_picker_terminal_unsynchronized(
     theme: Palette,
 ) -> io::Result<()> {
     let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, area.right(), area.bottom())),
+        },
+    )?;
     terminal
         .draw(|frame| draw_link_picker(frame, area, document, state, progress, geometry, theme))?;
     drop(terminal);
@@ -5780,7 +5802,12 @@ fn draw_search_picker_terminal_unsynchronized(
     theme: Palette,
 ) -> io::Result<()> {
     let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, area.right(), area.bottom())),
+        },
+    )?;
     terminal
         .draw(|frame| draw_search_picker(frame, area, search, outline, state, geometry, theme))?;
     drop(terminal);
@@ -8535,9 +8562,10 @@ mod tests {
             tab.zoom = 150;
             let document_id = tab.document_id;
             let revision = tab.revision;
+            let fingerprint = tab.watcher.accepted;
             app.session.pending_open = Some(super::session::PendingOpen::Reload {
                 document_id,
-                fingerprint: tab.watcher.accepted,
+                fingerprint,
             });
             app.navigation.flash = Some(super::PendingFlash {
                 document_id,
@@ -8546,7 +8574,7 @@ mod tests {
                 positioning_pending: false,
                 expires_at: Some(Instant::now()),
             });
-            app.finish_open(document_id, pages, Vec::new(), revision, &mut Vec::new())
+            app.finish_open(document_id, pages, Vec::new(), fingerprint, &mut Vec::new())
                 .unwrap();
             let tab = &app.session.tabs[0];
             assert_eq!(tab.page, pages - 1);
@@ -8845,6 +8873,7 @@ mod tests {
             scanned: 8,
             total_pages: 20,
             searching: true,
+            initial_navigation_pending: false,
         };
         assert_eq!(
             search.status_label(0).as_deref(),
@@ -8887,6 +8916,7 @@ mod tests {
             scanned: 3,
             total_pages: 3,
             searching: false,
+            initial_navigation_pending: false,
         };
         let outline = vec![
             OutlineItem {
@@ -11062,5 +11092,47 @@ mod tests {
         let mut reply = String::new();
         std::io::Read::read_to_string(&mut client, &mut reply).unwrap();
         assert!(reply.contains(r#""ok":true"#), "{reply}");
+    }
+
+    #[test]
+    fn late_search_results_do_not_clobber_navigation_after_picker_closes() {
+        let (mut app, viewport, file) = continuous_app();
+        let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+        app.pending.clear();
+        for page in 0..2 {
+            let key = app.page_key(page, viewport);
+            app.tab_mut()
+                .cache
+                .insert(key, continuous_frame(key, revision, false));
+        }
+        let mut output = Vec::new();
+        app.start_search("sample".into(), &mut output).unwrap();
+        let request_id = app.tab().search.request_id;
+        assert!(app.tab().search.initial_navigation_pending);
+        app.close_search_picker(&mut output).unwrap();
+        assert!(!app.tab().search.initial_navigation_pending);
+        app.set_page(1, &mut output).unwrap();
+        app.tab_mut().scroll_x = 12;
+        app.tab_mut().scroll_y = 34;
+        let mut highlighted_page_0 = app.page_key(0, viewport);
+        highlighted_page_0.search_request_id = request_id;
+        app.tab_mut().cache.insert(
+            highlighted_page_0,
+            continuous_frame(highlighted_page_0, revision, false),
+        );
+        let document_id = app.tab().document_id;
+        app.receive_search_results(
+            document_id,
+            request_id,
+            vec![SearchPageMatch {
+                page: 0,
+                occurrences: 1,
+                context: "sample".into(),
+            }],
+            1,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!((app.tab().page, app.tab().scroll_y), (1, 34));
     }
 }

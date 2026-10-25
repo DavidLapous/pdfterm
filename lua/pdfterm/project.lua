@@ -204,6 +204,73 @@ local function tex_includes(path, text)
     end
     return nil, pos
   end
+  local function skip_bracket(pos)
+    pos = whitespace(pos)
+    if text:sub(pos, pos) ~= '[' then
+      return pos, false
+    end
+    pos = pos + 1
+    while pos <= #text do
+      local char = text:sub(pos, pos)
+      if char == '%' then
+        pos = after_comment(pos)
+      elseif char == '\\' then
+        pos = pos + 2
+      elseif char == '{' then
+        _, pos = argument(pos, false)
+      elseif char == ']' then
+        return pos + 1, true
+      else
+        pos = pos + 1
+      end
+    end
+    return pos, true
+  end
+  local function skip_definition(pos, command)
+    if command == 'def' or command == 'gdef' or command == 'edef' or command == 'xdef' then
+      while pos <= #text do
+        local char = text:sub(pos, pos)
+        if char == '%' then
+          pos = after_comment(pos)
+        elseif char == '\\' then
+          pos = pos + 2
+        elseif char == '{' then
+          local _, next_pos = argument(pos, false)
+          return next_pos
+        else
+          pos = pos + 1
+        end
+      end
+      return pos
+    end
+    pos = whitespace(pos)
+    if text:sub(pos, pos) == '*' then
+      pos = whitespace(pos + 1)
+    end
+    if text:sub(pos, pos) == '{' then
+      _, pos = argument(pos, false)
+    elseif text:sub(pos, pos) == '\\' then
+      local _, finish = text:find('^([%a@]+)', pos + 1)
+      pos = finish and (finish + 1) or (pos + 2)
+    end
+    if command:find('DocumentCommand$', 1) then
+      _, pos = argument(pos, false)
+      _, pos = argument(pos, false)
+      return pos
+    end
+    while true do
+      local next_pos, skipped = skip_bracket(pos)
+      pos = next_pos
+      if not skipped then
+        break
+      end
+    end
+    _, pos = argument(pos, false)
+    if command == 'newenvironment' or command == 'renewenvironment' then
+      _, pos = argument(pos, false)
+    end
+    return pos
+  end
   local pos = 1
   while pos <= #text do
     local next_pos = text:find('[%%\\]', pos)
@@ -236,6 +303,13 @@ local function tex_includes(path, text)
             local _, close = text:find('\\end{' .. environment .. '}', pos, true)
             pos = close and close + 1 or #text + 1
           end
+        elseif command == 'newcommand' or command == 'renewcommand' or command == 'providecommand'
+          or command == 'DeclareRobustCommand' or command == 'NewDocumentCommand'
+          or command == 'RenewDocumentCommand' or command == 'ProvideDocumentCommand'
+          or command == 'DeclareDocumentCommand' or command == 'def' or command == 'gdef'
+          or command == 'edef' or command == 'xdef' or command == 'newenvironment'
+          or command == 'renewenvironment' then
+          pos = skip_definition(pos, command)
         elseif command == 'documentclass' then
           document = true
         elseif command == 'input' or command == 'include' or command == 'subfile' then

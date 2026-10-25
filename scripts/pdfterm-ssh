@@ -280,7 +280,7 @@ return liveIDs as text''', *sorted(identifiers), deadline=deadline)
         return set(result.splitlines())
 
     def close(self, identifier, deadline=None):
-        applescript('''repeat 50 times
+        applescript('''repeat 15 times
 if not (exists terminal id (item 1 of argv)) then
 try
 focus (focused terminal of selected tab of front window)
@@ -293,6 +293,20 @@ send key "c" modifiers "control" to terminal id (item 1 of argv)
 end try
 delay 0.02
 end repeat
+if exists terminal id (item 1 of argv) then
+try
+close terminal id (item 1 of argv)
+end try
+repeat 25 times
+if not (exists terminal id (item 1 of argv)) then
+try
+focus (focused terminal of selected tab of front window)
+end try
+return
+end if
+delay 0.02
+end repeat
+end if
 if exists terminal id (item 1 of argv) then error "owned viewer did not exit"''', identifier,
                     deadline=deadline)
 
@@ -301,12 +315,21 @@ def capture_terminal():
     if os.environ.get('TERM_PROGRAM') == 'WezTerm':
         return WezTermTerminal(os.environ.get('WEZTERM_PANE', ''),
                                os.environ.get('WEZTERM_UNIX_SOCKET', ''))
-    if os.environ.get('KITTY_WINDOW_ID'):
-        return KittyTerminal(os.environ['KITTY_WINDOW_ID'])
     if os.environ.get('TERM_PROGRAM') == 'ghostty' and sys.platform == 'darwin':
         return GhosttyTerminal(applescript(
             'return id of focused terminal of selected tab of front window'))
+    if os.environ.get('KITTY_WINDOW_ID'):
+        return KittyTerminal(os.environ['KITTY_WINDOW_ID'])
     raise RuntimeError('start pdfterm-ssh in Kitty, WezTerm, or Ghostty on macOS (without tmux)')
+
+
+def popen_in_pgrp(args, pgid):
+    if sys.version_info >= (3, 11):
+        return subprocess.Popen(args, process_group=pgid)
+    return subprocess.Popen(
+        args,
+        preexec_fn=os.setpgrp if pgid == 0 else (lambda: os.setpgid(0, pgid)),
+    )
 
 
 class StdioForward:
@@ -433,7 +456,7 @@ class Bridge:
                 client, _ = self.listener.accept()
             except socket.timeout:
                 continue
-            if not self.slots.acquire(blocking=False):
+            if not self.slots.acquire(timeout=0.5):
                 client.close()
                 continue
             # Accept promptly: the budget includes waiting for terminal control.
@@ -567,10 +590,10 @@ def main():
             # and its proxies in an owned group that lives until this scope exits.
             # Do not daemonize: a forked master would escape descendant cleanup.
             foreground = os.tcgetpgrp(sys.stdin.fileno())
-            master = subprocess.Popen(
+            master = popen_in_pgrp(
                 ssh[:-1] + ['-o', 'ControlMaster=yes', '-o', 'ControlPersist=no',
                             '-o', 'ForkAfterAuthentication=no', '-nN', args.host],
-                process_group=0)
+                0)
             previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
             try:
                 os.tcsetpgrp(sys.stdin.fileno(), master.pid)
@@ -650,7 +673,7 @@ def main():
             previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
             try:
                 os.tcsetpgrp(sys.stdin.fileno(), master.pid)
-                child = subprocess.Popen([*editor_ssh, command], process_group=master.pid)
+                child = popen_in_pgrp([*editor_ssh, command], master.pid)
                 return child.wait()
             finally:
                 os.tcsetpgrp(sys.stdin.fileno(), foreground)

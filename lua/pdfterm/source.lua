@@ -3,7 +3,7 @@ local M = {}
 local MAX_SOURCE, MAX_MANIFEST, MAX_WARNING = 2 * 1024 * 1024, 4 * 1024 * 1024, 4096
 local documents, manifests, latest, pending, warm, tracked, buffers, document_order = {}, {}, {}, {}, {}, {}, {}, {}
 local parsed_by_digest, parsed_count = {}, 0
-local serial, installed = 0, false
+local serial = 0
 local namespace_prefix = 'pdfterm.source.' .. tostring(vim.uv.hrtime()) .. '.'
 
 local function absolute(path, cwd, real)
@@ -394,26 +394,6 @@ local function source_buffer(path)
   return loaded_buffer(path)
 end
 
-local function warm_buffer(buffer)
-  if not normal_buffer(buffer) or not vim.api.nvim_buf_is_loaded(buffer) then return end
-  local path = absolute(vim.api.nvim_buf_get_name(buffer), nil, true)
-  for source in pairs(tracked) do
-    if source.buffer == buffer or not source.buffer and source.live_file == path then attach(source, buffer) end
-  end
-  local filetype = vim.bo[buffer].filetype
-  if not path:match('%.tex$') and not path:match('%.sty$') and not path:match('%.cls$')
-    and not path:match('%.ltx$') and not path:match('%.bib$') and not path:match('%.tikz$')
-    and not path:match('%.typ$') and filetype ~= 'tex' and filetype ~= 'plaintex'
-    and filetype ~= 'latex' and filetype ~= 'bib' and filetype ~= 'typst' then return end
-  if buffers[buffer] and next(buffers[buffer].sources) then return end
-  if warm[path] then attach(warm[path], buffer); return end
-  local bytes = source_bytes(path)
-  if bytes then
-    local source = new_source(path, bytes, buffer)
-    source.warm, warm[path] = true, source
-  end
-end
-
 local function detach_source(source)
   if source.buffer and vim.api.nvim_buf_is_valid(source.buffer) and source.namespace then
     if vim.api.nvim_buf_is_loaded(source.buffer) then
@@ -425,11 +405,48 @@ local function detach_source(source)
   tracked[source] = nil
 end
 
+local function clear_warm(path)
+  local source = warm[path]
+  if not source then return end
+  source.warm, warm[path] = nil, nil
+  if not source.document then detach_source(source) end
+end
+
+local function warm_buffer(buffer)
+  if not normal_buffer(buffer) or not vim.api.nvim_buf_is_loaded(buffer) then return end
+  local path = absolute(vim.api.nvim_buf_get_name(buffer), nil, true)
+  for source in pairs(tracked) do
+    if source.buffer == buffer or not source.buffer and source.live_file == path then attach(source, buffer) end
+  end
+  local filetype = vim.bo[buffer].filetype
+  local is_typst = path:match('%.typ$') or filetype == 'typst'
+  if not path:match('%.tex$') and not path:match('%.sty$') and not path:match('%.cls$')
+    and not path:match('%.ltx$') and not path:match('%.bib$') and not path:match('%.tikz$')
+    and not is_typst and filetype ~= 'tex' and filetype ~= 'plaintex'
+    and filetype ~= 'latex' and filetype ~= 'bib' then return end
+  if not is_typst and buffers[buffer] and next(buffers[buffer].sources) then return end
+  if warm[path] then attach(warm[path], buffer); return end
+  local bytes = source_bytes(path)
+  if bytes then
+    local source = new_source(path, bytes, buffer)
+    source.warm, warm[path] = true, source
+  end
+end
+
 function M.setup(group)
-  if installed then return end
-  installed = true
-  vim.api.nvim_create_autocmd({ 'BufReadPost', 'BufNewFile', 'BufEnter', 'FileType', 'BufWritePre' }, {
+  vim.api.nvim_create_autocmd({ 'BufNewFile', 'BufEnter', 'FileType', 'BufWritePre' }, {
     group = group, callback = function(event) warm_buffer(event.buf) end,
+  })
+  vim.api.nvim_create_autocmd({ 'BufReadPost', 'BufWritePost' }, {
+    group = group,
+    callback = function(event)
+      if not normal_buffer(event.buf) then return end
+      local path = absolute(vim.api.nvim_buf_get_name(event.buf), nil, true)
+      if path:match('%.typ$') or vim.bo[event.buf].filetype == 'typst' then
+        clear_warm(path)
+      end
+      warm_buffer(event.buf)
+    end,
   })
   vim.api.nvim_create_autocmd({ 'BufReadPre', 'BufUnload', 'BufDelete', 'BufWipeout' }, {
     group = group,
@@ -598,8 +615,19 @@ local function load_document(path, expected_pdf, expected_revision)
       and #reason <= MAX_WARNING and not reason:find('%c') and not reason:find('\194[\128-\159]'),
       'pdfterm: invalid source provenance warning')
   end
+  local aliases
+  if manifest.aliases ~= nil and manifest.aliases ~= vim.NIL then
+    assert(type(manifest.aliases) == 'table' and not vim.islist(manifest.aliases),
+      'pdfterm: invalid source snapshot aliases')
+    aliases = {}
+    for alias, target in pairs(manifest.aliases) do
+      assert(absolute(alias) == alias and absolute(target) == target and manifest.files[target] ~= nil,
+        'pdfterm: invalid source snapshot alias')
+      aliases[alias] = target
+    end
+  end
   local document = { pdf = manifest.pdf, revision = manifest.revision, cwd = manifest.cwd,
-    main = manifest.main, files = {}, source_snapshot = path,
+    main = manifest.main, files = {}, aliases = aliases, source_snapshot = path,
     key = document_key(manifest.pdf, manifest.revision), manifest_digest = vim.fn.sha256(bytes) }
   local staged = {}
   local ok, failure = pcall(function()
@@ -638,12 +666,22 @@ local function persist(project, info, sources, warnings)
   local path = directory .. '/manifest.json'
   if vim.uv.fs_stat(directory) then return load_document(path, pdf, info.revision) end
   local temporary = assert(vim.uv.fs_mkdtemp(cache_root() .. '/pending-XXXXXX'))
+  local aliases
+  if type(info.aliases) == 'table' and not vim.islist(info.aliases) then
+    for alias, target in pairs(info.aliases) do
+      if sources[target] then
+        aliases = aliases or vim.empty_dict()
+        aliases[alias] = target
+      end
+    end
+  end
   local manifest = { pdf = pdf, revision = vim.deepcopy(info.revision), cwd = absolute(info.cwd),
     main = absolute(type(info.main) == 'string' and info.main or project.main, info.cwd), files = vim.empty_dict(),
-    digests = vim.empty_dict(), warnings = vim.empty_dict() }
+    digests = vim.empty_dict(), warnings = vim.empty_dict(), aliases = aliases }
   assert(manifest.cwd and manifest.main, 'pdfterm: missing source metadata cwd/main')
   local document = { pdf = pdf, revision = manifest.revision, cwd = manifest.cwd,
-    main = manifest.main, files = {}, source_snapshot = path, key = key }
+    main = manifest.main, files = {}, aliases = aliases and vim.deepcopy(aliases) or nil,
+    source_snapshot = path, key = key }
   local existing
   local ok, failure = pcall(function()
     for index, original in ipairs(sorted_keys(sources)) do
@@ -695,6 +733,14 @@ local function metadata(info)
     'pdfterm: invalid compiled main source identity')
   for _, path in ipairs(info.inputs) do
     assert(absolute(path) == path, 'pdfterm: invalid compiled input identity')
+  end
+  if info.aliases ~= nil and info.aliases ~= vim.NIL then
+    assert(type(info.aliases) == 'table' and not vim.islist(info.aliases),
+      'pdfterm: invalid compiled source aliases')
+    for alias, target in pairs(info.aliases) do
+      assert(absolute(alias) == alias and absolute(target) == target,
+        'pdfterm: invalid compiled source alias')
+    end
   end
 end
 
@@ -753,10 +799,9 @@ function M.publish(capture, info)
   if not next(sources) then release(capture); pending[pdf] = nil; return nil end
   local document = persist(capture.project, info, sources, warnings)
   if not next(document.files) then release(capture); pending[pdf] = nil; return nil end
-  for path in pairs(document.files) do
-    if warm[path] and not warm[path].document then
-      detach_source(warm[path])
-      warm[path] = nil
+  for path, entry in pairs(document.files) do
+    if not path:match('%.typ$') or (warm[path] and warm[path].digest ~= entry.digest) then
+      clear_warm(path)
     end
   end
   latest[pdf] = document
@@ -811,6 +856,8 @@ local function attach_known(source, requested)
   buffer = loaded_buffer(source.live_file)
   if not buffer and source.live_file and vim.uv.fs_stat(source.live_file) then
     buffer = vim.fn.bufadd(source.live_file)
+  end
+  if buffer and not vim.api.nvim_buf_is_loaded(buffer) then
     local ok = pcall(vim.fn.bufload, buffer)
     if not ok then return nil end
   end
@@ -967,47 +1014,7 @@ function M.snapshot(pdf, full_revision)
   return document and next(document.files) and document.source_snapshot or nil
 end
 
-function M.inverse(location)
-  assert(type(location) == 'table' and absolute(location.file), 'pdfterm: invalid inverse source location')
-  local explicit = location.source_snapshot ~= nil and location.source_snapshot ~= vim.NIL
-  assert(not explicit or type(location.source_snapshot) == 'string' and location.source_snapshot:sub(1, 1) == '/',
-    'pdfterm: source snapshot path must be absolute')
-  local snapshot = explicit and snapshot_identity(location.source_snapshot) or nil
-  assert(not explicit or snapshot, 'pdfterm: invalid source snapshot path')
-  local pdf = absolute(location.pdf)
-  local full_revision = location.document_revision ~= vim.NIL and location.document_revision or nil
-  local document
-  if snapshot then document = load_document(snapshot, pdf, full_revision)
-  else document = matching_document(pdf, full_revision) end
-  local original = document and absolute(location.file, document.cwd)
-  local entry = document and document.files[original]
-  if document and not entry then
-    local resolved = absolute(location.file, document.cwd, true)
-    if resolved and document.files[resolved] then
-      original, entry = resolved, document.files[resolved]
-    end
-  end
-  local main
-  if document and not entry then main = select(2, default_entry(document)) end
-  local selected = entry or main
-  if selected then cached_contents(selected.cache_file, selected.digest) end
-  local pdf_revision = location.revision ~= vim.NIL and location.revision or nil
-  pdf_revision = pdf_revision or (type(full_revision) == 'table' and full_revision.pdf)
-  local identity = document and pdf and pdf == document.pdf and type(pdf_revision) == 'table'
-    and stable(pdf_revision) == stable(document.revision.pdf)
-    and (not full_revision or stable(full_revision) == stable(document.revision))
-  assert(not explicit or identity, 'pdfterm: inverse source snapshot document identity mismatch')
-  if not identity then
-    return approximate_inverse(location, 'compiled source snapshot/identity is unavailable; using a clamped current position')
-  end
-  if not entry then
-    if main then
-      return approximate_inverse({ file = main.source.original, line = 1, byte_column = 0, warning = location.warning },
-        'inverse source was not captured among compiled inputs; using the main/document anchor', main.source)
-    end
-    return approximate_inverse(location, 'inverse source was not captured; using a clamped current position')
-  end
-  local source, provenance = entry.source, warning(location.warning, entry.warning)
+local function project_source(location, source, provenance)
   local original_lines = lines_for(source)
   local requested_row = coordinate(location.line, 1) - 1
   local row = math.max(0, math.min(math.floor(requested_row), #original_lines - 1))
@@ -1039,6 +1046,75 @@ function M.inverse(location)
   end
   local live_row, live_byte = buffer_position(buffer, position[1], mapped_byte)
   return { buffer = buffer, file = source.live_file, line = live_row + 1, byte_column = live_byte, warning = provenance }
+end
+
+function M.inverse(location)
+  assert(type(location) == 'table' and absolute(location.file), 'pdfterm: invalid inverse source location')
+  local explicit = location.source_snapshot ~= nil and location.source_snapshot ~= vim.NIL
+  assert(not explicit or type(location.source_snapshot) == 'string' and location.source_snapshot:sub(1, 1) == '/',
+    'pdfterm: source snapshot path must be absolute')
+  local snapshot = explicit and snapshot_identity(location.source_snapshot) or nil
+  assert(not explicit or snapshot, 'pdfterm: invalid source snapshot path')
+  local pdf = absolute(location.pdf)
+  local full_revision = location.document_revision ~= vim.NIL and location.document_revision or nil
+  local document
+  if snapshot then document = load_document(snapshot, pdf, full_revision)
+  else document = matching_document(pdf, full_revision) end
+  local original = document and absolute(location.file, document.cwd)
+  local entry = document and document.files[original]
+  if document and not entry and type(document.aliases) == 'table' then
+    local aliased = original and document.aliases[original]
+    if aliased and document.files[aliased] then
+      original, entry = aliased, document.files[aliased]
+    end
+  end
+  if document and not entry then
+    local resolved = absolute(location.file, document.cwd, true)
+    if resolved and document.files[resolved] then
+      original, entry = resolved, document.files[resolved]
+    elseif resolved and type(document.aliases) == 'table' then
+      local aliased = document.aliases[resolved]
+      if aliased and document.files[aliased] then
+        original, entry = aliased, document.files[aliased]
+      end
+    end
+  end
+  local main
+  if document and not entry then main = select(2, default_entry(document)) end
+  local selected = entry or main
+  if selected then cached_contents(selected.cache_file, selected.digest) end
+  local pdf_revision = location.revision ~= vim.NIL and location.revision or nil
+  pdf_revision = pdf_revision or (type(full_revision) == 'table' and full_revision.pdf)
+  local identity = document and pdf and pdf == document.pdf and type(pdf_revision) == 'table'
+    and stable(pdf_revision) == stable(document.revision.pdf)
+    and (not full_revision or stable(full_revision) == stable(document.revision))
+  assert(not explicit or identity, 'pdfterm: inverse source snapshot document identity mismatch')
+  if not identity then
+    if not explicit and type(location.file) == 'string' and location.file:match('%.typ$') then
+      local typst_path = absolute(location.file, nil, true)
+      local source = typst_path and warm[typst_path]
+      if typst_path then
+        local bytes = source_bytes(typst_path)
+        if bytes and (not source or source.digest ~= vim.fn.sha256(bytes)) then
+          clear_warm(typst_path)
+          source = new_source(typst_path, bytes, source_buffer(typst_path))
+          source.warm, warm[typst_path] = true, source
+        end
+      end
+      if source then
+        return project_source(location, source, location.warning)
+      end
+    end
+    return approximate_inverse(location, 'compiled source snapshot/identity is unavailable; using a clamped current position')
+  end
+  if not entry then
+    if main then
+      return approximate_inverse({ file = main.source.original, line = 1, byte_column = 0, warning = location.warning },
+        'inverse source was not captured among compiled inputs; using the main/document anchor', main.source)
+    end
+    return approximate_inverse(location, 'inverse source was not captured; using a clamped current position')
+  end
+  return project_source(location, entry.source, warning(location.warning, entry.warning))
 end
 
 return M

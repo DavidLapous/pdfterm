@@ -26,17 +26,6 @@ pub(crate) fn focus_self(operation: &crate::process::Operation) -> io::Result<()
     {
         return focus_ssh(operation);
     }
-    if let Some(id) = env::var_os("KITTY_WINDOW_ID") {
-        let id = id.to_string_lossy();
-        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid("KITTY_WINDOW_ID must be a numeric window ID"));
-        }
-        return helper(
-            operation,
-            "kitten",
-            &["@", "focus-window", "--match", &format!("id:{id}")],
-        );
-    }
     if let Some(id) = env::var_os("PDFTERM_VIEWER_TERMINAL_ID") {
         let id = id.to_string_lossy();
         if !valid_uuid(&id) {
@@ -57,6 +46,17 @@ pub(crate) fn focus_self(operation: &crate::process::Operation) -> io::Result<()
             io::ErrorKind::Unsupported,
             "Ghostty terminal focus is supported only on macOS",
         ));
+    }
+    if let Some(id) = env::var_os("KITTY_WINDOW_ID") {
+        let id = id.to_string_lossy();
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid("KITTY_WINDOW_ID must be a numeric window ID"));
+        }
+        return helper(
+            operation,
+            "kitten",
+            &["@", "focus-window", "--match", &format!("id:{id}")],
+        );
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,

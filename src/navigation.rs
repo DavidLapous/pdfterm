@@ -136,13 +136,13 @@ impl InverseTask {
                 self.click.synctex
             }
         };
-        let discovered_snapshot =
-            if self.best_guess && self.source_snapshot.is_none() && self.inverse_search.is_none() {
-                self.editor
-                    .source_snapshot(&self.path, self.revision, &self.operation)?
-            } else {
-                None
-            };
+        let discovered_snapshot = if self.source_snapshot.is_none() && self.inverse_search.is_none()
+        {
+            self.editor
+                .source_snapshot(&self.path, self.revision, &self.operation)?
+        } else {
+            None
+        };
         let source_snapshot = self
             .source_snapshot
             .as_deref()

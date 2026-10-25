@@ -449,7 +449,13 @@ local ok, failure = xpcall(function()
     { 'forward_socket="forward.sock"', '[editor]', 'transport="socket"', 'path="editor.sock"' },
     directory .. '/pdfterm/config.toml'
   )
-  local binary = assert(vim.env.PDFTERM_EXECUTABLE, 'set PDFTERM_EXECUTABLE to a built viewer')
+  local binary = assert(
+    vim.env.PDFTERM_EXECUTABLE
+      or (vim.fn.executable(root .. '/target/debug/pdfterm') == 1 and (root .. '/target/debug/pdfterm'))
+      or (vim.fn.executable(root .. '/target/release/pdfterm') == 1 and (root .. '/target/release/pdfterm'))
+      or (vim.fn.exepath('pdfterm') ~= '' and vim.fn.exepath('pdfterm')),
+    'set PDFTERM_EXECUTABLE to a built viewer'
+  )
   local wrapper = directory .. '/selected-viewer'
   vim.fn.writefile({
     '#!/bin/sh',
@@ -856,10 +862,10 @@ local ok, failure = xpcall(function()
   end
   adapter.forward(false)
   wait(function()
-    return #notices >= 2
+    return #notices >= 1 and notices[#notices].message:find('PdfTermForwardSplit', 1, true) ~= nil
   end)
   assert(launches == 0 and #requests == 8, 'attach-only forward launched a viewer')
-  assert(notices[#notices].message:find('PdfTermForwardSplit', 1, true))
+  assert(#notices == 1 and notices[#notices].message:find('PdfTermForwardSplit', 1, true))
   focused = nil
   vim.cmd('PdfTermForward')
   wait(function()
@@ -995,7 +1001,6 @@ local ok, failure = xpcall(function()
   for _, output_folder in ipairs({ '.', 'output' }) do
     vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
     if output_folder == '.' then
-      assert(closed_splits.viewer == nil, 'ready viewer split was closed through terminal control after IPC quit')
       assert(closed_splits.viewer2 == 1, 'unconfirmed racing split was not closed on exit')
       assert(closed_splits.viewer3 == 1, 'failed rollback lost its owned viewer')
       assert(#quit_requests == 1, 'VimLeavePre did not send quit over forward_socket')
@@ -1436,6 +1441,68 @@ local ok, failure = xpcall(function()
     return focused ~= nil
   end)
   assert(focused == 'attached-explicit-source', 'attachment ignored its explicit source')
+
+  do
+    local macro_dir = directory .. '/macro-include'
+    vim.fn.mkdir(macro_dir, 'p')
+    vim.fn.writefile({
+      '\\documentclass{article}',
+      '\\newcommand{\\includechapter}[1]{\\input{sub}}',
+      '\\def\\myinclude{\\include{sub}}',
+      '\\begin{document}',
+      'Hello.',
+      '\\end{document}',
+    }, macro_dir .. '/unused.tex')
+    vim.fn.writefile({ 'Subchapter.' }, macro_dir .. '/sub.tex')
+    local resolved = project.describe(nil, macro_dir .. '/sub.tex')
+    assert(resolved.main == vim.uv.fs_realpath(macro_dir .. '/sub.tex'),
+      'unused macro definition falsely claimed project ownership: ' .. tostring(resolved.main))
+    vim.fn.writefile({
+      '\\documentclass{article}',
+      '\\newcommand{\\bracketdefault}[1][{[}]{#1}',
+      '\\newcommand{\\bareopen}[1][[]{#1}',
+      '\\newenvironment{bareenv}[1][[]{}{}',
+      '\\begin{document}',
+      '\\input{sub}',
+      '\\end{document}',
+    }, macro_dir .. '/owner.tex')
+    local owned = project.describe(nil, macro_dir .. '/sub.tex')
+    assert(owned.main == vim.uv.fs_realpath(macro_dir .. '/owner.tex'),
+      'braced bracket inside macro default hid subsequent \\input: ' .. tostring(owned.main))
+
+    local typ_file = macro_dir .. '/notes.typ'
+    vim.fn.writefile({ '= Heading', 'Paragraph target.' }, typ_file)
+    local anchors = require('pdfterm.source')
+    vim.cmd('edit ' .. vim.fn.fnameescape(typ_file))
+    vim.bo.filetype = 'typst'
+    vim.api.nvim_exec_autocmds('FileType', { buffer = 0 })
+    vim.api.nvim_buf_set_lines(0, 0, 0, false, { '// prepended line' })
+    local typ_mapped = anchors.inverse({
+      file = vim.uv.fs_realpath(typ_file),
+      line = 2,
+      byte_column = 10,
+    })
+    assert(typ_mapped.line == 3 and typ_mapped.byte_column == 10,
+      'Typst inverse did not project across unsaved buffer insert: ' .. vim.inspect(typ_mapped))
+    vim.cmd('silent write')
+    local typ_rebased = anchors.inverse({
+      file = vim.uv.fs_realpath(typ_file),
+      line = 3,
+      byte_column = 10,
+    })
+    assert(typ_rebased.line == 3 and typ_rebased.byte_column == 10 and not typ_rebased.warning,
+      'Typst inverse did not rebase warm source on write: ' .. vim.inspect(typ_rebased))
+    vim.fn.writefile({ '// external line', '// prepended line', '= Heading', 'Paragraph target.' }, typ_file)
+    vim.cmd('silent edit!')
+    local typ_reloaded = anchors.inverse({
+      file = vim.uv.fs_realpath(typ_file),
+      line = 4,
+      byte_column = 10,
+    })
+    assert(typ_reloaded.line == 4 and typ_reloaded.byte_column == 10 and not typ_reloaded.warning,
+      'Typst inverse double-shifted after external reload: ' .. vim.inspect(typ_reloaded))
+  end
+
   vim.notify = original_notify
   print(
     'adapter regressions passed: builds, timeouts, bootstrap, sessions, root projects, included forward, forward focus, inverse focus, split ownership; event ticks='

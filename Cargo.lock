@@ -840,12 +840,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "latex2mathml"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "678cf5bdb3ba63a264e6e0c9eee36538ca1d2da0afa4dd801c1f96309e710765"
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1656,12 +1650,11 @@ dependencies = [
 
 [[package]]
 name = "synctex-parser"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a71c3b8f951f6a6021dff3e9be7543273bdc15e47686c5e535f1999a81800f2f"
+checksum = "1cf43c74b3f0b3cdfcd617a79db0221ad5a8391b0be72c19939f8baf316c6190"
 dependencies = [
  "flate2",
- "latex2mathml",
  "libc",
  "serde",
  "serde_json",

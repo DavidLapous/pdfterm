@@ -3,7 +3,11 @@ local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root)
 
 local directory = assert(vim.uv.fs_mkdtemp(root .. '/.nvim-log-test-XXXXXX'))
-local binary = vim.env.PDFTERM_EXECUTABLE or (root .. '/target/release/pdfterm')
+local binary = vim.env.PDFTERM_EXECUTABLE
+  or (vim.fn.executable(root .. '/target/debug/pdfterm') == 1 and (root .. '/target/debug/pdfterm'))
+  or (vim.fn.executable(root .. '/target/release/pdfterm') == 1 and (root .. '/target/release/pdfterm'))
+  or (vim.fn.exepath('pdfterm') ~= '' and vim.fn.exepath('pdfterm'))
+  or (root .. '/target/release/pdfterm')
 local log_file = directory .. '/logs/pdfterm.log'
 
 local ok, failure = xpcall(function()
@@ -105,7 +109,21 @@ local ok, failure = xpcall(function()
   })
   lines = vim.fn.readfile(log_file)
   assert(#lines == prev_count + 1, 'expected 1 new log line for imprecise inverse')
-  assert(lines[#lines]:match('%[WARN%] %[inverse: .*test%.tex:2:0 %(precise=false%)] imprecise/coarse line positioning'),
+  assert(lines[#lines]:match('%[INFO%] %[inverse: .*test%.tex:2:0 %(precise=false%)] imprecise/coarse line positioning'),
+    'unexpected line: ' .. lines[#lines])
+
+  -- Case B2: routine best-guess diagnostic logs as INFO without notifying WARN
+  prev_count = #lines
+  pdfterm._inverse({
+    file = test_file,
+    line = 2,
+    byte_column = 0,
+    precise = false,
+    warning = 'best-guess navigation: no literal source position was qualified; using the compiler line anchor',
+  })
+  lines = vim.fn.readfile(log_file)
+  assert(#lines == prev_count + 1, 'expected 1 new log line for routine diagnostic inverse')
+  assert(lines[#lines]:match('%[INFO%] %[inverse: .*test%.tex:2:0 %(precise=false%)] best%-guess navigation: no literal source position was qualified; using the compiler line anchor'),
     'unexpected line: ' .. lines[#lines])
 
   -- Case C: out of bounds line (line 50 in a 5-line buffer)

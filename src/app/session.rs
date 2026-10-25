@@ -104,12 +104,17 @@ pub(super) struct FileWatcher {
 }
 
 impl FileWatcher {
+    #[cfg(test)]
     pub(super) fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            accepted: FileFingerprint::read(path)?,
+        Ok(Self::from_revision(FileFingerprint::read(path)?))
+    }
+
+    pub(super) fn from_revision(accepted: FileFingerprint) -> Self {
+        Self {
+            accepted,
             candidate: None,
             next_poll: Instant::now() + FILE_POLL_INTERVAL,
-        })
+        }
     }
 
     pub(super) fn poll(&mut self, path: &Path) -> Option<FileFingerprint> {
@@ -240,7 +245,7 @@ impl App {
         document_id: DocumentId,
         pages: u32,
         outline: Vec<OutlineItem>,
-        revision: PdfRevision,
+        revision: FileFingerprint,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let Some(pending) = self.session.pending_open.take() else {
@@ -257,7 +262,7 @@ impl App {
                 self.clear_document_flash(document_id);
                 let tab = &mut self.session.tabs[index];
                 tab.watcher.accept(fingerprint);
-                tab.revision = revision;
+                tab.revision = revision.pdf;
                 tab.page_count = pages;
                 tab.page = tab.page.min(pages - 1);
                 tab.outline = Arc::new(outline);
@@ -279,11 +284,11 @@ impl App {
                 view,
             } if expected == document_id => {
                 crate::recent::record(&path);
-                let watcher = FileWatcher::new(&path)?;
+                let watcher = FileWatcher::from_revision(revision);
                 self.session.tabs.push(Tab::new(
                     document_id,
                     path,
-                    revision,
+                    revision.pdf,
                     watcher,
                     pages,
                     0,

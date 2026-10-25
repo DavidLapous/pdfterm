@@ -11,7 +11,7 @@ def relay(mode, path, incoming=None, outgoing=None):
     incoming = incoming or sys.stdin.buffer
     outgoing = outgoing or sys.stdout.buffer
     opened, eof, closed = 0xffffffff, 0xfffffffe, 0xfffffffd
-    peers, lock, writing = {}, threading.Lock(), threading.Lock()
+    peers, lock, writing = {}, threading.Condition(), threading.Lock()
     stopping = threading.Event()
     listener = None
 
@@ -23,6 +23,8 @@ def relay(mode, path, incoming=None, outgoing=None):
     def forget(identifier, notify=False):
         with lock:
             peer = peers.pop(identifier, None)
+            if peer:
+                lock.notify_all()
         if peer:
             try:
                 peer[0].shutdown(socket.SHUT_RDWR)
@@ -48,8 +50,8 @@ def relay(mode, path, incoming=None, outgoing=None):
             while not stopping.is_set():
                 data = client.recv(65536)
                 if not data:
-                    send(identifier, eof)
                     half_closed(identifier, 1)
+                    send(identifier, eof)
                     return
                 send(identifier, len(data), data)
         except (OSError, ValueError):
@@ -60,7 +62,7 @@ def relay(mode, path, incoming=None, outgoing=None):
 
     def register(identifier, client, announce=False):
         with lock:
-            if identifier in peers or len(peers) >= 4:
+            if identifier in peers or (announce and len(peers) >= 4):
                 client.close()
                 raise RuntimeError('relay connection limit or duplicate ID')
             peers[identifier] = [client, False, False]
@@ -75,10 +77,12 @@ def relay(mode, path, incoming=None, outgoing=None):
             try:
                 client, _ = listener.accept()
                 with lock:
-                    full = len(peers) >= 4
-                if full:
-                    client.close()
-                    continue
+                    if not lock.wait_for(lambda: len(peers) < 4 or stopping.is_set(), timeout=1):
+                        client.close()
+                        continue
+                    if stopping.is_set():
+                        client.close()
+                        return
                 identifier += 1
                 register(identifier, client, announce=True)
             except (OSError, ValueError, RuntimeError):
@@ -141,7 +145,10 @@ def relay(mode, path, incoming=None, outgoing=None):
                 continue  # A socket error may race with its final frames.
             try:
                 if kind == eof:
-                    peer[0].shutdown(socket.SHUT_WR)
+                    try:
+                        peer[0].shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
                     half_closed(identifier, 2)
                 else:
                     peer[0].sendall(data)
@@ -156,6 +163,7 @@ def relay(mode, path, incoming=None, outgoing=None):
             except FileNotFoundError:
                 pass
         with lock:
+            lock.notify_all()
             identifiers = list(peers)
         for identifier in identifiers:
             forget(identifier)

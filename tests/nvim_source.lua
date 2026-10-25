@@ -208,6 +208,11 @@ if replay then
       assert(not query_error and query_reply.source_snapshot == vim.NIL, tostring(query_error))
       return
     end
+    local typ_buffer
+    if replay.mode == 'cold-cache' then
+      vim.cmd.edit(vim.fn.fnameescape(replay.cold_typ))
+      typ_buffer = api.nvim_get_current_buf()
+    end
     local query_error, query_reply = snapshot_query(snapshot_request(replay.info))
     assert(not query_error and type(query_reply.source_snapshot) == 'string', tostring(query_error))
     vim.cmd.edit(vim.fn.fnameescape(replay.project.main))
@@ -237,6 +242,13 @@ if replay then
       return
     end
     if replay.mode == 'cold-cache' then
+      api.nvim_set_current_buf(typ_buffer)
+      api.nvim_buf_set_lines(typ_buffer, 0, 0, false, { '// prepended line' })
+      vim.cmd('silent write')
+      local typ_current = source.inverse({ file = replay.cold_typ, line = 3, byte_column = 0 })
+      assert(typ_current.buffer == typ_buffer and typ_current.line == 3 and typ_current.byte_column == 0 and not typ_current.warning)
+      local typ_historical = source.inverse(replay.cold_typ_location)
+      assert(typ_historical.buffer == typ_buffer and typ_historical.line == 4 and typ_historical.byte_column == 0 and not typ_historical.warning)
       vim.cmd.edit(vim.fn.fnameescape(replay.cold_file))
       local cold_buffer = api.nvim_get_current_buf()
       precise(source.forward(document, cold_buffer, 0, 5), 1, 6)
@@ -706,14 +718,22 @@ local ok, failure = xpcall(function()
   assert(replay_result.code == 0, (replay_result.stderr or '') .. (replay_result.stdout or ''))
   local cold_project = { main = directory .. '/cold-main.tex', pdf = directory .. '/cold-main.pdf', cwd = directory }
   local cold_file = directory .. '/cold-body.tex'
+  local cold_typ = directory .. '/cold-notes.typ'
   vim.fn.writefile({ 'Main stable needle' }, cold_project.main)
   vim.fn.writefile({ 'Cold copper needle' }, cold_file)
+  vim.fn.writefile({ '= Heading', 'Second line', 'Third line' }, cold_typ)
   pdf_fixture(cold_project.pdf)
-  local cold_document = finish(cold_project, source.capture(cold_project, { cold_project.main, cold_file }),
-    { cold_project.main, cold_file })
+  local cold_document = finish(cold_project, source.capture(cold_project, { cold_project.main, cold_file, cold_typ }),
+    { cold_project.main, cold_file, cold_typ })
+  local unloaded_cold = vim.fn.bufadd(cold_file)
+  assert(not api.nvim_buf_is_loaded(unloaded_cold))
+  local loaded_inverse = source.inverse(location(cold_document, cold_file, 1, 5))
+  assert(loaded_inverse.buffer == unloaded_cold and api.nvim_buf_is_loaded(unloaded_cold)
+    and loaded_inverse.line == 1 and loaded_inverse.byte_column == 5 and not loaded_inverse.warning)
   local cold_data = { directory = directory, project = cold_project,
-    info = info(cold_project, { cold_project.main, cold_file }), cold_file = cold_file,
-    cold_location = location(cold_document, cold_file, 1, 5) }
+    info = info(cold_project, { cold_project.main, cold_file, cold_typ }), cold_file = cold_file, cold_typ = cold_typ,
+    cold_location = location(cold_document, cold_file, 1, 5),
+    cold_typ_location = location(cold_document, cold_typ, 3, 0) }
   for _, mode in ipairs({ 'cold-tamper', 'cold-cache' }) do
     cold_data.mode = mode
     local cold_result = vim.system({ vim.v.progpath, '--headless', '-u', 'NONE', '-l', root .. '/tests/nvim_source.lua' }, {

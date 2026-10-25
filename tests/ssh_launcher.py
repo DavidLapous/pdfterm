@@ -368,7 +368,8 @@ error('editor did not exit during launch')
                     if body.startswith('focus terminal id'):
                         self.assertEqual(arguments, ('ghostty-source',))
                         raise RuntimeError('Ghostty source refocus failed')
-                    if body.startswith('repeat 50 times'):
+                    if body.startswith('repeat 15 times'):
+                        self.assertIn('close terminal id (item 1 of argv)', body)
                         self.assertEqual(arguments, ('ghostty-child',), 'only the exact child may be closed')
                         if cleanup['fail']:
                             raise RuntimeError('Ghostty child cleanup unavailable')
@@ -815,11 +816,12 @@ class StdioRelayTests(unittest.TestCase):
         self.exchange(bytes(range(256)) * 1000)
 
     def test_ownership_receipt_can_follow_reply_on_same_connection(self):
-        self.exchange(b'launch request\n', receipt=True)
+        for _ in range(20):
+            self.exchange(b'launch request\n', receipt=True)
 
     def test_concurrent_clients_do_not_mix_frames(self):
         with ThreadPoolExecutor(max_workers=4) as workers:
-            list(workers.map(self.exchange, [bytes([n]) * 20000 for n in range(4)]))
+            list(workers.map(self.exchange, [bytes([n % 256]) * 20000 for n in range(20)]))
 
     def test_socket_is_private_current_user_owned_and_removed_on_disconnect(self):
         identity = os.stat(self.remote)

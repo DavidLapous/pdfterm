@@ -98,7 +98,7 @@ function ghostty.close(split)
       [[
 on run argv
   tell application "Ghostty"
-    repeat 50 times
+    repeat 15 times
       if not (exists terminal id (item 1 of argv)) then
         -- Collapsing an unfocused split swaps SwiftUI's subtree identity and drops firstResponder.
         try
@@ -113,6 +113,20 @@ on run argv
       end try
       delay 0.02
     end repeat
+    if exists terminal id (item 1 of argv) then
+      try
+        close terminal id (item 1 of argv)
+      end try
+      repeat 25 times
+        if not (exists terminal id (item 1 of argv)) then
+          try
+            focus (focused terminal of selected tab of front window)
+          end try
+          return
+        end if
+        delay 0.02
+      end repeat
+    end if
     if exists terminal id (item 1 of argv) then error "owned PDF split did not exit"
   end tell
 end run

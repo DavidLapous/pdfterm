@@ -21,7 +21,7 @@ ratatui = { version = "0.30.0", default-features = false, features = ["crossterm
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"
-synctex-parser = "0.1.0"
+synctex-parser = "0.1.1"
 thiserror = "2.0.17"
 png = "0.18.0"
 fontdb = "0.24.0"
