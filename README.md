@@ -20,8 +20,6 @@ Run directly in the terminal; tmux graphics passthrough is not supported.
 cargo install --locked --git https://github.com/jrf/pdfterm.git
 ```
 
-PDFium revision 7881 is checksummed and embedded. From a checkout, `cargo build --release`.
-
 ## Run
 
 ```console
@@ -79,8 +77,6 @@ The bundled plugin works with [Lazy.nvim](https://github.com/folke/lazy.nvim); i
 Configured log-directory, open, write, and close failures report an explicit Neovim error without recursively logging it or aborting navigation.
 
 Kitty splits require `allow_remote_control yes`; detached Neovim also needs a private `listen_on` socket. Ghostty control is macOS-only. WezTerm requires `wezterm` on `PATH`. For manual pairing, `:PdfTermViewerCommand` prints the Neovim-attached launch command and copies it to the clipboard.
-
-On normal Neovim exit, plugin-owned local Ghostty panes close even if Ghostty retains the viewer's exit screen. Unrelated terminal panes are left alone.
 
 For automatic local viewer splits over SSH, run `scripts/pdfterm-ssh HOST` from the client terminal. The remote needs Neovim, pdfterm, and its Neovim adapter. macOS remotes also need Python 3: their control connection uses a private, current-user-owned Unix socket relayed over SSH, without `netstat` or privileged port inspection. Linux remotes use a verified loopback reverse forward and require `ss`.
 
