@@ -7,6 +7,7 @@ from pathlib import Path
 import runpy
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -680,6 +681,61 @@ vim.cmd('qa!')
         policy = dict(line.split(maxsplit=1) for line in result.stdout.splitlines())
         self.assertIn(policy['controlmaster'], ('true', 'yes'))
         self.assertEqual(policy['stdinnull'], 'yes')
+
+    def test_hangup_and_revoked_tty_during_cleanup_still_close_bridge(self):
+        closed = []
+
+        class FakeChild:
+            pid = 4242
+
+            @staticmethod
+            def poll():
+                return None
+
+            @staticmethod
+            def wait(timeout=None):
+                return 0
+
+            @staticmethod
+            def terminate():
+                os.kill(os.getpid(), signal.SIGHUP)
+
+        class FakeBridge:
+            def __init__(self, *_):
+                pass
+
+            @staticmethod
+            def close():
+                closed.append(True)
+
+        def fake_tcsetpgrp(_fd, pgrp):
+            if pgrp == 1111:
+                raise OSError(5, 'Input/output error')
+
+        previous = signal.getsignal(signal.SIGHUP)
+        try:
+            signal.signal(signal.SIGHUP, launcher['handle_stop_signal'])
+            with patch.dict(os.environ, SSH_CONNECTION='', SSH_TTY='', TMUX=''), \
+                    patch.object(sys, 'argv', ['pdfterm-ssh', 'test.invalid']), \
+                    patch.object(sys.stdin, 'isatty', return_value=True), \
+                    patch.object(sys.stdin, 'fileno', return_value=0), \
+                    patch.object(os, 'tcgetpgrp', return_value=1111), \
+                    patch.object(os, 'tcsetpgrp', side_effect=fake_tcsetpgrp), \
+                    patch.object(os, 'killpg'), \
+                    patch.object(os.path, 'exists', return_value=True), \
+                    patch.dict(
+                        launcher['main'].__globals__,
+                        capture_terminal=lambda: self.windows,
+                        popen_in_pgrp=lambda *_args: FakeChild(),
+                        run=lambda cmd, **_kw: '/tmp/pdfterm-test1234' if 'mktemp' in cmd[-1] else ('Darwin' if 'uname' in cmd[-1] else ''),
+                        Bridge=FakeBridge,
+                        StdioForward=lambda *_args: FakeBridge(),
+                        kill_group=lambda _master: None,
+                    ):
+                self.assertEqual(launcher['main'](), 0)
+            self.assertEqual(closed, [True, True])
+        finally:
+            signal.signal(signal.SIGHUP, previous)
 
 
 class ShellHookTests(unittest.TestCase):

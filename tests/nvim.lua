@@ -846,7 +846,7 @@ local ok, failure = xpcall(function()
     viewer_reply_token = token
     receive()
     vim.schedule(function()
-      callback({ code = 0 }, { kind = 'ghostty', id = 'viewer' })
+      callback({ code = 0 }, { kind = 'ssh', id = 'viewer' })
     end)
     return { wait = function() end }
   end
@@ -1001,6 +1001,7 @@ local ok, failure = xpcall(function()
   for _, output_folder in ipairs({ '.', 'output' }) do
     vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
     if output_folder == '.' then
+      assert(closed_splits.viewer == 1, 'ready SSH viewer split was not closed on exit')
       assert(closed_splits.viewer2 == 1, 'unconfirmed racing split was not closed on exit')
       assert(closed_splits.viewer3 == 1, 'failed rollback lost its owned viewer')
       assert(#quit_requests == 1, 'VimLeavePre did not send quit over forward_socket')

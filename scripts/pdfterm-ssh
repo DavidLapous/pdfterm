@@ -554,7 +554,19 @@ class Bridge:
             raise RuntimeError('; '.join(failures))
 
 
+cleaning_up = False
+
+
+def handle_stop_signal(signum, _frame):
+    global cleaning_up
+    if not cleaning_up:
+        cleaning_up = True
+        sys.exit(128 + signum)
+
+
 def main():
+    global cleaning_up
+    cleaning_up = False
     parser = argparse.ArgumentParser(description=__doc__, epilog='Configure ports, users and proxies in ~/.ssh/config. The remote needs nvim and pdfterm with its adapter installed.')
     parser.add_argument('-F', '--ssh-config', help='alternate OpenSSH configuration file')
     parser.add_argument('host', help='SSH host or configured alias')
@@ -607,7 +619,10 @@ def main():
                     time.sleep(0.02)
                 run(ssh[:-1] + ['-O', 'check', args.host])
             finally:
-                os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                try:
+                    os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                except OSError:
+                    pass
                 signal.signal(signal.SIGTTOU, previous_ttou)
             ssh = ssh[:-1] + ['-o', 'ControlMaster=no', '-o', 'BatchMode=yes', args.host]
             candidate = run([*ssh, 'mktemp -d /tmp/pdfterm-XXXXXXXX'], timeout=30)
@@ -676,9 +691,13 @@ def main():
                 child = popen_in_pgrp([*editor_ssh, command], master.pid)
                 return child.wait()
             finally:
-                os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                try:
+                    os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                except OSError:
+                    pass
                 signal.signal(signal.SIGTTOU, previous_ttou)
         finally:
+            cleaning_up = True
             if child is not None and child.poll() is None:
                 child.terminate()
                 try:
@@ -716,7 +735,7 @@ def main():
 
 if __name__ == '__main__':
     for stop_signal in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(stop_signal, lambda signum, _: sys.exit(128 + signum))
+        signal.signal(stop_signal, handle_stop_signal)
     try:
         sys.exit(main())
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:

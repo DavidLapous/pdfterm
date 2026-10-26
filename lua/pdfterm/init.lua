@@ -989,8 +989,8 @@ function M.setup(opts)
       end
       for _, split in ipairs(owned_splits) do
         local matched_quit = quit_ok and split.token and quit_token == split.token
-        -- Ghostty retains scripted command surfaces after the viewer acknowledges quit.
-        if split.handle.kind == 'ghostty' or split.unclosed or not (matched_quit or (split.ready and quit_absent)) then
+        -- Ghostty (locally or behind pdfterm-ssh) retains scripted command surfaces after quit.
+        if split.handle.kind == 'ghostty' or split.handle.kind == 'ssh' or split.unclosed or not (matched_quit or (split.ready and quit_absent)) then
           local ok, error = pcall(terminal.close, split.handle)
           if not ok then
             notify(error)
