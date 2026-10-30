@@ -313,7 +313,6 @@ impl App {
                 }
                 self.session.active_tab = self.session.tabs.len() - 1;
                 self.reset_active_tab_pickers();
-                self.clear_viewer(output)?;
                 self.reset_render_state();
                 self.ensure_link_index();
                 self.request_current(output)?;
@@ -425,7 +424,6 @@ impl App {
         self.navigation.inverse.take();
         self.session.active_tab = index;
         self.reset_active_tab_pickers();
-        self.clear_viewer(output)?;
         self.reset_render_state();
         self.ensure_link_index();
         self.request_current(output)
@@ -446,7 +444,6 @@ impl App {
             self.session.active_tab -= 1;
         }
         self.reset_active_tab_pickers();
-        self.clear_viewer(output)?;
         self.reset_render_state();
         self.ensure_link_index();
         self.request_current(output)?;
