@@ -65,6 +65,8 @@ pub enum FitMode {
     Width,
     /// Match the page height to the viewport; scroll horizontally when wider.
     Height,
+    /// Fit the content bounds, leaving page margins outside the viewport.
+    Content,
 }
 
 impl FitMode {
@@ -72,7 +74,8 @@ impl FitMode {
         match self {
             Self::Page => Self::Width,
             Self::Width => Self::Height,
-            Self::Height => Self::Page,
+            Self::Height => Self::Content,
+            Self::Content => Self::Page,
         }
     }
 
@@ -81,7 +84,50 @@ impl FitMode {
             Self::Page => "fit-page",
             Self::Width => "fit-width",
             Self::Height => "fit-height",
+            Self::Content => "fit-content",
         }
+    }
+
+    pub(crate) fn raster_size(
+        self,
+        width: f32,
+        height: f32,
+        content: [f32; 4],
+        target_width: u32,
+        target_height: u32,
+    ) -> (u32, u32) {
+        let mut scale = match self {
+            Self::Page | Self::Width => target_width as f32 / width,
+            Self::Height => target_height as f32 / height,
+            Self::Content => {
+                // Reserve a little breathing room without changing page geometry.
+                const INNER_FRACTION: f32 = 0.96;
+                (target_width as f32 * INNER_FRACTION / (width * (content[2] - content[0]))).min(
+                    target_height as f32 * INNER_FRACTION / (height * (content[3] - content[1])),
+                )
+            }
+        };
+        if self == Self::Page && height * scale > target_height as f32 {
+            scale = target_height as f32 / height;
+        }
+        if self == Self::Content {
+            // Content can be a single tiny mark. Bound the full-page bitmap,
+            // not just the fitted object, before converting dimensions to i32.
+            const MAX_PIXELS: f32 = 16_777_216.0;
+            const MAX_DIMENSION: f32 = 32_768.0;
+            scale = scale
+                .min((MAX_PIXELS / (width * height)).sqrt())
+                .min(MAX_DIMENSION / width.max(height));
+        }
+        let pixels = |size: f32| {
+            (if self == Self::Content {
+                size.floor()
+            } else {
+                size.round()
+            })
+            .max(1.0) as u32
+        };
+        (pixels(width * scale), pixels(height * scale))
     }
 }
 
@@ -92,6 +138,8 @@ fn build_fit_config(
     fit: FitMode,
     target_width: i32,
     target_height: i32,
+    page: &PdfPage,
+    content: [f32; 4],
 ) -> PdfRenderConfig {
     match fit {
         FitMode::Page => base_config
@@ -100,6 +148,16 @@ fn build_fit_config(
             .set_maximum_height(target_height),
         FitMode::Width => base_config.set_target_width(target_width),
         FitMode::Height => base_config.set_target_height(target_height),
+        FitMode::Content => {
+            let (width, height) = fit.raster_size(
+                page.width().value,
+                page.height().value,
+                content,
+                target_width as u32,
+                target_height as u32,
+            );
+            base_config.set_target_size(width as i32, height as i32)
+        }
     }
 }
 
@@ -150,6 +208,8 @@ pub struct Frame {
     pub height: u32,
     pub page_width_pt: f32,
     pub page_height_pt: f32,
+    /// Content bounds as fractions of the displayed, rotated page: left/top/right/bottom.
+    pub content_bounds: [f32; 4],
     pub compressed_rgba: Vec<u8>,
     pub render_elapsed: Duration,
     pub dark_mode_elapsed: Option<Duration>,
@@ -945,8 +1005,18 @@ fn run_worker(
                                 .use_lcd_text_rendering(true)
                                 .force_half_tone(false)
                                 .use_print_quality(false);
-                            let config =
-                                build_fit_config(base_config, key.fit, target_width, target_height);
+                            let config = build_fit_config(
+                                base_config,
+                                key.fit,
+                                target_width,
+                                target_height,
+                                &rendered,
+                                if key.fit == FitMode::Content {
+                                    page_content_bounds(&rendered)
+                                } else {
+                                    [0.0, 0.0, 1.0, 1.0]
+                                },
+                            );
                             let (pdf_x, pdf_y) = rendered
                                 .pixels_to_points(x as i32, y as i32, &config)
                                 .map_err(|e| e.to_string())?;
@@ -1236,8 +1306,19 @@ fn run_worker(
                 .use_lcd_text_rendering(true)
                 .force_half_tone(false)
                 .use_print_quality(false);
-            let config =
-                build_fit_config(base_config, request.key.fit, target_width, target_height);
+            let content_bounds = if request.key.fit == FitMode::Content {
+                page_content_bounds(&page)
+            } else {
+                [0.0, 0.0, 1.0, 1.0]
+            };
+            let config = build_fit_config(
+                base_config,
+                request.key.fit,
+                target_width,
+                target_height,
+                &page,
+                content_bounds,
+            );
             let render_started = Instant::now();
             let bitmap = page.render_with_config(&config).map_err(|error| {
                 format!("could not render page {}: {error}", request.key.page + 1)
@@ -1376,6 +1457,7 @@ fn run_worker(
                     height,
                     page_width_pt: page.width().value,
                     page_height_pt: page.height().value,
+                    content_bounds,
                     compressed_rgba,
                     render_elapsed,
                     dark_mode_elapsed,
@@ -2497,7 +2579,18 @@ fn find_visible_matches(
         let zoom = i32::from(key.zoom.max(1));
         let target_width = (i32::from(key.width) * zoom / 100).max(1);
         let target_height = (i32::from(key.height) * zoom / 100).max(1);
-        let config = build_fit_config(PdfRenderConfig::new(), key.fit, target_width, target_height);
+        let config = build_fit_config(
+            PdfRenderConfig::new(),
+            key.fit,
+            target_width,
+            target_height,
+            &page,
+            if key.fit == FitMode::Content {
+                page_content_bounds(&page)
+            } else {
+                [0.0, 0.0, 1.0, 1.0]
+            },
+        );
         let Some(cached) =
             cached_visible_page_text(document, key.page, cache, generation, latest_generation)
         else {
@@ -2787,6 +2880,48 @@ fn cached_visible_page_text<'a>(
         slot.visible = Some(normalize_search_characters(visible_characters));
     }
     Some(slot)
+}
+
+/// Measure all page objects, not just text, in the same rotated/cropped device
+/// coordinates used by rendering and hit-testing. Empty pages retain page fit.
+fn page_content_bounds(page: &PdfPage) -> [f32; 4] {
+    const WIDTH: i32 = 100_000;
+    let height = (page.height().value * WIDTH as f32 / page.width().value).round() as i32;
+    let config = PdfRenderConfig::new().set_target_width(WIDTH);
+    let mut content = [1.0_f32, 1.0, 0.0, 0.0];
+    for object in page.objects().iter() {
+        let Ok(bounds) = object.bounds() else {
+            continue;
+        };
+        let bounds = bounds.to_rect();
+        let Some((left, right, top, bottom)) = page_rect_pixel_bounds(
+            page,
+            &config,
+            SearchRect {
+                left: bounds.left().value,
+                right: bounds.right().value,
+                top: bounds.top().value,
+                bottom: bounds.bottom().value,
+            },
+        ) else {
+            continue;
+        };
+        let left = (left as f32 / WIDTH as f32).clamp(0.0, 1.0);
+        let right = (right as f32 / WIDTH as f32).clamp(0.0, 1.0);
+        let top = (top as f32 / height as f32).clamp(0.0, 1.0);
+        let bottom = (bottom as f32 / height as f32).clamp(0.0, 1.0);
+        if left < right && top < bottom {
+            content[0] = content[0].min(left);
+            content[1] = content[1].min(top);
+            content[2] = content[2].max(right);
+            content[3] = content[3].max(bottom);
+        }
+    }
+    if content[0] < content[2] && content[1] < content[3] {
+        content
+    } else {
+        [0.0, 0.0, 1.0, 1.0]
+    }
 }
 
 fn effective_page_bounds(page: &PdfPage) -> Option<(f32, f32, f32, f32)> {
@@ -4448,7 +4583,11 @@ mod tests {
                 assert_eq!(selected.page, anchor.page);
                 assert_eq!(selected.rect, anchor.rect);
             }
-            for (fit, zoom) in [(super::FitMode::Page, 100), (super::FitMode::Width, 125)] {
+            for (fit, zoom) in [
+                (super::FitMode::Page, 100),
+                (super::FitMode::Width, 125),
+                (super::FitMode::Content, 125),
+            ] {
                 let key = super::RenderKey {
                     document_id: 1,
                     page: index as u32,
@@ -4469,6 +4608,8 @@ mod tests {
                     fit,
                     i32::from(key.width) * i32::from(zoom) / 100,
                     i32::from(key.height) * i32::from(zoom) / 100,
+                    &page,
+                    super::page_content_bounds(&page),
                 );
                 worker.clear_flash(1);
                 worker
@@ -4916,6 +5057,8 @@ mod tests {
                 key.fit,
                 i32::from(key.width),
                 i32::from(key.height),
+                &page,
+                super::page_content_bounds(&page),
             );
             super::page_rect_pixel_bounds(
                 &page,
@@ -5093,7 +5236,7 @@ mod tests {
     }
 
     use super::{
-        DarkModeStyle, DarkModeTransform, FitMode, LinkTarget, PageLink, PageLinkRect, PixelRect,
+        DarkModeStyle, DarkModeTransform, LinkTarget, PageLink, PageLinkRect, PixelRect,
         apply_dark_mode_link_contrast, apply_link_highlights, apply_selected_link_highlights,
         blend_highlight_rectangle, context_around_label, contrast_ratio, count_search_matches,
         dark_mode_pixel, darken_rgba, dominant_rectangle_color, mask_quadrilateral,
@@ -5574,6 +5717,67 @@ mod tests {
         assert_ne!(link_highlighted, link_original);
     }
 
+    #[test]
+    fn content_fit_bounds_sparse_page_bitmap_sizes() {
+        for (width, height) in [(600.0, 600.0), (1.0, 100_000.0)] {
+            let (raster_width, raster_height) = super::FitMode::Content.raster_size(
+                width,
+                height,
+                [0.5, 0.5, 0.500_001, 0.500_001],
+                1000,
+                1000,
+            );
+            assert!(raster_width > 0 && raster_height > 0);
+            assert!(raster_width <= 32_768 && raster_height <= 32_768);
+            assert!(u64::from(raster_width) * u64::from(raster_height) <= 16_777_216);
+        }
+    }
+
+    #[test]
+    fn content_fit_includes_images_and_empty_pages_keep_page_fit() {
+        let _native = super::pdfium_test_lock();
+        use pdfium_render::prelude::*;
+        let pdfium = super::load_pdfium(None).unwrap();
+        let document = pdfium
+            .load_pdf_from_byte_vec(synthetic_image_pdf(), None)
+            .unwrap();
+        let page = document.pages().get(0).unwrap();
+        let content = super::page_content_bounds(&page);
+        for (actual, expected) in content.into_iter().zip([0.25, 0.25, 0.75, 0.75]) {
+            assert!((actual - expected).abs() < 0.0001);
+        }
+        let config = super::build_fit_config(
+            PdfRenderConfig::new(),
+            super::FitMode::Content,
+            400,
+            300,
+            &page,
+            content,
+        );
+        let bitmap = page.render_with_config(&config).unwrap();
+        assert_eq!((bitmap.width(), bitmap.height()), (576, 576));
+        let mut empty = pdfium.create_new_pdf().unwrap();
+        let page = empty
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::from_points(
+                PdfPoints::new(400.0),
+                PdfPoints::new(600.0),
+            ))
+            .unwrap();
+        let content = super::page_content_bounds(&page);
+        assert_eq!(content, [0.0, 0.0, 1.0, 1.0]);
+        let config = super::build_fit_config(
+            PdfRenderConfig::new(),
+            super::FitMode::Content,
+            400,
+            300,
+            &page,
+            content,
+        );
+        let bitmap = page.render_with_config(&config).unwrap();
+        assert_eq!((bitmap.width(), bitmap.height()), (192, 288));
+    }
+
     fn fit_page_keeps_landscape_pages_landscape(pdfium: &pdfium_render::prelude::Pdfium) {
         use super::{FitMode, build_fit_config};
         use pdfium_render::prelude::{PdfPagePaperSize, PdfPoints, PdfRenderConfig};
@@ -5587,7 +5791,14 @@ mod tests {
             ))
             .expect("create landscape page");
         let page = document.pages().get(0).expect("first page");
-        let config = build_fit_config(PdfRenderConfig::new(), FitMode::Page, 400, 400);
+        let config = build_fit_config(
+            PdfRenderConfig::new(),
+            FitMode::Page,
+            400,
+            400,
+            &page,
+            super::page_content_bounds(&page),
+        );
         let bitmap = page.render_with_config(&config).expect("render page");
         assert!(
             bitmap.width() > bitmap.height(),
@@ -6071,13 +6282,6 @@ mod tests {
         darken_rgba(&mut pixels, None, NEUTRAL_DARK_MODE);
         assert_eq!(&pixels[..4], &[30, 30, 30, 255]);
         assert_eq!(&pixels[pixels.len() - 4..], &[30, 30, 30, 255]);
-    }
-
-    #[test]
-    fn fit_mode_cycles_page_width_height() {
-        assert_eq!(FitMode::Page.cycle(), FitMode::Width);
-        assert_eq!(FitMode::Width.cycle(), FitMode::Height);
-        assert_eq!(FitMode::Height.cycle(), FitMode::Page);
     }
 
     #[test]

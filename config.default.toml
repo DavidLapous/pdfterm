@@ -2,7 +2,7 @@
 # Default location: ~/.config/pdfterm/config.toml.
 # XDG_CONFIG_HOME overrides ~/.config. Press R in viewer to reload (or restart).
 
-fit_mode = "page"                  # page, width, or height
+fit_mode = "page"                  # page, width, height, or content
 dark_mode = false                  # Invert PDF colors using the selected theme
 theme = ""                         # Empty: built-in palette; otherwise a theme TOML path
 theme_catalog = ""                 # Empty: no external catalog; otherwise a catalog TOML path

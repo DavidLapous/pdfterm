@@ -516,6 +516,7 @@ mod tests {
             height: 4,
             page_width_pt: 4.0,
             page_height_pt: 4.0,
+            content_bounds: [0.0, 0.0, 1.0, 1.0],
             compressed_rgba,
             render_elapsed: Duration::ZERO,
             dark_mode_elapsed: None,
