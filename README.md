@@ -6,6 +6,8 @@
 
 The current page is kept when the file reloads. Omit the path, or press `f`, to open another PDF in a new tab.
 
+Tab changes keep the outgoing page visible until the destination is ready, then replace its images in one synchronized frame rather than clearing the document first.
+
 ## Requirements
 
 - Rust 1.88 or newer to build
