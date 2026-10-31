@@ -4698,7 +4698,11 @@ impl App {
         }
         // Kitty (image id, p=1) replaces the old placement, including its crop.
         // Only text/UI or geometry changes require clearing the canvas.
-        if old_pages.is_empty() || self.canvas_viewport != Some(viewport) {
+        if old_pages
+            .first()
+            .is_none_or(|old| old.frame.key.document_id != frame.key.document_id)
+            || self.canvas_viewport != Some(viewport)
+        {
             self.prepare_image_canvas(output, viewport)?;
         }
         let started = Instant::now();
@@ -4834,6 +4838,10 @@ impl App {
             return self
                 .visible_pages
                 .iter()
+                .filter(|page| {
+                    same_render_view(page.frame.key, self.render_key(viewport))
+                        && page.frame.revision.pdf == self.tab().revision
+                })
                 .find(|page| {
                     mouse.row.checked_sub(page.top).is_some_and(|row| {
                         page.placement
@@ -9016,6 +9024,67 @@ mod tests {
 
         app.session.tabs[0].path = other_file.path().to_owned();
         assert_eq!(app.tab_index_for_path(&path), Some(1));
+    }
+
+    #[test]
+    fn loading_tab_does_not_hit_test_outgoing_document() {
+        let (mut app, viewport, _file) = continuous_app();
+        let mouse = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 0,
+            row: viewport.top,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            app.page_at_mouse(mouse, viewport)
+                .unwrap()
+                .0
+                .key
+                .document_id,
+            app.tab().document_id
+        );
+        let (mut other, _, _other_file) = continuous_app();
+        let mut tab = other.session.tabs.pop().unwrap();
+        tab.document_id += 1;
+        tab.cache.clear();
+        app.session.tabs.push(tab);
+        app.session.active_tab = 1;
+        assert!(app.page_at_mouse(mouse, viewport).is_none());
+    }
+
+    #[test]
+    fn tab_switch_replaces_outgoing_images_in_one_frame() {
+        for continuous in [false, true] {
+            let (mut app, viewport, _file) = continuous_app();
+            app.viewer.continuous_scroll = continuous;
+            let outgoing: Vec<_> = app.visible_pages.iter().map(|page| page.image_id).collect();
+            let (mut other, _, _other_file) = continuous_app();
+            let mut tab = other.session.tabs.pop().unwrap();
+            tab.document_id += 1;
+            tab.page_count = 1;
+            tab.scroll_y = 0;
+            tab.cache.clear();
+            let key = tab.render_key(viewport, false, None);
+            let revision = crate::synctex::DocumentRevision::read(&tab.path).unwrap();
+            tab.cache
+                .insert(key, continuous_frame(key, revision, false));
+            app.session.tabs.push(tab);
+
+            let mut output = Vec::new();
+            app.select_tab(1, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains("\x1b_Ga=d,d=A,"));
+            let start = output.find("\x1b[?2026h").unwrap();
+            let end = output.find("\x1b[?2026l").unwrap();
+            for image_id in outgoing {
+                let deletion = output
+                    .find(&format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\"))
+                    .expect("outgoing image must be released");
+                assert!(start < deletion && deletion < end);
+            }
+            assert_eq!(app.submitted_key, Some(key));
+            assert_eq!(app.visible_page.as_ref().unwrap().frame.key, key);
+        }
     }
 
     #[test]
